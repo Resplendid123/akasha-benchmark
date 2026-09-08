@@ -1,0 +1,36 @@
+"""数据集适配器，以及五轮共用的规范化模型。"""
+
+from .base import DatasetAdapter
+from .corpus import CorpusIndex, load_corpus
+from .models import (
+    CORPUS_ID_RULES,
+    SAMPLE_ID_RULES,
+    Capability,
+    CapabilityError,
+    CanonicalSample,
+    CorpusDoc,
+    make_sample_id,
+)
+from .registry import ADAPTER_CLASSES, DATASET_NAMES, all_adapters, get_adapter
+from .resolver import ResolvedDataset, normalized_dir, resolve, subset_dir
+
+__all__ = [
+    "ADAPTER_CLASSES",
+    "CORPUS_ID_RULES",
+    "DATASET_NAMES",
+    "SAMPLE_ID_RULES",
+    "Capability",
+    "CapabilityError",
+    "CanonicalSample",
+    "CorpusDoc",
+    "CorpusIndex",
+    "DatasetAdapter",
+    "ResolvedDataset",
+    "all_adapters",
+    "get_adapter",
+    "load_corpus",
+    "make_sample_id",
+    "normalized_dir",
+    "resolve",
+    "subset_dir",
+]

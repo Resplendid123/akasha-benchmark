@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Raw datasets. narrativeqa inlines Project Gutenberg books and IMSDb
+# screenplays that must not be redistributed.
+/dataset/
+
+# Evaluation artifacts (normalized data, responses, reports).
+/data/
+
+# Akasha credentials. Copy akasha.config.example.json and fill it in.
+/akasha.config.json
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
