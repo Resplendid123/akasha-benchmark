@@ -1,19 +1,36 @@
 # Akasha-Benchmark 实施计划
 
 评测 Akasha 的多跳检索、引用归因与端到端答案质量。全部代码在本仓库实现，
-**不修改 Akasha 主仓库**。Akasha 侧只通过 HTTP 接口访问。
+**不修改 Akasha 主仓库**。入库和查询通过 HTTP；可选审计归因直接只读查询数据库。
 
-参考实现 `D:\VSCodeProjects\SAG-Benchmark`（下文 `SAG/` 前缀均指该处）只作设计参考，
-不 import、不依赖其代码。
+## 当前进度（2026-09-08）
 
-本文吸收并替代 `HANDOFF.md`。确认无遗漏后可删除该文件（它未被 git 跟踪，
-删除不可恢复，请自行确认）。
+按当前工作区代码核对，轮次 1–5、HTTP 客户端、配置模块及可选审计归因均已实现。
+本次运行 `uv run pytest tests/ -q`：**69 passed**。这些是本地测试，
+轮次 3/4 使用 `httpx.MockTransport`，不代表已连通真实 Akasha。
+当前仓库默认路径下没有 `dataset/`、`data/`，因此尚无本工作区的全量校验、
+在线编译、响应和报告产物可供验收；自定义目录中的运行情况本次未核实。
+
+| 阶段 | 实现状态 | 当前验收状态 |
+| --- | --- | --- |
+| 数据下载 | 脚本已迁至 `scripts/download_dataset.py` | 迁移后的输出路径待修复，见 §10 |
+| 1 归一化 | 四组适配器、严格模型、全量校验脚本已实现 | 待下载数据后做全量验收 |
+| 2 子集 | gold 覆盖、负样本、MuSiQue 分层、NarrativeQA 整篇抽样已实现 | 待生成固定 run_id 子集 |
+| 3 入库 | OWNER、独立 Space、编译、质量检查、续跑已实现 | 多数据集映射问题待修复；在线验收待做 |
+| 4 查询 | 串行请求、配置比对、响应落盘与续跑已实现 | 前置闸门和失败处理待补强；在线验收待做 |
+| 5 评测 | 检索、答案、引用、多跳及报告已实现 | 待真实响应验收 |
+| 可选审计 | 查询哈希关联、按 retrievalMode 汇总已实现 | 续跑时间窗待修复；数据库验收待做 |
+| 6 原文基线 | 尚未实现 | 后续对照实验，见 §9 |
+
+本文保留实施约束与验收目标；“已实现”与“待补强”分别标明当前行为和剩余工作。
+SAG 仅为历史设计参考，不是运行依赖；旧 HANDOFF 的迁移和清理不再作为本项目任务。
 
 ---
 
-## 0. 已核实的事实
+## 0. 数据快照与接口依据
 
-以下全部由实际读文件测得，非推测。**其中三项推翻了 HANDOFF.md 的判断**，已标注。
+本节数据统计来自先前记录的固定快照，本次未重新下载或全量复测。
+Akasha 服务端行为为既有接口约定及客户端代码所依赖的假设，真实部署仍需核验。
 
 ### 0.1 数据现状
 
@@ -28,9 +45,9 @@
 实测 2wiki 与 musique 的 corpus **没有 `idx` 字段**，只有 `{title, text}`。
 这两组必须在归一化阶段自行赋 id。
 
-### 0.2 gold → corpus 对齐（HANDOFF 决定 A 的答案）
+### 0.2 gold → corpus 对齐
 
-handoff 说这个检查从未跑过。已跑：
+历史快照检查记录：
 
 | 数据集 | gold title 全部命中 corpus | corpus 重复 title | 结论 |
 | --- | --- | --- | --- |
@@ -46,7 +63,7 @@ handoff 说这个检查从未跑过。已跑：
 **逐字节精确相等**（exact=2648 / whitespace_only=0 / MISMATCH=0）。
 所以 musique 的对齐键是 `(title, text)` 而非 title。
 
-**决定 A 定稿**：全链路走 id，零字符串匹配。各数据集的 corpus 行身份如下——
+**身份规则**：归一化时用 title 或 `(title, text)` 对齐；后续评测按 ID 匹配。各数据集的 corpus 行身份如下——
 
 - hotpotqa：用原生 `idx`
 - 2wiki：用 corpus 数组行号（归一化时赋予）
@@ -65,16 +82,16 @@ handoff 说这个检查从未跑过。已跑：
 ⚠️ **修正 HANDOFF #3**：handoff 称「hotpotqa 这类数据集确实存在重复 question 文本」。
 本批快照实测 hotpotqa 重复为 0，四组合计仅 musique 有 1 例。
 
-这条修正有实际后果：Akasha 审计表按 `queryHash = sha256(query)` 连接，
-原本担心的哈希碰撞几乎不存在，**第五轮可以安全地 join 审计表拿分层归因指标**
-（musique 那 1 例单独排除即可）。
+审计连接键为 `sha256:<hex>`（含前缀）。重复 question 是连接歧义，
+不是密码学哈希碰撞。`audit_join.py` 排除所选子集中所有重复文本对应的样本，
+并在 workspace 与时间窗内，对同一哈希取最后一条审计记录；续跑限制见 §10。
 
 ### 0.4 其他实测细节
 
-- **gold 数量分布**：hotpotqa `{2:650, 3:253, 4:81, 5:13, 6:1, 7:2}`；
+- **历史原始标注数量分布（不可直接作为去重后的指标分母）**：hotpotqa `{2:650, 3:253, 4:81, 5:13, 6:1, 7:2}`；
   2wiki `{2:765, 4:234, 5:1}`；musique `{2:518, 3:316, 4:166}`
 - **gold 内部重复**：hotpotqa 有 350 行、musique 有 47 行的 gold title 列表内部有重复
-  （`supporting_facts` 是 `(title, 句子下标)` 对，同一 title 多个句子）。
+  （hotpotqa 的 `supporting_facts` 是 `(title, 句子下标)` 对；MuSiQue 按支撑段落解析）。
   归一化时 **必须去重成集合**
 - **musique 跳数**：`id` 前缀编码跳数 —— `2hop:518, 3hop1:243, 3hop2:73,
   4hop1:108, 4hop2:27, 4hop3:31`。可直接用于按跳数分层报告指标
@@ -89,7 +106,7 @@ handoff 说这个检查从未跑过。已跑：
 
 - **导入**：`POST /api/pages/import`，multipart，字段 `file` + `spaceId`。
   接受 `.md/.html/.docx/.pdf`，单文件上限 30MB。**返回创建的 page 对象（含 `id`）**
-- **title 规则**（[import.service.ts:106](../Akasha/apps/server/src/integrations/import/services/import.service.ts#L106)）：
+- **title 规则**（`import.service.ts:106`，历史服务端定位）：
   优先取 Markdown **首个 heading** 作为 title 并**从正文移除**；无 heading 才退回文件名
 - **查询**：`POST /api/llm-wiki/query`，body `{query, spaceIds[], type?, scoreThreshold?, chatContext?}`
 - **没有只检索不生成的 HTTP 端点**。`retrieveOnly` 存在于 service 但未暴露。
@@ -123,15 +140,33 @@ handoff 说这个检查从未跑过。已跑：
 ## 1. 环境
 
 - Python 3.12（`.python-version` 已 pin，**勿用 3.14**）
-- Akasha 跑在 docker：`db`(pgvector/pg18) + `redis` + `akasha` 三个服务。
-  参考主仓 `docker-compose.yml.bak`（当前 `docker-compose.yml` 只有 db，缺 redis，
-  而 BullMQ 必须要 redis）
+- 在线运行需要 Akasha、数据库及 Redis（BullMQ 依赖）；具体镜像、数据库版本和
+  compose 文件以实际部署为准，本工作区未核验外部主仓部署状态。
 - 依赖尽量少。**不要引入 spacy** —— 本评测不需要，它是 SAG 里最大的体积约束
 - 所有 Akasha 连接参数（base URL、账号、workspace/space id、API key）
   走配置文件或环境变量，**不硬编码**
 
-新增依赖预期：`pydantic`（严格模型）、`httpx`（HTTP 客户端）、
-`numpy`（指标聚合）。`psycopg[binary]` 仅第五轮 join 审计表时需要。
+`pyproject.toml` 已声明 `httpx`、`huggingface-hub`、`numpy`、`pydantic`，
+开发依赖为 `pytest`。`psycopg[binary]` 尚未加入依赖，仅可选审计需要。
+配置由根目录 `akasha.config.json` 或 `AKASHA_*` 环境变量提供，环境变量优先；
+默认使用 email/password 登录，敏感配置在运行记录中脱敏。
+
+下列命令从仓库根执行。下载前先完成 §10 的路径修复，或自行把数据准备到根目录 `dataset/`：
+
+```bash
+uv sync
+uv run python scripts/download_dataset.py
+uv run python scripts/download_dataset.py --check
+uv run python -m akasha_benchmark.normalize
+uv run python scripts/validate_datasets.py
+uv run python -m akasha_benchmark.subset --run-id run001
+# 配置 Akasha 后执行；确认轮次 3 质量通过才进入轮次 4
+uv run python -m akasha_benchmark.ingest --run-id run001
+uv run python -m akasha_benchmark.run_queries --run-id run001
+uv run python -m akasha_benchmark.evaluate --run-id run001
+# 可选：先完成 evaluate，并安装 psycopg、配置 database_url 和 workspace_id
+uv run python -m akasha_benchmark.audit_join --run-id run001
+```
 
 ---
 
@@ -159,6 +194,8 @@ src/akasha_benchmark/
   evaluate.py          轮次 5 入口
   io_utils.py          原子写 JSON/JSONL + sha256
   config.py            配置加载
+  akasha_client.py      HTTP、cookie 登录、节流与接口封装
+  audit_join.py         可选数据库审计归因
 
 data/
   normalized/{dataset}/            轮次 1 产出（全量）
@@ -175,7 +212,12 @@ data/
   responses/{run_id}/{dataset}.jsonl   轮次 4 产出（原始响应全文）
   reports/{run_id}/                 轮次 5 产出
 
+docs/
+  PLAN.md                         本计划
+  datasets.md                     数据集字段说明
+tests/                            本地与 HTTP mock 测试
 scripts/
+  download_dataset.py             下载与文件大小校验（迁移后路径待修复）
   validate_datasets.py             轮次 1 的校验脚本
 ```
 
@@ -183,7 +225,7 @@ scripts/
 
 ## 3. 贯穿全程的设计约束
 
-这几条来自 SAG 的经验，建议照做：
+以下约束已体现在当前实现中，验收仍需检查实际产物：
 
 1. **显式适配器，拒绝 schema 猜测。** 每个数据集一个适配器类，自己声明名字、
    别名、校验规则。禁止写 `if "supporting_facts" in row: ... elif "paragraphs" in row:`
@@ -196,8 +238,10 @@ scripts/
    且**这个口径必须收到一处常量**（SAG 在预处理与评测两侧各写一份靠注释互指，
    这点是脆弱的，别学）。重复 ID 直接报错。按 ID 匹配后**再比一次 question 文本**，
    不一致报错 —— 能抓到预测文件与数据集版本不匹配
-5. **manifest + sha256。** 每轮产出都写 manifest，记源文件绝对路径、sha256、
-   条数、limit、生成时刻。JSON 写入走「临时文件 + `os.replace`」原子写
+5. **运行记录与 sha256。** 轮次 1–4 写 manifest：归一化记录源文件及输出哈希，
+   子集记录种子与 Markdown 哈希，在线轮次记录模型快照和运行统计。轮次 5
+   写 metrics/per_sample/report，不另写 manifest。汇总文件原子替换；
+   page_map 与响应 JSONL 逐条追加并 flush，截断尾行恢复仍待补强
 6. **corpus 去重口径全链路统一。** SAG 有个不一致（`get_docs()` 去重、
    `save_as_markdown()` 不去重，导致两套数字不可比）——**不要复制**。
    本计划统一：**不去重**，因为 musique 有 647 个重复 title 但它们是不同段落，
@@ -265,7 +309,7 @@ class CanonicalSample(BaseModel):
 - `manifest.json` —— 源文件路径+sha256、QA 条数、corpus 条数、
   去重前后条数、适配器版本、capability 列表、生成时刻
 
-### 4.5 校验脚本（`scripts/validate_datasets.py`）
+### 4.5 校验脚本（`../scripts/validate_datasets.py`）
 
 **逐行过全量数据，不是只看 row 0。** 检查项：
 
@@ -280,7 +324,7 @@ class CanonicalSample(BaseModel):
 
 ---
 
-## 5. 轮次 2：各抽 100 篇子集
+## 5. 轮次 2：构建可复现子集
 
 **目标**：每数据集抽出可独立评测的子集，放同一 `run_id` 目录下。
 
@@ -292,21 +336,15 @@ class CanonicalSample(BaseModel):
 
 1. 固定随机种子，从 `samples.jsonl` 抽 **100 条 QA**
 2. 取这 100 条的 gold doc_id **全集**（去重）作为 corpus 必选集
-3. 若必选集不足目标 corpus 规模，从剩余 corpus 随机补负样本
+3. 按 `negatives_ratio` 从剩余 corpus 随机补负样本，默认与 gold 文档等量，受剩余语料数限制
 
-按 0.4 的 gold 分布估算 100 条 query 的 gold 文档数：
-hotpotqa ≈ 250、2wiki ≈ 280、musique ≈ 270。
-**建议 corpus 规模取 gold 全集 + 等量负样本**，即每组约 500–560 篇。
+默认 `qa_limit=100`、`negatives_ratio=1.0`。随机源包含 `run_id`、
+数据集名与 seed；实际语料数以去重后的 gold 全集和子集 manifest 为准，
+不按原始标注条数估算编译成本。
 
-> 成本提示：编译是每篇 2 次 LLM 调用。四组合计约 2000–2200 篇 ≈ 4000–4400 次调用。
-> 若预算紧，先只做 hotpotqa 一组（约 500 篇 ≈ 1000 次调用）。
-
-**musique 抽样时按跳数分层**（2hop/3hop/4hop 按 0.4 的比例），
-否则 100 条随机抽样可能几乎全是 2hop，测不出多跳深度的影响。
-
-narrativeqa：10 篇文档 4111 chunk，抽 100 条 QA 会牵出大量 chunk。
-建议**只取 2 篇文档的全部 chunk**（约 300–900 篇）+ 对应的 QA，
-它的价值在实体跨文档合并与 EM/F1，不在检索指标。
+**MuSiQue 按 `hop_prefix` 六层分配名额**，使用最大余额法保留小层。
+NarrativeQA 默认优先选择 chunk 最少的 2 篇文档，保留它们的全部 chunk，
+再取对应 QA；QA 超过上限时继续抽样。它不参与检索相关指标。
 
 ### 5.2 Markdown 生成
 
@@ -339,14 +377,14 @@ narrativeqa：10 篇文档 4111 chunk，抽 100 条 QA 会牵出大量 chunk。
 ### 6.1 环境准备
 
 1. 起 docker（db + redis + akasha）
-2. 首次用 `POST /api/auth/setup` 建 workspace 与首个用户；后续 `POST /api/auth/login` 拿 JWT
+2. 首次部署需先完成 workspace 与用户初始化；脚本用 `POST /api/auth/login`
+   登录并保持 `authToken` cookie，不自动执行 setup
 3. **评测用户必须是 OWNER** —— 否则第三道授权闸门会静默丢弃 chunk，
    你会误判为召回质量差
 4. 每个数据集**建独立 Space**（`POST /api/spaces/create`），互不干扰。
    四个 Space 各自评测，避免跨数据集实体合并污染结果
-5. 通过 `PUT /api/llm-wiki/admin/model-configs/:feature` 固定
-   `compiler` / `embedding` / `answer` / `image` 四项配置，
-   **把配置快照写进 manifest**。特别注意 embedding：
+5. 运行前在 Akasha 配好 `compiler` / `embedding` / `answer` / `image`。
+   当前脚本只读取并记录模型配置，不主动修改服务端配置。特别注意 embedding：
    换模型后旧 chunk 的 `embedding_profile` 对不上就永远召回不到
 
 ### 6.2 导入
@@ -371,18 +409,22 @@ narrativeqa：10 篇文档 4111 chunk，抽 100 条 QA 会牵出大量 chunk。
 ### 6.4 入库完整性校验（不可跳过）
 
 `POST /api/llm-wiki/admin/diagnostics/quality` 拿质量报告，要求：
-- `missing_chunk_page_count == 0`
-- `missing_embedding_page_count == 0`
-- `stale_*` 计数为 0
+- `missingChunkPageCount == 0`
+- `missingEmbeddingPageCount == 0`
+- `missingSourcePageCount == 0`
+- `stalePageCount == 0`
+
+实际读取 `report.summary` 的 camelCase 字段，缺字段也判失败。
 
 任何一项非 0 就**不要进入下一轮** —— 半成品库跑出的指标没有意义。
-若有失败页，用 `POST /api/llm-wiki/admin/retry-pages` 重试。
+若有失败页，需另行调用 `POST /api/llm-wiki/admin/retry-pages`；脚本不自动重试。
+`--skip-compile` 是调试入口，不等于质量验收通过；超时和下一轮的自动阻断缺口见 §10。
 
 ### 6.5 产出
 
 `data/ingest/{run_id}/`：`page_map.jsonl`、`manifest.json`
-（workspace/space id、模型配置快照、Run 结果分布、质量报告、耗时、
-Akasha 版本或 git commit）
+（workspace/space id、模型快照、导入统计、Run 状态、超时标记、质量报告和
+`quality_passed`）。尚未记录 Akasha 版本或 commit、完整耗时，这些仍是追溯待办。
 
 **验收标准**：`page_map` 条数 == 子集 corpus 条数；质量报告全部 0。
 
@@ -435,17 +477,20 @@ Akasha 版本或 git commit）
 
 ### 7.3 稳健性
 
-- **可恢复**：启动时读已有 jsonl，跳过已完成的 `sample_id`
-- 失败（非 2xx、超时）**照样写一行**，记 `http_status` 与错误体，
-  不要静默跳过 —— 失败率本身是指标
+- **可恢复**：启动时读已有 jsonl，跳过所有已有 `sample_id`，包括失败行；
+  当前没有自动重试失败样本的策略
+- 非 2xx 响应会落盘；捕获的 `AkashaError` / `OSError` 记为状态 0。
+  原生 `httpx.RequestError`（含超时）尚未被这层捕获，需补齐后才能保证失败均落盘
 - 每条之间留固定间隔，避免打满 LLM 配额
 - 记录本轮开始时的模型配置快照（再拉一次 `GET /admin/model-configs`），
-  与轮次 3 的快照比对，不一致则报错终止
+  与轮次 3 的快照比对，默认不一致则终止；`--allow-config-drift` 可覆盖，
+  manifest 会记录不一致，正式可比实验不应使用该覆盖
 
 ### 7.4 产出
 
 `data/responses/{run_id}/{dataset}.jsonl` + `manifest.json`
-（模型配置、请求总数、失败数、总耗时、p50/p95 延迟）
+（模型配置、当前调用的开始/生成时间、请求数、失败数、成功请求的 p50/p95/max 延迟）。
+续跑后 manifest 只统计本次新请求，并覆盖原时间窗；完整运行统计尚待合并。
 
 **验收标准**：每个 `sample_id` 恰好一行；失败数已知且记录在案。
 
@@ -468,7 +513,12 @@ Akasha 版本或 git commit）
 用 `retrievedSources` 而非 `citations`：前者是裁剪前的召回全集，
 后者已被「被引 ∩ 有证据」交集裁剪过，用它算 Recall 会低估检索能力。
 
-narrativeqa 无 gold —— **请求该指标时抛异常**，不返回 0.0。
+NarrativeQA 无 gold：`evaluate.py` 自动省略检索、归因和多跳指标，并写明原因；
+显式能力检查 `require_evidence_capability` 则抛 `CapabilityError`，不伪造 0 分。
+
+检索汇总同时输出全样本与 `answerMode == "knowledge"` 切片。`no_match` /
+`general` 的空 `retrievedSources` 不能证明底层未召回。未知 page_id 保留排名位，
+不计为 gold，并单列 `unmapped_page_ids`。
 
 ### 8.2 多跳专项（`metrics/multihop.py`）
 
@@ -478,14 +528,14 @@ narrativeqa 无 gold —— **请求该指标时抛异常**，不返回 0.0。
   的条目占比，以及**其中有多少是 gold**。这直接量化图扩展的净价值
 - **gold 覆盖完整度**：多跳题需要全部 gold 才能答对，
   单独统计「gold 全命中」的比例（比 Recall 平均值更贴近多跳实际需求）
-- **按跳数分层**：musique 用 `id` 前缀（2hop/3hop1/3hop2/4hop1/4hop2/4hop3），
-  hotpotqa 用 `level`/`type`，2wiki 用 `type`。报告随跳数增加的衰减曲线
+- **当前分层报告**：MuSiQue 按 `hop_count`（2/3/4）汇总；HotpotQA 与
+  2Wiki 按 `type` 汇总。抽样用六层 `hop_prefix`，报告不是六层，也未按 `level` 分层
 - **信号来源分布**：`semantic` / `lexical` / `exact-title` / `graph-neighbor`
   各自贡献的 gold 命中数
 
 ### 8.3 答案质量（`metrics/qa.py`）
 
-**EM / F1 用标准口径，不要自创** —— 否则没法跟论文比：
+**EM / F1 使用常见答案归一化口径**（口径相同不代表实验可直接与论文比较）：
 小写、去标点、去冠词 `a/an/the`、合并空白；多参考答案取 max
 （HippoRAG 2 / MRQA 口径）。
 
@@ -493,19 +543,22 @@ narrativeqa 无 gold —— **请求该指标时抛异常**，不返回 0.0。
 - narrativeqa：2 条人工参考，取 max
 
 同时报告 `answerMode` 分布 —— `no_match` 率与 `general` 兜底率
-是「检索没喂够料」的直接信号。
+用于观察回答模式；不能仅据该分布断定底层检索失败。
 
 ### 8.4 引用归因（`metrics/attribution.py`）
 
 - **citation precision**：`citations` 中命中 gold 的比例
 - **citation recall**：gold 被 `citations` 覆盖的比例
-- **裁剪损失**：`len(retrievedSources) - len(citations)`，
-  以及被裁掉的里面有多少其实是 gold（裁剪过严的证据）
-- **证据可验证率**：`citationEvidence[].excerpts` 非空的引用占比
+- **裁剪损失**：先映射、去重为 doc_id，计算 `retrieved_set - cited_set` 的大小，
+  同时记录差集中的 gold 数；不是原始数组长度相减
+- **证据可验证率**：`citationEvidence` 条目中 `excerpts` 非空的占比，
+  只检查证据存在性，尚未校验 span 内容是否真实支持答案
+
+当前引用归因会忽略无法映射的 page_id；未知引用对 precision 分母的影响待明确（§10）。
 
 ### 8.5 分层归因（需 join 审计表）
 
-按 0.3 的实测结论，重复 question 几乎不存在，可以安全 join：
+该模块是离线评测之外的可选步骤，先读取 `per_sample.jsonl`，再以只读 SQL 取审计：
 
 ```sql
 SELECT query_hash, retrieval_mode, metadata
@@ -513,17 +566,19 @@ FROM knowledge_query_audit
 WHERE workspace_id = $1 AND created_at BETWEEN $2 AND $3
 ```
 
-Python 侧算 `sha256(question)` 匹配。**musique 那 1 例重复 question 单独排除。**
+Python 侧用 `"sha256:" + hashlib.sha256(question.encode("utf-8")).hexdigest()`
+匹配。所选子集中的重复文本全部排除；同一哈希按 `created_at` 取窗口内最后一条。
 
 拿到 `metadata` 后做三段归因：
 
 | 分段 | 判据 | 说明 |
 | --- | --- | --- |
-| 召回上限 | `candidateChunkCount` vs gold 命中 | gold 是否**进过**候选集 |
-| 排序损失 | `rankedCandidateCount` vs `candidateChunkCount` | 进了候选但被 RRF/阈值刷掉 |
+| 候选为空 | `candidateChunkCount == 0` | 只证明候选为空，不能推断 gold 是否进过非空候选集 |
+| 排序损失 | `max(candidateChunkCount - rankedCandidateCount, 0)` | 候选数量减少，不是逐 gold 的损失归因 |
 | 授权损失 | `filteredChunkCount` | 排序通过但被第三道闸门丢弃 |
 
-没有这个分层，你只会得到「Recall@10 = 0.6」却不知道该调什么。
+这些计数帮助定位损失阶段；当前 `gold_hit` 来自离线 `hit@10`，
+不是候选集 gold 命中。报告不能把计数差解释为已证明的逐文档因果归因。
 
 **另外必须按 `retrievalMode` 切分报告** ——
 `high_completeness` 与 `high_completeness_fallback` 是两种召回口径，
@@ -535,6 +590,12 @@ Python 侧算 `sha256(question)` 匹配。**musique 那 1 例重复 question 单
 - `metrics.json` —— 全部指标，机器可读
 - `per_sample.jsonl` —— 每条 query 的逐项结果，便于定位坏样本
 - `report.md` —— 人读摘要，含 0.6 那条架构说明与本轮模型配置
+- `audit_join.json` —— 可选命令单独写入，含 `by_retrieval_mode` 与关联覆盖统计；
+  当前不合并进 `report.md`
+
+评测对重复 sample_id、未知 sample_id、question 不一致报错；缺响应文件的
+数据集会跳过，部分缺失样本列入 `missing_responses`，不会自动补成失败行。
+已有 HTTP 失败行参与指标统计。正式验收必须额外检查覆盖率，不能只看退出码。
 
 ---
 
@@ -549,35 +610,67 @@ Python 侧算 `sha256(question)` 匹配。**musique 那 1 例重复 question 单
 架构性错配。没有这个对照，五轮产出的绝对数字**无法回答
 「这套设计是否值得」** —— 而这是这个项目最该知道的答案。
 
-实现上不需要动 Akasha：直接读 `data/normalized/{dataset}/corpus.jsonl`，
-本地建一个同嵌入模型的向量索引即可。
+实现无需修改 Akasha：读取同一 run_id 的子集语料建立原文索引。
+需锁定语料、query、嵌入模型、分块、检索预算与生成配置；直接索引全量
+normalized corpus 会改变候选范围，不适合作为同子集对照。向量基线与 Akasha
+混合检索还存在机制差异，结果应说明这些差异，不能全部归因于 LLM 编译。
 
 ---
 
-## 10. 遗留事项
+## 10. 剩余工作与执行顺序
 
-来自 HANDOFF.md，需要你决定：
+### 10.1 正式在线运行前修复
 
-1. **SAG 那边复制了 8 个数据集文件到 `SAG/dataset/`**（约 136MB，与本仓重复）。
-   `SAG/.gitignore:138` 的 `/dataset/*` 已覆盖，不会误提交。
-   留着可作第六轮的对照 baseline；不需要就删，本仓的 `dataset/` 是原始副本。
-   **注意 narrativeqa 内联了 Project Gutenberg 书籍与 IMSDb 剧本正文，
-   按 `SAG/dataset/README.md` 不可再分发** —— 本仓 `.gitignore` 需确认已排除 `dataset/`
-2. **`SAG/scripts/_validate_datasets.py`** 未跟踪且未被 gitignore，
-   是 SAG 那边 `git status` 唯一未跟踪项。思路已吸收进本文 4.5，可删
-3. **`HANDOFF.md`**（本仓）已被本文完全吸收，确认后可删。
-   它未被 git 跟踪，删除不可恢复
-4. **本仓零提交**（`master` 无 commit）。建议在轮次 1 开始前先做首次提交，
-   确保后续工作可回溯
+- [ ] **下载路径迁移**：`scripts/download_dataset.py` 的 `DEST` 仍按脚本目录取
+  `dataset/`，实际会写到 `scripts/dataset/`；resolver 读取根目录 `dataset/`。
+  统一路径，并同步 README、脚本 docstring、resolver 的旧下载命令。
+  `.gitignore` 已排除根目录 `/dataset/`，未覆盖错误的新输出位置。
+- [ ] **跨数据集 page_map 身份**：`ingest._load_page_map` 仅以 `doc_id` 建字典，
+  多组数字 ID 会互相覆盖，影响续跑过滤、条数统计。改为 `(dataset, doc_id)`
+  并增加两组同 ID 的续跑测试，校验每组映射集合等于对应子集。
+- [ ] **强制前置质量闸门**：轮次 4 目前只要求轮次 3 manifest 存在，未检查
+  `quality_passed`、导入完整性或 `runs.timed_out`。轮次 3 的超时也未独立触发
+  失败退出，`--skip-compile` 可返回成功。补上正式运行的自动阻断与测试。
+- [ ] **网络异常与文件恢复**：明确捕获 `httpx.RequestError` 并将超时、断连落盘；
+  为响应及 page_map 追加 JSONL 的截断尾行制定恢复策略。已有失败行当前会被
+  续跑跳过，需要明确重试方式，避免简单追加造成重复 sample_id。
+- [ ] **续跑统计与审计时间窗**：响应文件累积保留，manifest 却被本次请求统计
+  覆盖，审计会漏掉早期请求。保存完整会话记录或从响应时间构造覆盖窗口，
+  并加强同 query 多次运行的匹配；测试续跑后的累计条数与审计覆盖率。
+
+### 10.2 真实数据与在线验收
+
+- [ ] 下载固定快照，执行四组 normalize 与 validate，记录新的哈希及去重 gold 分布。
+- [ ] 固定 seed/run_id 构建子集，确认每组 gold 覆盖及实际编译规模。
+- [ ] 先用单数据集小规模走通在线入库、查询、离线报告，再执行完整四组实验。
+- [ ] 记录 Akasha 版本/commit、模型配置与完整耗时；核对 HTTP 返回字段和质量诊断。
+- [ ] 明确未映射引用的计分分母；核对答案失败计分、缺失响应、证据存在性与
+  真正 span 校验的差异。NarrativeQA 在审计中没有 gold，其 gold_hit 不应混入
+  有 gold 数据集的准确率结论。
+- [ ] 可选审计配置 database_url/workspace_id 和 psycopg，核对 unmatched、
+  excluded、retrievalMode 切片；再决定是否把审计摘要合并进人读报告。
+
+### 10.3 后续工作
+
+- [ ] 实现 §9 的原文基线与固定实验配置对照。
+
+仓库已有提交（本次检查 HEAD 为 `6b74301`），不再保留“零提交、先首次提交”的
+旧待办。外部 SAG 文件清理不在本项目范围。本文仅记录当前代码缺口，未代替代码修复。
 
 ---
 
 ## 11. 各轮验收标准汇总
 
+下表是正式实验的验收目标；当前进度见文首，已知自动检查缺口见 §10。
+
 | 轮次 | 验收标准 |
 | --- | --- |
-| 1 归一化 | 四组全量通过适配器；gold 解析率 100%；无重复 ID；manifest 含 sha256 |
-| 2 抽样 | 每条 sample 的 gold 全在子集 corpus 内（覆盖率 100%）；musique 按跳数分层 |
-| 3 入库 | `page_map` 条数 == corpus 条数；质量报告 missing/stale 全为 0 |
-| 4 生成 | 每个 sample_id 恰好一行；失败数已记录；模型配置与轮次 3 一致 |
-| 5 指标 | narrativeqa 请求检索指标时抛异常而非返回 0；报告按 `retrievalMode` 切分 |
+| 1 归一化 | 四组全量通过；有 gold 的三组解析率 100%；无重复 ID；manifest 哈希匹配 |
+| 2 抽样 | gold 全在子集 corpus；MuSiQue 六层抽样；NarrativeQA 整篇保留；种子与哈希可追溯 |
+| 3 入库 | 每组 page_map 身份集合等于子集；无未完成编译；四项 camelCase 质量计数均为 0 |
+| 4 查询 | 全量 sample_id 恰好一行；失败均落盘；配置一致；续跑统计覆盖完整实验 |
+| 5 指标 | 覆盖率与失败数明确；全样本/knowledge 检索切片；NarrativeQA 省略无定义指标；报告注明架构边界 |
+| 可选审计 | 完整运行窗口；重复文本排除；未匹配数量明确；按 retrievalMode 汇总，计数归因不冒充候选 gold 验证 |
+
+当前测试基线：`uv run pytest tests/ -q`，2026-09-08 本地运行 **69 passed**。
+后续为 §10 的缺口补充有区分力的测试，并以真实产物完成各轮验收。

@@ -22,3 +22,4 @@ wheels/
 # Test and tooling caches
 .pytest_cache/
 .ruff_cache/
+.idea

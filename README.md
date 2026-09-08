@@ -3,7 +3,7 @@
 评测 Akasha 的多跳检索、引用归因与端到端答案质量。全部代码在本仓库，
 **不修改 Akasha 主仓库** —— Akasha 侧只通过 HTTP 访问。
 
-实施计划见 [PLAN.md](PLAN.md)，数据集字段说明见 [docs/datasets.md](docs/datasets.md)。
+实施计划见 [PLAN.md](docs/PLAN.md)，数据集字段说明见 [docs/datasets.md](docs/datasets.md)。
 
 ## 先读这一条
 
