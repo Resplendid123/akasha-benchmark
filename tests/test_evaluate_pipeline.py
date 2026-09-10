@@ -170,8 +170,10 @@ def test_evaluate_splits_knowledge_only_from_all_samples(workspace: Path):
     assert summary["retrieval"]["full_coverage@2"] == pytest.approx(1 / 3)
 
     # F1：只有 s1 答对，且答得与参考逐词相同，所以它那条是 1.0。
-    # 不报 EM，见 metrics/qa.py。
-    assert "em" not in summary["qa"]
+    # 这个 fixture 的 s1 是短跨度答案，所以 EM 跟 F1 一样是 1/3 ——
+    # 真实运行里 EM 会是 0（散文答案），见 metrics/qa.py。
+    assert summary["qa"]["em"] == pytest.approx(1 / 3)
+    assert summary["qa"]["em_knowledge_only"] == pytest.approx(1.0)
     assert summary["qa"]["f1"] == pytest.approx(1 / 3)
     assert summary["qa"]["f1_knowledge_only"] == pytest.approx(1.0)
     assert summary["answer_mode_distribution"]["no_match"] == pytest.approx(1 / 3)
@@ -228,15 +230,17 @@ def test_run_writes_all_three_artifacts(workspace: Path):
 
     report = (out / "report.md").read_text(encoding="utf-8")
     # 那条架构说明必须出现在每份报告里，不能只写在计划文档里。
-    assert "not valid" in report
-    assert "knowledge only" in report
-    # 不报 EM 的理由也要在报告里，否则熟悉 hotpotqa 的读者会去找这一列。
-    assert "no Exact Match column" in report
-    assert "| EM |" not in report
+    assert "无效的" in report
+    assert "仅 knowledge" in report
+    # EM 报出来了，但「为什么预期是 0」必须同时在报告里 ——
+    # 否则熟悉 hotpotqa 的读者看到 0.0000 会判断系统坏了。
+    assert "answer EM：" in report
+    assert "Exact Match 预期就是 0.0000" in report
+    assert "答案**形状**的探针" in report
 
     metrics = load_json(out / "metrics.json")
     assert metrics["datasets"][0]["dataset"] == DATASET
-    assert "em" not in metrics["datasets"][0]["qa"]
+    assert "em" in metrics["datasets"][0]["qa"]
 
 
 def test_report_tables_have_matching_column_counts(workspace: Path):

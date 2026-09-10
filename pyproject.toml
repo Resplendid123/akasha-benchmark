@@ -8,6 +8,7 @@ dependencies = [
     "httpx==0.28.1",
     "huggingface-hub==0.35.3",
     "numpy==2.5.3",
+    "psycopg[binary]==3.3.5",
     "pydantic==2.13.5",
 ]
 

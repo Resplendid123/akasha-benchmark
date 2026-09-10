@@ -8,12 +8,14 @@ multipart 的字段名、OWNER 闸门、质量闸门、续跑时的跳过逻辑�
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from akasha_benchmark import akasha_client as client_mod
 from akasha_benchmark.akasha_client import AkashaClient, AkashaError, unwrap_envelope
 from akasha_benchmark.config import AkashaConfig
 from akasha_benchmark.io_utils import atomic_write_json, atomic_write_jsonl, read_jsonl
@@ -260,8 +262,12 @@ def test_login_without_cookie_is_an_error(config: AkashaConfig):
         client.login()
 
 
-def test_query_records_non_2xx_without_raising(config: AkashaConfig):
-    """查询的非 2xx 不抛异常，交给调用方落盘。"""
+def test_query_records_non_2xx_without_raising(config: AkashaConfig, no_sleep: None):
+    """查询的非 2xx 不抛异常，交给调用方落盘。
+
+    替身返回的 503 属于可重试状态，所以这里走完整的重试再返回 —— 断言的是
+    「重试用尽后仍是 503 且不抛」。用 ``no_sleep`` 跳过退避，否则要真等 5 次。
+    """
     fake = FakeAkasha()
     fake.fail_query_for.add("bad question")
     with client_for(fake, config) as client:
@@ -269,6 +275,184 @@ def test_query_records_non_2xx_without_raising(config: AkashaConfig):
         response = client.query("bad question", ["space-1"])
     assert response.status == 503
     assert response.body["message"] == "unavailable"
+
+
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """退避的 sleep 换成空操作，测试不必真等。"""
+    monkeypatch.setattr(client_mod.time, "sleep", lambda _seconds: None)
+
+
+def _counting_handler(
+    statuses: list[int], payload: Any = None
+) -> tuple[Any, list[httpx.Request]]:
+    """按 ``statuses`` 依次返回状态码，用尽后一律 200。同时记下每次请求。"""
+    seen: list[httpx.Request] = []
+    remaining = list(statuses)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if remaining:
+            status = remaining.pop(0)
+            return httpx.Response(status, text="")
+        return enveloped(payload if payload is not None else {"ok": True})
+
+    return handler, seen
+
+
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
+def test_transient_status_is_retried_then_succeeds(
+    config: AkashaConfig, no_sleep: None, status: int
+):
+    """瞬时 5xx/429 要重试而不是让整个阶段退出。
+
+    这条是拿一次真实事故换回来的：编译 400 页要轮询上千次，dev server
+    （``nest start --watch``）偶发重启会返回 502，客户端不重试就让 ingest
+    进程直接退出 —— 而服务端的编译还在 BullMQ 里继续跑，于是没人接管进度、
+    manifest 也写不出来。
+    """
+    handler, seen = _counting_handler([status])
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client:
+        body = client.get("llm-wiki/admin/model-configs")
+    assert body == {"ok": True}
+    assert len(seen) == 2  # 一次失败 + 一次成功
+
+
+def test_transport_error_is_retried_then_succeeds(config: AkashaConfig, no_sleep: None):
+    """连接层异常（服务重启时的 connect reset）同样要重试。"""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return enveloped({"ok": True})
+
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client:
+        assert client.get("llm-wiki/admin/model-configs") == {"ok": True}
+    assert attempts["n"] == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422])
+def test_client_errors_are_not_retried(config: AkashaConfig, no_sleep: None, status: int):
+    """4xx 是请求本身的问题，重试只会放大 —— 必须一次就抛。"""
+    handler, seen = _counting_handler([status])
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client, pytest.raises(AkashaError) as excinfo:
+        client.get("llm-wiki/admin/model-configs")
+    assert excinfo.value.status == status
+    assert len(seen) == 1
+
+
+def test_retries_are_bounded_and_then_raise(config: AkashaConfig, no_sleep: None):
+    """一直 502 时不能无限重试，用尽次数后照常抛，由调用方决定怎么处理。"""
+    handler, seen = _counting_handler([502] * 50)
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client, pytest.raises(AkashaError) as excinfo:
+        client.get("llm-wiki/admin/model-configs")
+    assert excinfo.value.status == 502
+    assert len(seen) == client_mod.MAX_RETRIES + 1
+
+
+def test_multipart_retry_resends_the_whole_file(
+    tmp_path: Path, config: AkashaConfig, no_sleep: None
+):
+    """重试 multipart 前必须把文件句柄拨回开头。
+
+    不 rewind 的话第一次尝试已经把句柄读到末尾，重发的 body 是空的 ——
+    服务端会收下一个空文件并返回 200，于是「导入成功」但内容为空，
+    这种缺陷不报错，只会让后续召回莫名其妙地找不到东西。
+
+    导入本身是 ``retry=False``（见下一条），所以这里直接调 ``request``
+    把重试打开，锁住 rewind 这个通用行为。
+    """
+    md = tmp_path / "42.md"
+    md.write_text("# Title\n\nBody line\n", encoding="utf-8")
+    bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        if len(bodies) == 1:
+            return httpx.Response(502, text="")
+        return enveloped({"id": "page-1", "title": "Title"})
+
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client, md.open("rb") as handle:
+        response = client.request(
+            "POST",
+            "pages/import",
+            files={"file": (md.name, handle, "text/markdown")},
+            data={"spaceId": "space-1"},
+            retry=True,
+        )
+
+    assert response.body["id"] == "page-1"
+    assert len(bodies) == 2
+    # 两次都要带上完整正文，第二次不能是空 body。
+    for body in bodies:
+        assert b"Body line" in body
+    assert b'name="spaceId"' in bodies[1]
+
+
+def test_import_page_does_not_retry_ambiguous_failures(
+    tmp_path: Path, config: AkashaConfig, no_sleep: None
+):
+    """导入遇到 5xx 不重试 —— 服务端可能已建好 page，重试会建出第二个。
+
+    重复 page 不在 ``page_map`` 里，续跑发现不了，只会悄悄抬高语料规模。
+    缺篇相反是可发现、可续跑补齐的，所以这里宁可失败也不重试。
+    """
+    md = tmp_path / "42.md"
+    md.write_text("# Title\n\nBody\n", encoding="utf-8")
+    handler, seen = _counting_handler([502] * 10)
+
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client, pytest.raises(AkashaError) as excinfo:
+        client.import_page(md, "space-1")
+
+    assert excinfo.value.status == 502
+    assert len(seen) == 1
+
+
+def test_create_space_does_not_retry(config: AkashaConfig, no_sleep: None):
+    """建 Space 同样是写入，重试可能建出第二个，所以一次就抛。"""
+    handler, seen = _counting_handler([502] * 10)
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client, pytest.raises(AkashaError):
+        client.create_space(name="n", slug="s1")
+    assert len(seen) == 1
+
+
+def test_polling_endpoints_do_retry(config: AkashaConfig, no_sleep: None):
+    """只读的诊断端点必须重试 —— 编译 400 页要轮询上千次，一次 502 不能掀桌。"""
+    payload = {"statusCounts": {"compiling": 1}}
+    handler, seen = _counting_handler([502, 503], payload)
+    client = AkashaClient(config)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client:
+        assert client.run_diagnostics_summary(["space-1"]) == payload
+    assert len(seen) == 3
+
+
+def test_retry_delay_is_bounded_and_jittered(config: AkashaConfig):
+    """退避有上限且带抖动：上限防止越等越久，抖动避免并发请求齐步重试。"""
+    client = AkashaClient(config)
+    with client:
+        delays = [client._retry_delay(attempt) for attempt in range(10)]
+    assert all(0 < d <= client_mod.RETRY_MAX_DELAY * 1.25 for d in delays)
+    # 前几次应当随尝试次数增长（取抖动下界比较，避免偶发翻转）。
+    assert client._retry_delay(0) < client_mod.RETRY_MAX_DELAY
+    varied = {round(client._retry_delay(3), 6) for _ in range(20)}
+    assert len(varied) > 1
 
 
 def _write_subset(
@@ -498,10 +682,62 @@ def test_run_queries_writes_one_row_per_sample(
     }
 
 
-def test_run_queries_records_failures_as_rows(
+def test_run_queries_honours_concurrency(
     staged: Path, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """失败也占一行，并计入 manifest 的失败数。"""
+    """``concurrency`` 要真的并发，而不是只写进 manifest。
+
+    并发下每个 worker 持有独立客户端（限流器用共享状态，共用一个实例会互相踩），
+    所以登录次数应当等于并发度。行序变成完成顺序，因此按集合断言。
+    """
+    _prepare_query_stage(staged)
+    config = replace(config, concurrency=3)
+    fake = FakeAkasha()
+    _patch_client(monkeypatch, rq_mod, fake, config)
+
+    assert rq_mod.run(RUN_ID, [DATASET], None, staged, None, None, False) == 0
+
+    rows = list(read_jsonl(rq_mod.responses_dir(RUN_ID, staged) / f"{DATASET}.jsonl"))
+    assert {r["sample_id"] for r in rows} == {f"{DATASET}:s1", f"{DATASET}:s2"}
+    assert all(r["http_status"] == 200 for r in rows)
+    logins = [path for method, path in fake.requests if path == "/api/auth/login"]
+    assert len(logins) == 3
+    manifest = json.loads(
+        (rq_mod.responses_dir(RUN_ID, staged) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["concurrency"] == 3
+    assert manifest["total_failures"] == 0
+
+
+def test_run_queries_concurrent_resume_skips_completed_rows(
+    staged: Path, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
+):
+    """并发路径同样要能续跑：已有行的 sample 不再重新请求。"""
+    _prepare_query_stage(staged)
+    config = replace(config, concurrency=3)
+    out_path = rq_mod.responses_dir(RUN_ID, staged) / f"{DATASET}.jsonl"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps({"sample_id": f"{DATASET}:s1", "http_status": 200}) + "\n",
+        encoding="utf-8",
+    )
+
+    fake = FakeAkasha()
+    _patch_client(monkeypatch, rq_mod, fake, config)
+    assert rq_mod.run(RUN_ID, [DATASET], None, staged, None, None, False) == 0
+
+    assert [q["query"] for q in fake.queries] == ["second question"]
+    rows = list(read_jsonl(out_path))
+    assert {r["sample_id"] for r in rows} == {f"{DATASET}:s1", f"{DATASET}:s2"}
+
+
+def test_run_queries_records_failures_as_rows(
+    staged: Path, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch, no_sleep: None
+):
+    """失败也占一行，并计入 manifest 的失败数。
+
+    替身的 503 会先走完重试，``no_sleep`` 让这里不必真等退避。
+    """
     _prepare_query_stage(staged)
     fake = FakeAkasha()
     fake.fail_query_for.add("second question")
@@ -519,12 +755,15 @@ def test_run_queries_records_failures_as_rows(
 
 
 def test_run_queries_records_transport_errors_instead_of_crashing(
-    staged: Path, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
+    staged: Path, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch, no_sleep: None
 ):
-    """断连/超时要落盘成失败行，并且不能中断后面的样本。
+    """断连/超时**重试用尽后**要落盘成失败行，并且不能中断后面的样本。
 
     ``httpx.RequestError`` 不是 ``OSError`` 的子类，漏掉它的话跑到一半
     网络抖一下整个阶段就带 traceback 崩掉，那一行也不会落盘。
+
+    这里断言的错误串仍以 ``ConnectError:`` 开头 —— 客户端重试用尽后原样抛出
+    传输层异常，不包成 ``AkashaError``，否则上面那条捕获通路就断了。
     """
     _prepare_query_stage(staged)
     fake = FakeAkasha()

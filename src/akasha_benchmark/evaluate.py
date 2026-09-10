@@ -158,8 +158,11 @@ def evaluate_dataset(
         "answer_mode_distribution": qa.answer_mode_distribution(
             [e["answer_mode"] for e in per_sample]
         ),
-        # 只有 F1，没有 EM：EM 对散文答案恒等于 0，不随质量变化。见 metrics/qa.py。
+        # EM 预期恒为 0（散文答案对不上短跨度参考），当形态探针读；F1 才是质量指标。
+        # 见 metrics/qa.py 与 metrics.md「答案质量」。
         "qa": {
+            "em": _mean([e["qa"]["em"] for e in per_sample]),
+            "em_knowledge_only": _mean([e["qa"]["em"] for e in knowledge_rows]),
             "f1": _mean([e["qa"]["f1"] for e in per_sample]),
             "f1_knowledge_only": _mean([e["qa"]["f1"] for e in knowledge_rows]),
         },
@@ -185,7 +188,10 @@ def evaluate_dataset(
                 "count": len(rows),
                 "retrieval": retrieval.aggregate([r["retrieval"] for r in rows]),
                 "multihop": multihop.aggregate([r["multihop"] for r in rows]),
-                "qa": {"f1": _mean([r["qa"]["f1"] for r in rows])},
+                "qa": {
+                    "em": _mean([r["qa"]["em"] for r in rows]),
+                    "f1": _mean([r["qa"]["f1"] for r in rows]),
+                },
                 "knowledge_answer_share": len(knowledge) / len(rows) if rows else 0.0,
             }
         summary["stratified"] = {"key": key, "strata": strata}
@@ -205,35 +211,34 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
     读者会拿这些数字直接跟公开 baseline 比，而那个比较是无效的。
     """
     lines = [
-        f"# Akasha-Benchmark report — {run_id}",
+        f"# Akasha-Benchmark 评测报告 — {run_id}",
         "",
-        f"Generated {context['generated_at']}.",
+        f"生成于 {context['generated_at']}。",
         "",
-        "## How to read these numbers",
+        "## 这些数字该怎么读",
         "",
-        "Akasha's dense and lexical recall run over compiler-generated text",
-        "(`knowledge_chunks` indexes `artifact.markdown`), not the source documents.",
-        "Source text lives in `knowledge_source_chunks`, which does not take part in",
-        "recall and only supplies evidence windows during citation resolution. Two",
-        "consequences: Recall@k is systematically depressed in a way no amount of",
-        "tuning fixes, and multi-hop performance may be inflated because the compiler",
-        "can merge entities across documents into a single artifact. **Comparing these",
-        "figures directly against published baselines is not valid.** The only",
-        "meaningful control is the raw-text baseline.",
+        "Akasha 的向量召回与词法召回跑在**编译产物**上，而不是原始文档：",
+        "`knowledge_chunks` 索引的是 `artifact.markdown`。原文存在",
+        "`knowledge_source_chunks` 里，它不参与召回，只在解析引用时提供证据窗口。",
+        "两个后果：Recall@k 被系统性压低，且这种压低不是调参能补回来的；多跳表现",
+        "则可能被高估，因为编译器会把跨文档的实体合并进同一份产物。",
+        "**因此把这里的数字直接与公开 baseline 对比是无效的。**唯一有意义的对照",
+        "是原文基线（raw-text baseline）。",
         "",
-        "`no_match` and `general` answers return an empty `retrievedSources`, so their",
-        "retrieval scores are 0 by construction. Each retrieval table therefore appears",
-        "twice: over all samples, and over `knowledge` answers only. The difference is",
-        "generation-side rejection, not retrieval failure.",
+        "`no_match` 和 `general` 两种回答返回空的 `retrievedSources`，它们的检索得分",
+        "按定义就是 0。所以每张检索表都给两份：一份是全样本，一份只算 `knowledge`",
+        "回答。两者之差反映的是生成侧的拒答，不是检索失败。",
         "",
-        "**There is no Exact Match column, deliberately.** EM requires the whole",
-        "normalized answer to equal the reference, but Akasha answers in explanatory",
-        "prose while these datasets reference short spans, so EM is identically 0",
-        "regardless of answer quality, and a metric with no variance carries no",
-        "information. Answer F1 is kept but is diluted by the same verbosity, so read",
-        "it only across configurations of this system, never against published numbers.",
+        "**这里的 Exact Match 预期就是 0.0000，这不是故障。**",
+        "EM 要求归一化后的整段答案与参考答案完全相等，而 Akasha 用解释性散文作答，",
+        "这些数据集的参考答案却是短跨度，两者不可能相等。实测过：三条内容正确、",
+        "且 gold 全部召回（`recall@10` = `full_coverage@10` = 1.000）的答案，EM 仍是 0.000。",
+        "把 EM 当作答案**形状**的探针，而不是答案质量的度量：它变成非零意味着生成侧",
+        "开始输出短跨度，而不是答案变好了。Answer F1 被同样的冗长度稀释（精确率被",
+        "压垮，因为分母是 20-40 个散文 token，而参考答案只有 1-5 个 token），所以它",
+        "只能用于比较本系统的不同配置，绝不能与公开数字对比。",
         "",
-        "## Model configuration",
+        "## 模型配置",
         "",
         "```json",
         context["model_configs_excerpt"],
@@ -245,17 +250,20 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
         lines += [
             f"## {summary['dataset']}",
             "",
-            f"- samples: {summary['responses_evaluated']}/{summary['samples_in_subset']}"
-            f" (http failures: {summary['http_failures']})",
-            f"- answer modes: {summary['answer_mode_distribution']}",
-            f"- answer F1: {summary['qa']['f1']:.4f}"
-            f"  (knowledge-only: {summary['qa']['f1_knowledge_only']:.4f})",
+            f"- 样本数：{summary['responses_evaluated']}/{summary['samples_in_subset']}"
+            f"（HTTP 失败：{summary['http_failures']}）",
+            f"- 回答模式分布：{summary['answer_mode_distribution']}",
+            f"- answer EM：{summary['qa']['em']:.4f}"
+            f"（仅 knowledge：{summary['qa']['em_knowledge_only']:.4f}）"
+            " — 预期为 0，原因见上",
+            f"- answer F1：{summary['qa']['f1']:.4f}"
+            f"（仅 knowledge：{summary['qa']['f1_knowledge_only']:.4f}）",
         ]
         if "retrieval" in summary:
             overall, knowledge = summary["retrieval"], summary["retrieval_knowledge_only"]
             lines += [
                 "",
-                "| metric | all samples | knowledge only |",
+                "| 指标 | 全样本 | 仅 knowledge |",
                 "| --- | --- | --- |",
             ]
             for key in sorted(overall):
@@ -263,38 +271,39 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
             multi = summary["multihop"]
             lines += [
                 "",
-                f"- graph-neighbor share: {multi['graph_neighbor_share']:.4f};"
-                f" precision {multi['graph_neighbor_precision']:.4f}",
-                f"- gold reachable only via graph expansion:"
-                f" {multi['graph_exclusive_gold_share']:.4f}",
-                f"- gold hit rate by signal: "
-                + ", ".join(f"{r}={v:.3f}" for r, v in multi["reason_gold_rate"].items()),
-                f"- citation precision/recall:"
-                f" {summary['attribution']['citation_precision']:.4f} /"
+                f"- 图邻居占比：{multi['graph_neighbor_share']:.4f}；"
+                f"精确率 {multi['graph_neighbor_precision']:.4f}",
+                f"- 仅靠图扩展才能到达的 gold 占比："
+                f"{multi['graph_exclusive_gold_share']:.4f}",
+                "- 各信号的 gold 命中率："
+                + "、".join(f"{r}={v:.3f}" for r, v in multi["reason_gold_rate"].items()),
+                f"- 引用精确率/召回率："
+                f"{summary['attribution']['citation_precision']:.4f} /"
                 f" {summary['attribution']['citation_recall']:.4f}",
-                f"- truncation loss: {summary['attribution']['truncation_loss']:.2f} docs,"
-                f" of which gold: {summary['attribution']['truncated_gold']:.2f}",
-                f"- evidence-verifiable citations:"
-                f" {summary['attribution']['evidence_verifiable_rate']:.4f}",
+                f"- 截断损失：{summary['attribution']['truncation_loss']:.2f} 篇，"
+                f"其中 gold {summary['attribution']['truncated_gold']:.2f} 篇",
+                f"- 证据可验证的引用占比："
+                f"{summary['attribution']['evidence_verifiable_rate']:.4f}",
                 "",
-                f"### Stratified by `{summary['stratified']['key']}`",
+                f"### 按 `{summary['stratified']['key']}` 分层",
                 "",
-                "| stratum | n | recall@10 | full_coverage@10 | F1 | knowledge share |",
-                "| --- | --- | --- | --- | --- | --- |",
+                "| 分层 | n | recall@10 | full_coverage@10 | EM | F1 | knowledge 占比 |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
             ]
             for name, bucket in summary["stratified"]["strata"].items():
                 lines.append(
                     f"| {name} | {bucket['count']} |"
                     f" {bucket['retrieval'].get('recall@10', 0.0):.4f} |"
                     f" {bucket['retrieval'].get('full_coverage@10', 0.0):.4f} |"
+                    f" {bucket['qa']['em']:.4f} |"
                     f" {bucket['qa']['f1']:.4f} |"
                     f" {bucket['knowledge_answer_share']:.4f} |"
                 )
             if summary["unmapped_page_ids"]:
                 lines += [
                     "",
-                    f"> {len(summary['unmapped_page_ids'])} retrieved page ids are absent from"
-                    " `page_map`. They keep their rank slot but can never count as gold.",
+                    f"> 有 {len(summary['unmapped_page_ids'])} 个被检索到的 page id 不在"
+                    " `page_map` 里。它们仍占据排名位次，但永远不可能被算作 gold。",
                 ]
         else:
             lines += ["", f"> {summary['retrieval_note']}"]
@@ -357,7 +366,7 @@ def run(
     for summary in summaries:
         line = (
             f"ok   {summary['dataset']:<16} n={summary['responses_evaluated']:<4} "
-            f"F1={summary['qa']['f1']:.3f}"
+            f"EM={summary['qa']['em']:.3f} F1={summary['qa']['f1']:.3f}"
         )
         if "retrieval" in summary:
             line += (

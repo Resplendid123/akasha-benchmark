@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +40,33 @@ TERMINAL_RUN_STATUSES = frozenset(
 ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "compiling", "aggregate_pending", "aggregating"}
 )
+
+# 只重试瞬时故障。502/503/504 是 dev server 重启或代理抖动，429 是限流，
+# 都与请求内容无关，重发就能过。4xx 不在其列 —— 那是请求本身的问题。
+RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+RETRYABLE_EXCEPTIONS = (httpx.TransportError,)
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 2.0
+RETRY_MAX_DELAY = 30.0
+
+
+def _rewind_files(files: Any) -> None:
+    """把 multipart 里的文件句柄拨回开头，供重试重新读取。
+
+    ``httpx`` 的 files 可以是 dict 或 (name, value) 列表，value 又可以是
+    裸句柄或 ``(filename, handle, content_type)`` 元组，所以这里逐层剥。
+    不可 seek 的对象（比如生成器）跳过 —— 那种情况下重试本就不安全，
+    交给上层的 4xx/5xx 判断去处理。
+    """
+    values = files.values() if isinstance(files, dict) else [v for _, v in files]
+    for value in values:
+        handle = value[1] if isinstance(value, (tuple, list)) and len(value) > 1 else value
+        seek = getattr(handle, "seek", None)
+        if callable(seek):
+            try:
+                seek(0)
+            except (OSError, ValueError):
+                pass
 
 
 def unwrap_envelope(body: Any) -> Any:
@@ -125,15 +154,13 @@ class AkashaClient:
         files: Any | None = None,
         data: Any | None = None,
         raise_for_status: bool = True,
+        retry: bool = True,
     ) -> Response:
+        """``retry=False`` 用于结果有歧义就会造成重复的写入端点，见 :meth:`import_page`。"""
         url = self.config.api(path)
-        self._throttle()
-        started = time.perf_counter()
-        try:
-            response = self._client.request(method, url, json=json_body, files=files, data=data)
-        finally:
-            self._last_request_at = time.monotonic()
-        latency_ms = int((time.perf_counter() - started) * 1000)
+        response, latency_ms = self._request_with_retry(
+            method, url, json_body, files, data, retry
+        )
 
         try:
             body: Any = response.json() if response.content else None
@@ -146,6 +173,78 @@ class AkashaClient:
         if raise_for_status and not response.is_success:
             raise AkashaError(method, url, response.status_code, response.text)
         return Response(status=response.status_code, body=body, latency_ms=latency_ms)
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        json_body: Any | None,
+        files: Any | None,
+        data: Any | None,
+        retry: bool = True,
+    ) -> tuple[httpx.Response, int]:
+        """发一次请求，瞬时故障按退避重试，返回 ``(response, latency_ms)``。
+
+        重试只针对 :data:`RETRYABLE_STATUSES` 和连接层异常 —— 这些是 dev server
+        重启（``nest start --watch``）或反向代理抖动的表现，与请求内容无关。
+        4xx 一律不重试：那是请求本身的问题，重试只会放大。
+
+        不重试的代价在长任务上很实际：编译 400 页要轮询上千次，途中任何一次
+        502 都会让整个 ingest 进程退出，而服务端的编译还在 BullMQ 里继续跑，
+        于是产物写不出来、进度也无人接管。
+
+        ``retry=False`` 关掉重试，留给结果有歧义的写入端点用 —— 见 :meth:`import_page`。
+        """
+        max_retries = MAX_RETRIES if retry else 0
+        attempt = 0
+        while True:
+            # multipart 的文件句柄在上一次尝试里已被读到末尾，重试前必须回到开头，
+            # 否则重发的是空 body，服务端会收下一个空文件。
+            if files and attempt:
+                _rewind_files(files)
+            self._throttle()
+            started = time.perf_counter()
+            try:
+                response = self._client.request(
+                    method, url, json=json_body, files=files, data=data
+                )
+            except RETRYABLE_EXCEPTIONS as exc:
+                self._last_request_at = time.monotonic()
+                # 重试用尽后原样抛出，不包成 AkashaError —— 调用方（run_queries）
+                # 按 httpx.RequestError 捕获传输层失败并落盘，换了异常类型
+                # 那条通路就断了，一次网络抖动会让整个阶段带 traceback 崩掉。
+                if attempt >= max_retries:
+                    raise
+                delay = self._retry_delay(attempt)
+                print(
+                    f"  retry {attempt + 1}/{max_retries} after {type(exc).__name__} "
+                    f"on {method} {url} in {delay:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            finally:
+                self._last_request_at = time.monotonic()
+            latency_ms = int((time.perf_counter() - started) * 1000)
+
+            if response.status_code in RETRYABLE_STATUSES and attempt < max_retries:
+                delay = self._retry_delay(attempt)
+                print(
+                    f"  retry {attempt + 1}/{max_retries} after HTTP {response.status_code} "
+                    f"on {method} {url} in {delay:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            return response, latency_ms
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        """指数退避，带抖动，并设上限。抖动避免多个请求在同一刻齐步重试。"""
+        base = min(RETRY_BASE_DELAY * (2**attempt), RETRY_MAX_DELAY)
+        return base * (0.75 + random.random() * 0.5)
 
     def post(self, path: str, json_body: Any | None = None, **kwargs: Any) -> Any:
         return self.request("POST", path, json_body=json_body, **kwargs).body
@@ -182,8 +281,12 @@ class AkashaClient:
 
     def create_space(self, name: str, slug: str, description: str = "") -> dict[str, Any]:
         # slug 必须是纯字母数字（CreateSpaceDto 的 @IsAlphanumeric），长度 2-100。
+        # 与 import_page 同理不重试：建 Space 是写入，重试可能建出第二个。
+        # slug 唯一约束大概率会拦住，但报错形态会变成难懂的冲突而不是原本的 502。
         return self.post(
-            "spaces/create", {"name": name, "slug": slug, "description": description}
+            "spaces/create",
+            {"name": name, "slug": slug, "description": description},
+            retry=False,
         )
 
     def delete_space(self, space_id: str) -> Any:
@@ -201,12 +304,20 @@ class AkashaClient:
 
         导入服务会取首个 Markdown heading 当 page title 并从正文移除，
         所以文件名只承担 doc_id 的职责，两者互不干扰。
+
+        **不重试**（``retry=False``）。5xx 的结果是有歧义的：服务端可能已经建好 page，
+        只是代理在响应前挂了。重试于是建出第二个 page —— 语料里多一篇没人引用的重复，
+        它不在 ``page_map`` 里，续跑也发现不了，只会悄悄抬高语料规模并污染检索指标。
+
+        不重试的代价很小：导入失败会被记进 ``failures`` 并继续跑下一篇，
+        而入库阶段本身可续跑，重跑一次就会把缺的补上（缺篇能被发现，重复不能）。
         """
         with markdown_path.open("rb") as handle:
             return self.post(
                 "pages/import",
                 files={"file": (markdown_path.name, handle, "text/markdown")},
                 data={"spaceId": space_id},
+                retry=False,
             )
 
     # --- 知识编译 ---
@@ -226,8 +337,20 @@ class AkashaClient:
     def quality_diagnostics(self, space_ids: list[str]) -> dict[str, Any]:
         return self.post("llm-wiki/admin/diagnostics/quality", {"spaceIds": space_ids})
 
-    def retry_pages(self, space_ids: list[str], **kwargs: Any) -> dict[str, Any]:
-        return self.post("llm-wiki/admin/retry-pages", {"spaceIds": space_ids, **kwargs})
+    def retry_pages(self, page_ids: list[str]) -> dict[str, Any]:
+        """按源页 id 重试编译，一次最多 100 篇。
+
+        服务端 DTO（``admin-retry-pages.dto.ts``）只认 ``pageIds``，且要求页面
+        在编译 run 里出现过 —— 失败页也算，所以这是补 ``partial`` 缺口的正道：
+        它建的是 ``page_retry`` run，范围恰好是这些页，不会像 ``follow_up``
+        那样把整个 space 拖去重编译。
+        """
+        return self.post("llm-wiki/admin/retry-pages", {"pageIds": page_ids})
+
+    def cancel_run(self, run_id: str, reason: str | None = None) -> dict[str, Any]:
+        """取消一个未终态的编译 run。``reason`` 会进审计日志，上限 400 字。"""
+        body = {"reason": reason} if reason else {}
+        return self.post(f"llm-wiki/admin/compilation-runs/{run_id}/cancel", body)
 
     # --- 模型配置 ---
 

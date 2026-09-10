@@ -5,7 +5,8 @@
 
 实施计划见 [PLAN.md](docs/PLAN.md)，数据集字段说明见 [docs/datasets.md](docs/datasets.md)，
 接口请求／响应样例见 [docs/akasha_api.md](docs/akasha_api.md)，
-评测指标见 [docs/metrics.md](docs/metrics.md)。
+评测指标见 [docs/metrics.md](docs/metrics.md)，
+逐样本追到根因的排查记录见 [docs/cases/](docs/cases/)。
 
 ## 先读这一条
 

@@ -401,13 +401,16 @@ None，闸门会假通过，然后拿一个半成品库跑出一堆没意义的�
   `requested=0 / skipped=3`，`page_map` 9→9 行、响应 3→3 行都没长。报告侧
   `missing_responses` 与 `unmapped_page_ids` 均为空。
 - [ ] 执行完整四组实验（1722 篇）。单篇编译约 40 秒是主要成本。
-- [x] **EM 已移除。** 冒烟实测 `recall@10` / `full_coverage@10` / `mrr` 全 1.000、
-  三条答案全部实质正确，EM 仍是 0.000 —— Akasha 返回解释性散文，参考答案是短跨度，
-  整串相等不可能成立，所以 EM 恒为 0 且没有方差，零信息量。不报比报出来再附免责
-  说明更诚实。F1 保留（那三条 0.054 / 0.087 / 0.143，随质量变化），但绝对值被
-  解释性 token 稀释，只可同配置比较。`Capability.ANSWER_EM_F1` 一并改名
-  `ANSWER_F1`，其值 `answer_f1` 会出现在 `metrics.json` 的 `capabilities` 里。
-  依据见 [metrics.md](metrics.md)「为什么没有 Exact Match」。
+- [x] **EM 报出来，但按形态探针读。** 冒烟实测 `recall@10` / `full_coverage@10` /
+  `mrr` 全 1.000、三条答案全部实质正确，EM 仍是 0.000 —— Akasha 返回解释性散文，
+  参考答案是短跨度，整串相等不可能成立，所以 EM 预期恒为 0。它一度被移除（零信息量），
+  现改为报出并在 `report.md` 表格上方直接写明「预期为 0」：熟悉 hotpotqa 的读者会
+  主动去找这一列，少一列比多一列 0 更容易被误读。EM 变成非 0 的含义是生成端改了
+  答案形态，不是答案变对了。F1 同时保留（那三条 0.054 / 0.087 / 0.143，随质量变化），
+  绝对值被解释性 token 稀释，只可同配置比较。`Capability.ANSWER_F1`
+  （值 `answer_f1`，出现在 `metrics.json` 的 `capabilities` 里）**未随之改名**，
+  它标的是「这个数据集有参考答案可打分」，与报几个指标无关。
+  两个指标的计算式、逐 token 分解与低分归因见 [metrics.md](metrics.md)「答案质量 QA」。
 - [ ] 决定要不要加 containment 类宽松指标（答案是否**包含**参考答案）。目前没有实现：
   它同样有偏，散文越长越容易蒙中。加不加取决于要回答什么问题。
 - [ ] 记录 Akasha 版本/commit、模型配置与完整耗时；核对 HTTP 返回字段和质量诊断。
@@ -438,4 +441,296 @@ None，闸门会假通过，然后拿一个半成品库跑出一堆没意义的�
 23 个 skip 是 `tests/test_live_akasha.py` 的单样本在线冒烟，需要 `AKASHA_LIVE=1`
 和在线的 Akasha 才跑（`make smoke`）；同日已在真实 Akasha 上 23 项全过。
 后续为 §10.1 的缺口补充有区分力的测试，并以真实产物完成各阶段验收。
+
+---
+
+## 12. 评测平台（设计已定，尚未实现）
+
+在本仓库与 Akasha 之上加一个 Web 评测平台：跑评测、看数据处理过程、
+配指标与模型、追样本与归因。**本章只记已定的决策与理由，代码一行未写。**
+
+Akasha 侧仍然只通过 HTTP（加一条只读 SQL），不修改 Akasha 主仓库 —— 这条不变。
+
+### 12.1 定了的二十条
+
+| # | 决策 | 理由要点 |
+| --- | --- | --- |
+| 1 | 观测与执行控制都做 | 顺序待定，见 §12.6 |
+| 2 | **数据库当事实来源**，归一化产物入库 | 文件降级为可选导出；代价见 §12.2 |
+| 3 | 评测端 SQLite，Akasha 链路走只读 Postgres | 方向单向：SQLite 可写权威，PG 只读外来 |
+| 4 | Akasha 审计数据**抄进 SQLite 存档** | `knowledge_query_audit` 是运行时表，会随容器重建消失 |
+| 5 | run 按成本边界**拆三层** | 索引层 / 查询层 / 评测层，见 §12.3 |
+| 6 | 单活模型配置 + 硬闸门 | embedding 不匹配=拒绝执行；compiler 不匹配=警告 |
+| 7 | 阶段任务走 **subprocess**，进度写库 | 15 小时任务不能与 Web 后端同生命周期 |
+| 8 | 查询并发做成旋钮，默认 1 | 把死字段 `concurrency` 的语义补活 |
+| 9 | **judge 是指标**，不是新的一层 | 与 F1/recall 同层，只是需要模型 |
+| 10 | capability 从「指标名」改成「**数据依赖**」 | 见 §12.4 |
+| 11 | judge provider 前端配、落库 | 但 `api_key` 不落库，见第 12 条 |
+| 12 | 库只存非密字段，`api_key` 走环境变量 | db 文件不因此变成密钥文件 |
+| 13 | judge 失败**该条排除**，另叠失败率闸门 | 记 0 会让限流伪装成质量差 |
+| 14 | 标注三层，**只有样本层跨 run 继承** | 样本层是资产，另两层是笔记 |
+| 15 | LLM 归因**只给原始材料**，不给已算指标 | 否则标签与指标的交叉验证变成空的 |
+| 16 | 公开数据集与自有知识库**互相校准** | 四组公开数据是 judge 唯一的校准路径 |
+| 17 | 标注与 ground truth 功能**预留** | schema 留字段，界面不做 |
+| 18 | 后端 FastAPI + uvicorn | pydantic 2.13.5 已是硬依赖，直接复用 |
+| 19 | 前端 Vite + React + TypeScript | 三个重交互视图；指标字段「可能不存在」需类型建模 |
+| 20 | 同仓库平铺，手写 SQL 迁移 + 迁移前自动备份 | 平台与 benchmark 共享数据层，非单向依赖 |
+
+### 12.2 库当事实来源要付的代价
+
+现在整个项目的完整性保证**建立在文件上**。改成库权威，这四条要跟着搬，
+而它们全都落在「错了不报错、只给出看着合理的假结果」的地带：
+
+1. 各阶段 manifest 记的上游 sha256 链。
+2. `ingest` 导入前重算每篇 md 的 sha256，与子集 manifest 不符直接抛错。
+3. 续跑判据 —— 读已有 `page_map.jsonl` / 响应 jsonl 跳过已完成条目。
+4. `evaluate` 两道闸门：`sample_id` 不在子集里报错、ID 对得上但 question 文本不一致报错。
+
+**必须保住的性质**：`normalize` / `subset` / `evaluate` 目前完全不依赖 Akasha 在线，
+改造后仍须如此（这也是选 SQLite 而非复用 Akasha 那个 Postgres 的主要理由）。
+
+**写事务必须短、逐批提交**。否则 Web 端在 ingest 的 15 小时里读不到进度，
+第 1 条决策要的观测就废了。
+
+索引里不塞全文：narrativeqa 原始 QA 文件 94MB 是因为每行内联整篇正文
+（约 210KB × 293 行，实际只有 10 篇不同文档）。存标识、指标、指针与短字段，
+正文按需读；真要全文搜索再上 SQLite FTS，那是单独一件事。
+
+### 12.3 三层的边界是 Akasha 的约束画出来的
+
+| 层 | 由什么决定 | 成本 |
+| --- | --- | --- |
+| **索引层** | subset 配置（seed/qa-limit/negatives-ratio）+ compiler + embedding | 约 15 小时 / 1722 篇 |
+| **查询层** | 挂某个索引层 + answer 模型 + `scoreThreshold` + 并发度 | 10–14 秒 × 每条 |
+| **评测层** | 挂某个查询层 + 指标组 + k（+ judge 配置） | 确定性指标秒级；judge 有网络成本 |
+
+分层依据是模型配置的重编译语义：compiler/embedding 改了必须重编译（索引层），
+answer 改了不用（查询层）。`put_model_config` 已实现于
+`akasha_client.py:349` 但**全仓库零调用**，answer 模型热切换只需接上它。
+
+**embedding 是唯一会静默失效的那个**：换模型后旧 chunk 的 `embedding_profile`
+对不上，那些 chunk 永远召回不到（`ingest.py:11`、§6.1），而评测会照常算出
+一份「recall 低、拒答率高」的报告 —— 看起来像配置差，实际是索引与 embedding 错配。
+所以闸门对 embedding 不匹配必须**拒绝执行**，不是警告。
+
+真要做 embedding 对照实验，起第二个 Akasha 实例比切换全局配置更实际。
+
+### 12.4 capability 反转成数据依赖
+
+现有两个 capability 的**值**已经是数据依赖的意思，只是名字取的是指标名：
+
+```
+EVIDENCE_RECALL = "evidence_recall"   # 实际含义：有 gold 文档标注
+ANSWER_F1       = "answer_f1"         # 实际含义：有参考答案
+```
+
+judge 指标的依赖与这两个对不齐 —— faithfulness / answer relevancy
+**不需要任何标注**，对四组都成立，声明它们没有信息量。所以反转成
+「指标声明依赖、数据集声明拥有、闸门做集合比对」，新增指标不再碰枚举，
+而「拒绝计算而不是返回 0.0」的保护自动继承。
+
+**一个具体收获**：narrativeqa 现在整组检索指标省略（无 gold），
+而 faithfulness / context precision 不需要 gold 文档就能算 —— judge 能填上这个洞，
+且它恰恰最需要（46% 的参考答案措辞在原文里根本不存在，F1 绝对值信息量最低）。
+
+改造顺带清一笔账：磁盘上 `data/normalized/*/manifest.json` 与
+`data/subsets/run001/*/manifest.json` 记的是 `answer_em_f1`，当前代码是
+`answer_f1`（产物早于改名）。这个不一致已经存在，一起清掉。
+
+### 12.5 judge、归因与标注是三件不同的事
+
+别合。三者的产物、去向、汇总语义都不同：
+
+| | 产物 | 去向 | 参与汇总 |
+| --- | --- | --- | --- |
+| **judge 指标** | 分数 | 指标层 | 是 |
+| **LLM 归因** | 结构化标签 + 理由 | 标注表（作者=模型） | 否 |
+| **人工标注** | 同上 | 标注表（作者=human） | 否 |
+
+后两者同表、只差作者列，因此 judge-human 一致率是一个 `GROUP BY` 就能算出来的
+免费产物 —— 而它是判断「这个 LLM 归因能不能信」的唯一办法。
+
+**标签取值**从现有分析里提炼，它们本来就是 metrics.md 已区分开的归因类别：
+`annotation_wording`（gold 全名 vs 模型通称）、`answer_form`（散文稀释）、
+`gold_incomplete`、`retrieval_miss`、`citation_dropped`（对应 `truncated_gold`）、
+`question_ambiguous`。有标签才能回答「这批低分里多少是标注问题、多少是真检索失败」。
+
+**标签与指标可交叉验证**：标了 `citation_dropped` 的样本，`truncated_gold` 应 > 0。
+不一致说明判断或指标有一个错了 —— 这本身是有用信号，也是
+第 15 条决策（归因不看指标）存在的理由：看过指标再出标签，这条验证就变成空的。
+
+judge 失败要分四类记（限流 / 超时 / 解析失败 / 模型拒答），处置完全不同。
+重试直接复用 `akasha_client.py` 那套（`RETRYABLE_STATUSES = {429,502,503,504}`、
+5 次指数退避带抖动、4xx 不重试），语义对 judge 适用，不必重写。
+
+judge provider 配置进指标层的身份哈希时，**只能进 `base_url` + `model`，
+绝不能进 api_key**。`redacted()` 建议改成白名单式（现在是黑名单，
+漏写一个字段就泄露密钥）。
+
+### 12.6 ground truth 的取巧办法与它的偏差（预留功能）
+
+自有知识库上标 gold 文档的候选不必从全库找 —— 从**多次查询的
+`retrievedSources` 并集**里找就够（几十篇而非几千篇），LLM 判候选、人确认。
+
+**但这个取巧有必须写进报告的偏差**：从召回并集标出的 gold，天然排除了
+「所有配置都没召回到的那些真 gold」。所以据此算出的 recall@k 是**偏高的上界**，
+能回答「配置 A 比 B 好多少」，不能回答「绝对检索水平如何」。
+性质与 §0.3 同类，处理方式也该一样 —— 写进报告，不留给读者自己发现。
+
+参考答案**不该让 LLM 写**：judge 用 LLM 判答案对错，参考答案又是 LLM 写的，
+等于自己出题自己判。标注记 `source`（`human` / `model` / `model_confirmed_by_human`）
+与 `confidence`，这样任何指标结果都能追溯到「它依赖的 gold 有多少是人确认过的」。
+
+### 12.7 目录与运维
+
+```
+src/akasha_benchmark/        现有，阶段代码 + 数据层（新增 store/）
+src/akasha_platform/         FastAPI 后端
+web/                         Vite + React 前端
+migrations/                  SQLite schema 演进
+```
+
+开发时 Vite dev server + FastAPI 两进程；生产 `npm run build` 出静态文件由
+FastAPI 挂 `StaticFiles`，单进程单端口。`[project.scripts]` 加 `akasha-platform`，
+Makefile 加 `make serve`。
+
+**迁移必须能在有数据的库上跑**，不能只在空库验证过 —— SQLite 的 `ALTER TABLE`
+不能删列改类型，复杂改动走「建新表 → 拷数据 → 换名」，且要在真实数据的库副本上
+先跑一遍。**迁移前自动备份**（`cp` 成 `akasha_bench.db.pre-{version}`），
+20 行代码换掉一整类事故。
+
+`reindex` 从文件重建产物索引时**必须显式绕开标注表与 judge 判决表** ——
+这两张表不可重建，与产物表同库，一个粗心的 `DELETE FROM` 就没了。
+
+### 12.8 设计期间查实的几条事实（会影响实现）
+
+- **`concurrency` 是死字段**。只出现在定义、类型转换表、写进 manifest 三处，
+  **没有任何代码读它控制行为**。真正生效的是 `request_interval_seconds`（默认 0.5s），
+  `_throttle()` 在每个请求前 sleep。所谓「串行」不是并发度设成 1，是压根没写并发。
+- **编译并发不在我们手里**。导入完成后调一次 `compile-spaces` 建 Run，之后只是轮询等；
+  真正在编译的是 Akasha 的 BullMQ worker。观察到的约 40 秒/篇是那边的吞吐，
+  客户端怎么调都改不了。ingest 的进度条本质是「帮我盯着别人干活」。
+- **查询是唯一并行有收益的环节**：358 条 × 10–14 秒约 70–83 分钟。
+  但 answer 模型走第三方 OpenAI 兼容端点（配额未知），且 `httpx.Client`
+  并发要开多个实例或改 async。
+- **导入并行收益很小**（编译才是那 15 小时），且写入端点 `import_page` / `create_space`
+  在重试机制里是显式不重试的 —— 5xx 后结果有歧义，可能建出第二个 page 而
+  page_map 里没有。并发会让这个歧义更难查。
+- **`apiKeySet` 只是布尔量，不回传 key**。所以 judge 即便用同一个端点同一个模型，
+  平台也得自己配一份凭据。这是平台第一次持有 LLM 密钥。
+- **`numpy==2.5.3` 是死依赖**，全仓库零引用。加 web 依赖时一起删。
+- **`docs/diagrams/*.html` 是静态文档产物**（717KB/721KB 自包含，支持 `?embed=1`），
+  可以 iframe 嵌进前端当架构说明，但数字写死在 JSON spec 里，
+  叠不上本次 run 的真实数据。真实数据的血缘视图另做，两件事别混。
+- **Akasha 跑在 WSL 内部的 podman 里**，Windows 侧 `podman ps` 看不到它
+  （`/api/health` 返回 200 但容器列表为空）。运维文档要写清从哪连、连不上时怎么查。
+- 测试基线已是 **108 passed / 32 skipped**，§11 记的 86/23 已过期。
+
+### 12.9 血缘视图：确切的查询链路（实测，非推断）
+
+平台的核心能力。下面这条链路是 2026-09-10 在 run001 的真实库上逐跳走通的，
+表名列名均已核对 —— **不是照 Akasha 文档抄的**。
+
+```
+pages.id                      ← page_map.jsonl 里的 page_id（导入接口返回）
+  ↓ knowledge_page_sources.source_page_id
+knowledge_pages.id            ← 编译产出的 artifact，不是原始 page
+  ↓ knowledge_chunks.knowledge_page_id          参与召回的文本
+  ↓ knowledge_graph_edges.from/to_knowledge_page_id   图边
+  ↓ knowledge_claims.knowledge_page_id          抽出的断言
+knowledge_source_chunks.source_page_id          原文，不参与召回
+```
+
+**两处与先前假设不符，已纠正**：`knowledge_chunks` 的外键是 `knowledge_page_id`
+而非 `source_page_id`；`knowledge_page_sources` **直接带 `source_page_id`**，
+不必经 `knowledge_sources` 中转。
+
+关键列：`knowledge_pages` 有 `page_type`（`entity` / `source_summary`）、
+`canonical_key`（实体合并的键）、`compile_scope`、`stale_at`；
+`knowledge_chunks` 有 `chunk_role`、`retrieval_channel`、`embedding_profile`、
+`search_tsv`；`knowledge_graph_edges` 有 `relation`（实测取值 `produced`、
+`released_album`）。workspace 下 `knowledge_*` 表共 29 张。
+
+#### 验收样例：一条 recall@5 = 0.5 的样本，六跳定位到根因
+
+`hotpotqa:5ae4f2595542990ba0bbb1a8`（bridge / hard，gold 2 篇）。
+gold `6369 Cyndi Lauper` 排第 1，gold `6365 Dee Does Broadway` **到 k=20 都没出现**。
+`includedItemCount: 20` / `omittedItemCount: 0`，所以不是上下文预算挤掉的；
+它压根没进候选集。
+
+6365 编成 3 个 artifact（`Dee Does Broadway` / `Dee Snider` /
+`Source Summary: …`），**全部图边只有 4 条，都在 Dee Snider ↔ Dee Does Broadway
+之间**，到 `canonical_key = cyndi_lauper` 的边 **0 条** —— 嘉宾关系没升格成图边。
+
+而更要紧的是编译把查询需要的短语删了：
+
+```
+原文（knowledge_source_chunks，不参与召回）：
+  "Guests in the album include the Grammy and Emmy award winning Cyndi Lauper, …"
+编译（knowledge_chunks，参与召回）：
+  "…featuring vocal contributions from guest artists including Cyndi Lauper, …"
+```
+
+三个 artifact 的 chunk 正文全部不含 `Grammy` / `Emmy`。而问题问的正是
+*"who won Grammy and Emmy award"*。于是三条召回路径同时断：词法（词已不在索引文本里）、
+稠密（编译产物主题是「Dee Snider 的百老汇专辑」，与「歌手生日」语义远）、
+图扩展（那条边不存在）。
+
+**这是 §0.3 那条架构论断的具体实例，也是「非调参可解」的证据** ——
+调 `scoreThreshold`、加大 k、换检索模式都救不回来。
+
+完整案例（含三条召回路径为什么同时断、以及跨全库的系统性验证）见
+[cases/recall-miss-compiled-away.md](cases/recall-miss-compiled-away.md)。
+只读探查脚本在 [cases/scripts/](cases/scripts/)，可重跑。
+
+**跨全库验证得到的三条编译器行为**（400+ 篇，非单例）：
+编译**不是压缩而是扩写**（中位 2.19 倍，仅 2.7% 净压缩），所以丢修饰语是改写策略
+而非空间不足；**图边极稀疏**（1454 artifact / 555 边，59% 的 entity 零出边）；
+**relation 自由生成**（555 条边散在 377 种取值上，295 种只出现一次，
+`createdBy` 与 `created_by` 并存、`father of` 带空格），
+所以图遍历无法按关系类型做。
+
+**顺带更正 §0.3 的一条预判**：那里担心「多跳可能偏高，因为实体跨文档合并」，
+实测 925 个 entity artifact 里被多于一篇原文贡献的**只有 12 个（1.3%）**——
+合并几乎没发生，方向反而是「桥接关系没建立、多跳靠图走不通」。
+机制描述没错，只是这份语料上极少触发；语料更密时结论可能不同。
+
+#### 由此确定的两个视图
+
+1. **逐样本血缘**：失败样本 → gold doc_id → page_id → artifact 列表 → chunk 正文
+   → 图边 → 原文。跨五张表六跳，必须一屏走完，否则归因就得像这次一样手写 SQL。
+2. **原文 vs 编译产物 diff**：升为一等视图。这次的根因只有把两者并排才看得见。
+   §9 的原文基线从整体上量这个效应，而**逐样本 diff 能直接指出丢了哪个词** ——
+   对调参无用（改不了编译器），对「这个数字该怎么读」有决定性作用。
+
+#### 顺带实测到的检索侧事实
+
+`audit_join.json`（99/100 样本匹配上）：`mean_candidate_chunks` 恒为 **200.0**
+（硬上限，不是自然分布）、`mean_ranking_loss` **152.04**、
+`mean_authorization_loss` **28.07**、`recall_ceiling_miss_rate` **0.0**、
+`gold_hit_rate` **0.9697**、`access_policy_fallback_rate` 0.0，
+`retrieval_mode` 全部是 `high_completeness`。候选集从不为空，
+损失全在排序段 —— 200 个候选里平均砍掉 152 个。
+
+### 12.10 还没定的（下一轮）
+
+- **第一版的先后**：观测层与执行控制哪个先上。
+- **三层的身份键**：配置哈希（内容寻址）还是用户命名 + 自增 ID。
+  决定「两个索引层什么时候算同一个」，也决定复用规则。
+- **认证与绑定**：默认只绑 `127.0.0.1`。红线 —— 这个服务持有 Akasha 管理员凭据、
+  只读数据库连接、以及启动长任务的能力，**任何时候暴露到 `0.0.0.0` 都必须先有认证**，
+  不是「以后再说」的项。
+- **前端信息架构**：血缘视图（§12.9）、对比视图、任务视图怎么组织。
+  `snippets[].id` 是裸 UUID 不带类型前缀且 snippet 里没有 `kind`，
+  光看响应分不出这条来自原文块还是编译产物 —— 现已确认可用
+  `knowledge_chunks.id` 反查补上 `page_type` 与 `chunk_role`。
+- **失败案例入口的默认切分**：四条 `recall@5 < 1.0` 里三条是 `answerMode: general`
+  （生成端回落，`retrievedSources` 被无条件清空），只有一条是真的漏 gold ——
+  而那一条答案还是对的。混在一起看会把 1 条检索问题读成 4 条。
+  按 `answerMode` 分开必须是默认视图，不是可选筛选器。
+- **`full_coverage@k` 该不该顶替 `recall@k` 当主指标**：hotpotqa 全部 2 篇 gold，
+  recall 只有 0/0.5/1 三个取值，均值 0.965 的可读性不如 `full_coverage@5 = 0.96`。
+- **judge 具体指标清单**：faithfulness / answer relevancy / context precision 等
+  各自的 prompt、输出 schema 与依赖声明。
+- **answer 模型热切换**要不要做进第一版（`put_model_config` 已就绪但零调用）。
 

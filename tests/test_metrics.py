@@ -100,19 +100,35 @@ def test_f1_takes_max_over_references():
     assert partial["f1"] == pytest.approx(2 / 3)
 
 
-def test_score_answer_reports_no_exact_match():
-    """EM 是刻意去掉的：对散文答案它恒等于 0，不随质量变化。
-
-    这条钉住「不报 EM」这个决定本身 —— 哪天有人顺手把它加回来，
-    报告里就会多出一列恒为 0 的数，读者会据此判断系统坏了。
-    """
+def test_score_answer_reports_both_em_and_f1():
+    """两个指标都报，各自独立对多参考取 max。"""
     scored = qa.score_answer("the beatles", ["The Beatles"])
-    assert set(scored) == {"f1"}, f"score_answer should report f1 only, got {sorted(scored)}"
-    assert not hasattr(qa, "exact_match")
+    assert set(scored) == {"em", "f1"}, f"expected em and f1, got {sorted(scored)}"
+    assert scored["em"] == 1.0
+    assert scored["f1"] == 1.0
 
 
-def test_f1_survives_a_verbose_answer_where_em_could_not():
-    """散文答案里含有正确短答案时，F1 仍是正数 —— 这就是保留它的理由。
+def test_exact_match_is_whole_string_after_normalization():
+    """EM 比的是整串归一化结果，不是包含关系。"""
+    assert qa.exact_match("The Beatles!", "beatles") == 1.0
+    # 多一个词就不算 —— 这正是散文答案恒为 0 的机制。
+    assert qa.exact_match("the beatles band", "beatles") == 0.0
+    assert qa.exact_match("Flavivirus", "flavivirus") == 1.0
+
+
+def test_em_and_f1_take_max_independently():
+    """两个指标各自取 max，不是先挑一条参考再算两个数。
+
+    ``em`` 在第二条参考上满分、``f1`` 在第一条上更高，所以「先选参考」的写法
+    会给出一个两边都不对的组合。
+    """
+    scored = qa.score_answer("beatles", ["beatles band", "The Beatles"])
+    assert scored["em"] == 1.0  # 对上第二条
+    assert scored["f1"] == 1.0  # 同样对上第二条，但取 max 后与选谁无关
+
+
+def test_verbose_answer_zeroes_em_but_not_f1():
+    """散文答案：EM 归 0，F1 仍是正数 —— 这就是两者要分开读的理由。
 
     数字很低（这里约 0.13），所以 F1 的绝对值不可跨系统比较；
     但它随答案质量变化，而 EM 在这种形态下恒为 0。
@@ -122,6 +138,7 @@ def test_f1_survives_a_verbose_answer_where_em_could_not():
         "virus belonging to the genus Flavivirus."
     )
     scored = qa.score_answer(verbose, ["Flavivirus"])
+    assert scored["em"] == 0.0, "EM must be 0 for prose that merely contains the answer"
     assert 0.0 < scored["f1"] < 0.3, scored
 
 

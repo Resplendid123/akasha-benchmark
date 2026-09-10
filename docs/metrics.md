@@ -8,16 +8,15 @@ uv run python -m akasha_benchmark.evaluate --run-id run001
 uv run python -m akasha_benchmark.evaluate --run-id run001 --k 5 --k 20   # 自定义 k
 ```
 
-**纯离线**。只读查询落盘的响应 jsonl，全程不碰 Akasha，所以指标改了可以随便重算，
-不用重跑 query。产出三个文件：
+离线产出三个文件：
 
 | 文件 | 内容 |
 | --- | --- |
 | `metrics.json` | 逐数据集汇总，机器读 |
 | `per_sample.jsonl` | 逐样本明细，用于复查单条和自定义切片 |
-| `report.md` | 人读报告，带架构说明和分层表 |
+| `report.md` | 中文报告，带架构说明和分层表 |
 
-四组指标，分别回答不同的问题：
+四组指标：
 
 | 组 | 模块 | 回答什么 |
 | --- | --- | --- |
@@ -29,17 +28,16 @@ uv run python -m akasha_benchmark.evaluate --run-id run001 --k 5 --k 20   # 自�
 ## 先读这一节：数字不能直接跟公开 baseline 比
 
 Akasha 的稠密与词法召回跑在**编译器生成的文本**上（`knowledge_chunks` 索引的是
-`artifact.markdown`），不是原始文档。原文在 `knowledge_source_chunks` 里，
-它不参与召回，只在引用解析阶段提供证据窗口。两个后果：
+`artifact.markdown`），不是原始文档。原文在 `knowledge_source_chunks` 里，不参与召回，只在引用解析阶段提供证据窗口。会导致两个问题：
 
-- Recall@k 被系统性压低，且**不是调参能解决的**。
+- Recall@k 被系统性压低。
 - 多跳成绩可能被抬高，因为编译器会把跨文档的同一实体合并成一个 artifact，
   两个 hop 可能被直接连成一条 graph edge，而不是靠两次独立检索各自找到。
 
 所以拿这些数跟 HippoRAG 2 之类的公开结果比是**无效的**。唯一有意义的对照是
-原文基线。`report.md` 开头会把这段话打出来，那不是客套。
+原文基线。
 
-## 答案质量
+## 答案质量 QA
 
 `normalize_answer` 照抄 SQuAD/MRQA 的标准口径，**顺序不能换**：
 小写 → 去标点 → 去冠词 `a`/`an`/`the` → 合并空白。
@@ -53,34 +51,122 @@ Akasha 的稠密与词法召回跑在**编译器生成的文本**上（`knowledg
 照抄而不是自创，是为了让数字至少在口径上能跟已发表结果对上。自创归一化会让
 所有对外比较失去意义。
 
-| 指标 | 定义 |
-| --- | --- |
-| `f1` | 词袋级 F1，重复词按出现次数取交集 |
+两个指标，都在归一化之后算：
 
-**对多条参考取 max**。musique 的别名在归一化时已并入 `answers`，
-narrativeqa 本身带 2 条人工参考，所以打分侧不用再写一遍别名逻辑。
+| 指标 | 定义 | 怎么算 |
+| --- | --- | --- |
+| `em` | 整串完全相等才算 1 | `normalize_answer(pred) == normalize_answer(ref)` |
+| `f1` | 词袋级 F1，重复词按出现次数取交集 | 见下式 |
 
-### 为什么没有 Exact Match
+F1 用 `Counter` 取交集，所以重复词按出现次数计：
 
-EM 要求整串归一化后完全相等。Akasha 返回的是解释性散文，而 hotpotqa / 2wiki /
-musique 的参考答案是短跨度，两者不可能相等 —— 所以 EM 在这套架构上**恒等于 0，
-且不随答案质量变化**。
+```
+shared    = sum((Counter(pred_tokens) & Counter(ref_tokens)).values())
+precision = shared / len(pred_tokens)      # 分母是预测的长度
+recall    = shared / len(ref_tokens)       # 分母是参考的长度
+f1        = 2 * precision * recall / (precision + recall)
+```
 
-2026-09-09 的在线冒烟给出了实证（hotpotqa 三条，`data/smoke/`）：
+`precision` 的分母是**预测答案的 token 数** —— 这一条是后面所有低分的机制来源，
+预测越长，分母越大，F1 越低，与答案对不对无关。
 
-| 指标 | 值 |
-| --- | --- |
-| `recall@10` / `full_coverage@10` / `mrr` | 1.000 / 1.000 / 1.000 |
-| 三条答案是否实质正确 | 全部正确（`Flavivirus`、`Pavel Alexandrov`、`Pierre Cuypers`） |
-| EM | **0.000** |
-| F1 | 0.054 / 0.087 / 0.143 |
+**两个指标各自独立对多条参考取 max**，不是先挑一条参考再算两个数
+（后者会给出一个两边都不最优的组合，`test_metrics.py` 有一条钉这个）。
+musique 数据集中的别名在归一化时已并入 `answers`，narrativeqa 本身带 2 条人工参考，
+所以打分侧不用再写一遍别名逻辑。
 
-一个没有方差的指标不提供信息，只会让报告读者误判系统坏了，所以直接不报，
-而不是报出来再附一段免责说明。`score_answer` 因此只返回 `f1`
-（`metrics/qa.py`），`test_metrics.py` 有一条测试专门钉住这个决定 ——
-免得日后有人顺手把它加回来。
+退化情况与官方 SQuAD 脚本一致：预测和参考都空算完全匹配（`f1 = 1.0`），
+预测空而参考非空算 0。
 
-**F1 保留，因为它是变化的。** 但绝对值被解释性 token 稀释，所以：
+`answer_mode_distribution` 报各 `answerMode` 的占比，缺失值单独归到 `missing`
+而不是并进别的桶。`no_match` 率和 `general` 兜底率是「检索没喂够料」的直接信号。
+
+### 为什么 EM 预期恒为 0
+
+**EM = 0 是这套架构的正常读数，不是系统坏了。** EM 要求整串归一化后完全相等，
+而 Akasha 返回解释性散文，hotpotqa / 2wiki / musique 的参考答案是短跨度，
+两者不可能相等。
+
+2026-09-09 的在线冒烟（hotpotqa 3 条）实测：三条答案**全部实质正确**、
+gold 全部召回（`recall@10` 与 `full_coverage@10` 均为 1.000），EM 仍是 0.000。
+
+所以 EM **只能当形态探针读**：它变成非 0 意味着生成端开始输出短跨度答案
+（换了 answer prompt 或换了模型），而不是意味着答案变对了。判断答案对不对，
+看 F1 配合 `citation_precision` / `evidence_verifiable_rate` 和人工抽查。
+
+报出来而不是藏起来，是因为「一列 0」加一段解释比「读者发现少了一列」更好 ——
+熟悉 hotpotqa 的人会主动去找这一列。`report.md` 因此在表格上方直接写明预期为 0，
+`test_evaluate_pipeline.py` 与 `test_live_akasha.py` 各有一条断言钉住这段说明必须在。
+
+### 为什么 F1 也低：precision 塌了
+
+F1 受同一效应影响但**仍然是变化的**，所以它是这组里唯一可读的数。同一批冒烟
+逐 token 分解（用 `tokenize` 重算，mean F1 = 0.0946，与报告一致）：
+
+| sample | \|pred\| | \|gold\| | shared | P | R | F1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5a710a1e55 | 36 | 1 | 1 | 0.0278 | 1.0000 | 0.0541 |
+| 5a717d4c55 | 43 | 3 | 2 | 0.0465 | 0.6667 | 0.0870 |
+| 5a71835755 | 23 | 5 | 2 | 0.0870 | 0.4000 | 0.1429 |
+| **mean** | | | | **0.0537** | **0.6889** | **0.0946** |
+
+**recall 0.69、precision 0.054，差 13 倍。** 该答出的词答出来了，分是被
+precision 的分母吃掉的。两个独立效应，量级差很多：
+
+**一、散文稀释（主因，只压 precision）。** 预测 23–43 token，参考 1–5 token。
+最极端的一条 gold 只有一个词 `Flavivirus`：
+
+```
+Q:    What is the genus of the viral disease that has symptoms such as fever, chills,
+      loss of appetite, nausea, muscle pains, and headaches, and has a chance of
+      causing liver damage?
+gold: Flavivirus                                                          (1 token)
+pred: The disease described is yellow fever, which is caused by the yellow fever
+      virus belonging to the genus **Flavivirus** . Yellow fever symptoms include
+      fever, chills, loss of appetite, nausea, muscle pains, and headaches, and
+      it can cause liver damage .                                        (36 token)
+```
+
+归一化后逐 token 归类（`^` 命中 gold、`q` 抄自问题、`.` 其他）：
+
+```
+disease[q] described[.] is[q] yellow[.] fever[q] which[.] is[q] caused[.] by[.]
+yellow[.] fever[q] virus[.] belonging[.] to[.] genus[q] flavivirus[^] yellow[.]
+fever[q] symptoms[q] include[.] fever[q] chills[q] loss[q] of[q] appetite[q]
+nausea[q] muscle[q] pains[q] and[q] headaches[q] and[q] it[.] can[.] cause[.]
+liver[q] damage[q]
+```
+
+| 类别 | n | 占比 |
+| --- | --- | --- |
+| 命中 gold | 1 | 2.8% |
+| 抄自问题 | 21 | 58.3% |
+| 其他（补全推理链） | 14 | 38.9% |
+
+最大头是**复述问题的条件**：第二句把症状清单原样抄回来当作「症状对得上」的论证，
+21 个 token 全部是问题里已有的词，对答案零信息量，但每一个都进 precision 的分母。
+其余是显式写出中间实体（yellow fever → yellow fever virus → 属），多跳题上这是
+可解释性的优点，打分时是纯负担。真正答题的只有 `flavivirus` 一个词，埋在第 16 位。
+
+反事实：把 precision 修满、recall 保持不动，mean F1 会从 0.0946 升到 **0.7905**。
+**绝大部分损失来自这一条。**
+
+**二、gold 用全名、模型用通称（次因，只压 recall）。** hotpotqa 这批每条只有
+1 个参考答案，没有别名，多参考取 max 在这里帮不上忙：
+
+| gold | 模型答 | 丢掉的 token | R |
+| --- | --- | --- | --- |
+| `Pavel Sergeyevich Alexandrov` | `Pavel Alexandrov` | `sergeyevich` | 0.667 |
+| `Petrus Josephus Hubertus (Pierre) Cuypers` | `Pierre Cuypers` | `petrus` `josephus` `hubertus` | 0.400 |
+
+这是标注口径问题，不是答错。
+
+**答案文风改不了。** `run_queries.py` 和 `akasha_client.py` 的请求体里只有 query
+和 `scoreThreshold`，没有任何控制答案形态的参数（prompt / answerStyle / 长度约束
+都没有），`budget.responseReserve` 也是 0。文风由 Akasha 服务端的 answer 生成逻辑
+决定，评测侧无法干预。所以这个稀释在当前架构下是结构性的。
+
+由此，F1 的用法：
 
 - 只在**同配置之间**比较（比如调 `scoreThreshold` 前后），不与公开 baseline 比
 - 判断答案对不对，看 `citation_precision` / `evidence_verifiable_rate` 配合人工抽查
@@ -88,14 +174,9 @@ musique 的参考答案是短跨度，两者不可能相等 —— 所以 EM 在
   所以两者的 F1 差值仍然可读
 
 想让绝对值本身可读，需要加「答案是否包含参考答案」的宽松指标（containment）。
-**目前没有实现**，因为它同样有偏 —— 散文越长越容易蒙中。加不加取决于要回答
-什么问题，见 PLAN.md §10.3。
-
-退化情况与官方 SQuAD 脚本一致：预测和参考都空算完全匹配（`f1 = 1.0`），
-预测空而参考非空算 0。
-
-`answer_mode_distribution` 报各 `answerMode` 的占比，缺失值单独归到 `missing`
-而不是并进别的桶。`no_match` 率和 `general` 兜底率是「检索没喂够料」的直接信号。
+**目前没有实现**，因为它同样有偏 —— 散文越长越容易蒙中，且上面那两条全名样本
+它同样判 0（整串包含不成立，实测 3 条只命中 1 条）。加不加取决于要回答什么问题，
+见 PLAN.md §10.3。
 
 ### narrativeqa 的答案分数有个措辞造成的上限
 
@@ -120,7 +201,7 @@ musique 的参考答案是短跨度，两者不可能相等 —— 所以 EM 在
 （`summary.text` 本身不进规范化数据，corpus 是从全文切的块，
 见 [normalized_datasets.md](normalized_datasets.md)。）
 
-## 检索
+## 检索质量 Retrieval
 
 用 `retrievedSources` 算，**不用** `citations`。前者是裁剪前的召回全集，
 后者已经被「被引 ∩ 有证据」的交集裁过一遍，拿它算 Recall 会低估检索能力。
@@ -160,8 +241,9 @@ nDCG@k = DCG@k / IDCG@k          IDCG 为 0 时返回 0
 `full_coverage@k`，多跳题少一跳就答不全。
 
 但**两者都满分时 F1 仍然可能很低**，那就与检索无关了 —— 是散文稀释，
-见上面「为什么没有 Exact Match」。冒烟实测过这一组：`full_coverage@10` 为 1.000、
-三条答案全部实质正确，F1 仍只有 0.05–0.14。先排除这一种再去怀疑检索。
+见上面「为什么 F1 也低：precision 塌了」。冒烟实测过这一组：`full_coverage@10`
+为 1.000、三条答案全部实质正确，F1 仍只有 0.05–0.14，EM 全 0。
+先排除这一种再去怀疑检索。
 
 ### 未反查到的 page 要占住名次
 

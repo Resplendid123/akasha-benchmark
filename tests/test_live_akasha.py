@@ -1053,8 +1053,9 @@ def test_pipeline_report_metrics_are_well_formed(pipeline: dict[str, Any]):
         for metric, value in summary[slice_name].items():
             assert 0.0 <= value <= 1.0, f"{slice_name}.{metric} = {value} is out of [0, 1]"
 
-    # 不报 EM（对散文答案恒为 0，见 metrics/qa.py），所以只校验 F1。
-    assert "em" not in summary["qa"], "EM is back in the report; it carries no information here"
+    # EM 报出来但预期为 0（散文答案对不上短跨度参考，见 metrics/qa.py）。
+    # 这里不断言它必须为 0 —— 换了 answer prompt 后它可能变正，那是形态变化不是失败。
+    assert 0.0 <= summary["qa"]["em"] <= 1.0
     assert 0.0 <= summary["qa"]["f1"] <= 1.0
 
     # knowledge 切片是全样本的子集，所以计数不可能更多。
@@ -1065,7 +1066,7 @@ def test_pipeline_report_metrics_are_well_formed(pipeline: dict[str, Any]):
     print(
         f"  R@10 {summary['retrieval'].get('recall@10', 0.0):.3f}"
         f" (knowledge-only {summary['retrieval_knowledge_only'].get('recall@10', 0.0):.3f})"
-        f"   F1 {summary['qa']['f1']:.3f}"
+        f"   EM {summary['qa']['em']:.3f}   F1 {summary['qa']['f1']:.3f}"
     )
 
 
@@ -1076,21 +1077,23 @@ def test_pipeline_report_md_is_readable_and_states_its_caveats(pipeline: dict[st
     而那个比较是无效的。这段是结论的一部分，不是客套。
     """
     report = pipeline["report_md"]
-    assert report.startswith("# Akasha-Benchmark report"), report[:80]
+    assert report.startswith("# Akasha-Benchmark 评测报告"), report[:80]
     for fragment in (
-        "How to read these numbers",
+        "这些数字该怎么读",
         "knowledge_chunks",
-        "not valid",
-        "Model configuration",
-        # 不报 EM 的理由必须写在报告里：熟悉 hotpotqa 的读者会去找这一列。
-        "no Exact Match column",
+        "无效的",
+        "模型配置",
+        # EM 报出来了，所以「为什么预期是 0」必须同时在报告里：
+        # 熟悉 hotpotqa 的读者看到 0.0000 会以为系统坏了。
+        "Exact Match 预期就是 0.0000",
+        "答案**形状**的探针",
         pipeline["dataset"],
     ):
         assert fragment in report, f"report.md lacks {fragment!r}"
     # 检索表两份都要出现。
-    assert "| metric | all samples | knowledge only |" in report
-    # 分层表不能再有 EM 列。
-    assert "| EM |" not in report
+    assert "| 指标 | 全样本 | 仅 knowledge |" in report
+    # 分层表要有 EM 列。
+    assert "| EM | F1 |" in report
 
 
 def test_the_smoke_space_was_cleaned_up(trip: dict[str, Any]):

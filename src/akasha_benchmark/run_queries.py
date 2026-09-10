@@ -1,4 +1,4 @@
-"""查询：逐条串行跑 query，把完整响应落盘。
+"""查询：跑 query 并把完整响应落盘。并发由 ``concurrency`` 配置决定，默认 1（串行）。
 
 **这一步不算任何指标。** 它只负责产出证据，解释证据是评测的事。
 
@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,48 @@ def _completed_sample_ids(path: Path) -> set[str]:
     return {row["sample_id"] for row in read_jsonl(path) if row.get("sample_id")}
 
 
+def _query_one(
+    client: AkashaClient,
+    dataset: str,
+    sample: CanonicalSample,
+    space_id: str,
+    score_threshold: float | None,
+) -> tuple[dict[str, Any], int | None]:
+    """跑一条 query，返回 ``(待落盘的行, 成功时的 latency_ms)``。
+
+    失败也返回行 —— 失败率本身就是结果，见模块 docstring。第二个返回值为
+    ``None`` 表示这条不计入延迟统计，否则超时会把 p95 带偏。
+    """
+    requested_at = utc_now()
+    try:
+        response = client.query(sample.question, [space_id], score_threshold=score_threshold)
+        status, body, latency_ms = response.status, response.body, response.latency_ms
+        error = None
+    except (AkashaError, httpx.RequestError, OSError) as exc:
+        # 连接层面的失败（超时、断连），同样写一行，记下错误。
+        #
+        # httpx.RequestError **不是** OSError 的子类，它走的是
+        # TransportError -> RequestError -> HTTPError -> Exception。
+        # 少了它，跑到一半网络抖一下整个阶段就带 traceback 崩掉，
+        # 那一行也不会落盘 —— 而 query() 用 raise_for_status=False，
+        # 非 2xx 根本不抛，所以传输层异常是这里唯一能逃出来的东西。
+        status, body, latency_ms = 0, None, 0
+        error = f"{type(exc).__name__}: {exc}"
+
+    row = {
+        "sample_id": sample.sample_id,
+        "dataset": dataset,
+        "question": sample.question,
+        "requested_at": requested_at,
+        "latency_ms": latency_ms,
+        "http_status": status,
+        "error": error,
+        "response": body,
+    }
+    ok = bool(status and 200 <= status < 300)
+    return row, (latency_ms if ok else None)
+
+
 def run_dataset(
     client: AkashaClient,
     dataset: str,
@@ -57,6 +101,7 @@ def run_dataset(
     data_dir: Path | None,
     score_threshold: float | None,
     limit: int | None,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
     """跑完一个数据集的全部 query，返回该数据集的统计。"""
     samples = [
@@ -74,54 +119,57 @@ def run_dataset(
     latencies: list[int] = []
     failures = 0
     # 追加模式 + 每条 flush，中断后已完成的部分不丢。
+    #
+    # 并发时所有落盘都在主线程做（worker 只发请求、只返回行），于是不需要写锁，
+    # 续跑语义也和串行时完全一样。行序变成完成顺序而非样本顺序 —— 评测按
+    # sample_id 关联并显式拒绝重复，不依赖行序。
     with out_path.open("a", encoding="utf-8", newline="\n") as sink:
-        for position, sample in enumerate(todo, 1):
-            requested_at = utc_now()
-            try:
-                response = client.query(
-                    sample.question,
-                    [space_id],
-                    score_threshold=score_threshold,
-                )
-                status, body, latency_ms = response.status, response.body, response.latency_ms
-                error = None
-            except (AkashaError, httpx.RequestError, OSError) as exc:
-                # 连接层面的失败（超时、断连），同样写一行，记下错误。
-                #
-                # httpx.RequestError **不是** OSError 的子类，它走的是
-                # TransportError -> RequestError -> HTTPError -> Exception。
-                # 少了它，跑到一半网络抖一下整个阶段就带 traceback 崩掉，
-                # 那一行也不会落盘 —— 而 query() 用 raise_for_status=False，
-                # 非 2xx 根本不抛，所以传输层异常是这里唯一能逃出来的东西。
-                status, body, latency_ms = 0, None, 0
-                error = f"{type(exc).__name__}: {exc}"
 
-            # 只有成功的请求计入延迟统计，否则超时会把 p95 带偏。
-            if status and 200 <= status < 300:
-                latencies.append(latency_ms)
-            else:
+        def emit(position: int, row: dict[str, Any], latency: int | None) -> None:
+            nonlocal failures
+            if latency is None:
                 failures += 1
-
-            sink.write(
-                json.dumps(
-                    {
-                        "sample_id": sample.sample_id,
-                        "dataset": dataset,
-                        "question": sample.question,
-                        "requested_at": requested_at,
-                        "latency_ms": latency_ms,
-                        "http_status": status,
-                        "error": error,
-                        "response": body,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            else:
+                latencies.append(latency)
+            sink.write(json.dumps(row, ensure_ascii=False) + "\n")
             sink.flush()
-
             if position % 10 == 0 or position == len(todo):
                 print(f"  {dataset}: {position}/{len(todo)} (failures={failures})")
+
+        if concurrency <= 1:
+            for position, sample in enumerate(todo, 1):
+                row, latency = _query_one(client, dataset, sample, space_id, score_threshold)
+                emit(position, row, latency)
+        else:
+            # 每个 worker 一个独立客户端：AkashaClient 的限流器用共享的
+            # _last_request_at，多线程共用一个实例会互相踩，且 request_interval
+            # 会退化成「一起睡、一起发」。各自持有则每个连接独立按间隔发送，
+            # 聚合速率约为 concurrency / request_interval。
+            extra = [AkashaClient(client.config) for _ in range(concurrency - 1)]
+            try:
+                for spare in extra:
+                    spare.login()
+                pool: queue.Queue[AkashaClient] = queue.Queue()
+                for worker_client in (client, *extra):
+                    pool.put(worker_client)
+
+                def task(sample: CanonicalSample) -> tuple[dict[str, Any], int | None]:
+                    borrowed = pool.get()
+                    try:
+                        return _query_one(
+                            borrowed, dataset, sample, space_id, score_threshold
+                        )
+                    finally:
+                        pool.put(borrowed)
+
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = [executor.submit(task, sample) for sample in todo]
+                    for position, future in enumerate(as_completed(futures), 1):
+                        row, latency = future.result()
+                        emit(position, row, latency)
+            finally:
+                for spare in extra:
+                    spare.close()
 
     return {
         "dataset": dataset,
@@ -195,6 +243,7 @@ def run(
                     data_dir,
                     score_threshold,
                     limit,
+                    config.concurrency,
                 )
             )
 
