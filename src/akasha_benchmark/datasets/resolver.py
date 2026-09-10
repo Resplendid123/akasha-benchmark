@@ -39,16 +39,29 @@ def resolve(name: str, dataset_dir: Path | None = None) -> ResolvedDataset:
     if missing:
         raise FileNotFoundError(
             f"{adapter.name}: missing {missing}. "
-            "Run `uv run python download_dataset.py` first."
+            "Run `uv run python scripts/download_datasets.py` first."
         )
     return ResolvedDataset(adapter=adapter, qa_path=qa_path, corpus_path=corpus_path)
 
 
+def repo_relative(path: Path) -> str:
+    """manifest 里记录路径用的形式：仓库内的写成相对路径，分隔符统一为 ``/``。
+
+    绝对路径会把某一台机器的目录结构焊进产物里 —— 换机器、换平台，
+    或者别人拿到这份 manifest，记下来的路径都是错的，也没法逐字段比对两次产出。
+    仓库外的路径（例如测试用的临时目录）没有有意义的相对表示，保持绝对形式。
+    """
+    resolved = Path(path).resolve()
+    if resolved.is_relative_to(REPO_ROOT):
+        return resolved.relative_to(REPO_ROOT).as_posix()
+    return resolved.as_posix()
+
+
 def normalized_dir(dataset: str, data_dir: Path | None = None) -> Path:
-    """轮次 1 产出目录。"""
+    """归一化产出目录。"""
     return (data_dir or DEFAULT_DATA_DIR) / "normalized" / dataset
 
 
 def subset_dir(run_id: str, dataset: str, data_dir: Path | None = None) -> Path:
-    """轮次 2 产出目录，按 run_id 隔离。"""
+    """子集产出目录，按 run_id 隔离。"""
     return (data_dir or DEFAULT_DATA_DIR) / "subsets" / run_id / dataset

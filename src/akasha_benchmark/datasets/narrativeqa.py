@@ -37,7 +37,7 @@ class NarrativeQAAdapter(DatasetAdapter):
     qa_filename: ClassVar[str] = "narrativeqa.json"
     corpus_filename: ClassVar[str] = "narrativeqa_corpus.json"
     # 不含 EVIDENCE_RECALL，原因见模块 docstring。
-    capabilities: ClassVar[frozenset[Capability]] = frozenset({Capability.ANSWER_EM_F1})
+    capabilities: ClassVar[frozenset[Capability]] = frozenset({Capability.ANSWER_F1})
 
     def expected_qa_rows(self) -> int:
         return 293
@@ -71,7 +71,7 @@ class NarrativeQAAdapter(DatasetAdapter):
             answers=tuple(answers),
             gold_doc_ids=(),
             metadata={
-                # 轮次 2 靠这个字段整篇整篇地抽文档。
+                # 抽子集靠这个字段整篇整篇地抽文档。
                 "document_id": document_id,
                 "kind": document.get("kind"),
                 "reference_count": len(answers),

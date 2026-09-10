@@ -1,4 +1,4 @@
-"""规范化样本与语料模型，五轮共用。
+"""规范化样本与语料模型，各阶段共用。
 
 有两条规则是后续所有代码都依赖的：
 
@@ -17,7 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 # doc_id / sample_id 的口径收在这里一处，避免预处理与评测两侧各写一份而漂移。
-# PLAN.md 4.2 定稿的各数据集 corpus 行身份：
+# PLAN.md 0.1 定稿的各数据集 corpus 行身份：
 #   hotpotqa     用原生 "idx"（int）转 str
 #   2wiki        用 corpus 数组行号转 str
 #   musique      用 corpus 数组行号转 str，title 有歧义时用 (title, text) 消歧
@@ -45,7 +45,7 @@ class CapabilityError(RuntimeError):
 
 class Capability(StrEnum):
     EVIDENCE_RECALL = "evidence_recall"
-    ANSWER_EM_F1 = "answer_em_f1"
+    ANSWER_F1 = "answer_f1"
 
 
 class CanonicalSample(BaseModel):

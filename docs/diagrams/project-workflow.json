@@ -27,7 +27,7 @@
       "col": 0,
       "type": "database",
       "label": "四组原始数据",
-      "sublabel": "download_dataset.py",
+      "sublabel": "download_datasets.py",
       "tag": "dataset/",
       "width": 184
     },
@@ -200,7 +200,7 @@
       "title": "结果解释边界",
       "items": [
         "召回基于编译生成文本；分列全样本与 knowledge 回答的检索指标。",
-        "五轮需依次执行；本图依据当前代码，不包含计划中的第六轮原文基线。"
+        "各阶段需依次执行；本图依据当前代码，不包含计划中的原文基线。"
       ]
     }
   ]

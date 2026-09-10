@@ -25,7 +25,7 @@ class TwoWikiMultihopQAAdapter(DatasetAdapter):
     qa_filename: ClassVar[str] = "2wikimultihopqa.json"
     corpus_filename: ClassVar[str] = "2wikimultihopqa_corpus.json"
     capabilities: ClassVar[frozenset[Capability]] = frozenset(
-        {Capability.EVIDENCE_RECALL, Capability.ANSWER_EM_F1}
+        {Capability.EVIDENCE_RECALL, Capability.ANSWER_F1}
     )
 
     def expected_qa_rows(self) -> int:

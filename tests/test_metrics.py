@@ -90,16 +90,39 @@ def test_normalize_answer_is_the_standard_recipe():
     assert qa.normalize_answer("An apple, an orange.") == "apple orange"
 
 
-def test_em_and_f1_take_max_over_references():
+def test_f1_takes_max_over_references():
     """多参考取 max。"""
     scored = qa.score_answer("the beatles", ["The Beatles", "Beatles band"])
-    assert scored["em"] == 1.0
     assert scored["f1"] == 1.0
 
     partial = qa.score_answer("John Lennon", ["Lennon"])
-    assert partial["em"] == 0.0
     # 共有 1 个词；precision 1/2、recall 1/1，F1 = 2/3。
     assert partial["f1"] == pytest.approx(2 / 3)
+
+
+def test_score_answer_reports_no_exact_match():
+    """EM 是刻意去掉的：对散文答案它恒等于 0，不随质量变化。
+
+    这条钉住「不报 EM」这个决定本身 —— 哪天有人顺手把它加回来，
+    报告里就会多出一列恒为 0 的数，读者会据此判断系统坏了。
+    """
+    scored = qa.score_answer("the beatles", ["The Beatles"])
+    assert set(scored) == {"f1"}, f"score_answer should report f1 only, got {sorted(scored)}"
+    assert not hasattr(qa, "exact_match")
+
+
+def test_f1_survives_a_verbose_answer_where_em_could_not():
+    """散文答案里含有正确短答案时，F1 仍是正数 —— 这就是保留它的理由。
+
+    数字很低（这里约 0.13），所以 F1 的绝对值不可跨系统比较；
+    但它随答案质量变化，而 EM 在这种形态下恒为 0。
+    """
+    verbose = (
+        "The disease described is yellow fever, which is caused by the yellow fever "
+        "virus belonging to the genus Flavivirus."
+    )
+    scored = qa.score_answer(verbose, ["Flavivirus"])
+    assert 0.0 < scored["f1"] < 0.3, scored
 
 
 def test_f1_empty_prediction():

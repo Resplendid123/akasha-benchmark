@@ -1,6 +1,6 @@
-"""轮次 3：把子集语料灌进 Akasha、完成编译、校验入库完整性。
+"""入库：把子集语料灌进 Akasha、完成编译、校验入库完整性。
 
-产出 ``doc_id -> page_id`` 映射，后续每一轮都要靠它把响应里的
+产出 ``doc_id -> page_id`` 映射，后续每个阶段都要靠它把响应里的
 ``sourcePageId`` 反查回语料文档。
 
 流程：
@@ -11,7 +11,7 @@
        ``embedding_profile`` 就对不上了，那些 chunk 永远召回不到
     4. 串行导入，边导边追加写 page_map.jsonl，中断后可续跑而不是重来
     5. compile-spaces 绕过 1 小时静默期，然后轮询到全部终态
-    6. 质量闸门：任何 missing / stale 计数非 0 就终止本轮
+    6. 质量闸门：任何 missing / stale 计数非 0 就终止
 
     uv run python -m akasha_benchmark.ingest --run-id run001 --dataset hotpotqa
 """
@@ -48,11 +48,20 @@ def _slug(prefix: str, dataset: str, run_id: str) -> str:
     return slug[:100]
 
 
-def _load_page_map(path: Path) -> dict[str, dict[str, Any]]:
-    """读已有的 page_map，用于断点续跑。文件不存在视为从零开始。"""
+def _load_page_map(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    """读已有的 page_map，用于断点续跑。文件不存在视为从零开始。
+
+    键必须是 ``(dataset, doc_id)``。四组的 doc_id 是各自数据集里的裸 ID，
+    跨组会撞：在锁定的 run001 子集上，hotpotqa×2wiki 撞 15 个、
+    hotpotqa×musique 17 个、2wiki×musique 28 个。只按 doc_id 建字典的话，
+    后导入的那组会覆盖前一组的行，于是续跑时前一组的这些 doc 被误判成
+    「已导入」而跳过，manifest 的 page_map_rows 也会少算。
+    """
     if not path.is_file():
         return {}
-    return {row["doc_id"]: row for row in read_jsonl(path) if row.get("dataset")}
+    return {
+        (row["dataset"], row["doc_id"]): row for row in read_jsonl(path) if row.get("dataset")
+    }
 
 
 def _find_space(client: AkashaClient, slug: str) -> dict[str, Any] | None:
@@ -71,7 +80,7 @@ def _find_space(client: AkashaClient, slug: str) -> dict[str, Any] | None:
 
 
 def ensure_space(client: AkashaClient, dataset: str, run_id: str, prefix: str) -> dict[str, Any]:
-    """取或建该数据集本轮专用的 Space，``reused`` 标明是复用还是新建。"""
+    """取或建该数据集本次运行专用的 Space，``reused`` 标明是复用还是新建。"""
     slug = _slug(prefix, dataset, run_id)
     existing = _find_space(client, slug)
     if existing:
@@ -98,7 +107,7 @@ def import_corpus(
     expected_hashes: dict[str, str] = manifest["corpus_md_sha256"]
 
     done = _load_page_map(page_map_path)
-    already = {d for d, row in done.items() if row["dataset"] == dataset}
+    already = {doc_id for (ds, doc_id) in done if ds == dataset}
 
     corpus_dir = src / "corpus"
     todo = sorted(set(expected_hashes) - already)
@@ -112,11 +121,11 @@ def import_corpus(
             md_path = corpus_dir / f"{doc_id}.md"
             markdown = md_path.read_text(encoding="utf-8")
             actual = sha256_text(markdown)
-            # md 与轮次 2 记录的 sha256 不符，说明抽样产物被改过，
+            # md 与抽样时记录的 sha256 不符，说明子集产物被改过，
             # 此时导进去的内容和 manifest 记的对不上，指标无从追溯。
             if actual != expected_hashes[doc_id]:
                 raise RuntimeError(
-                    f"{dataset}/{doc_id}.md changed since round 2 "
+                    f"{dataset}/{doc_id}.md changed since the subset was built "
                     f"(manifest {expected_hashes[doc_id][:12]} != disk {actual[:12]}). "
                     "Re-run subset sampling or restore the file."
                 )
@@ -213,7 +222,7 @@ def run(
     data_dir: Path | None,
     skip_compile: bool = False,
 ) -> int:
-    """执行轮次 3。返回进程退出码：0 表示可以进入轮次 4。"""
+    """执行入库。返回进程退出码：0 表示可以开始跑查询。"""
     config = load_config(config_path)
     config.require_credentials()
     out_dir = ingest_dir(run_id, data_dir)
@@ -234,7 +243,7 @@ def run(
             )
         workspace = me.get("workspace") or {}
 
-        # 导入前拉一次模型配置快照，轮次 4 会拿它比对，不一致就终止。
+        # 导入前拉一次模型配置快照，跑查询时会拿它比对，不一致就终止。
         model_configs = client.get_model_configs()
 
         spaces: dict[str, dict[str, Any]] = {}
@@ -272,7 +281,7 @@ def run(
         total_failures = sum(len(r["failures"]) for r in import_results)
         page_map = _load_page_map(page_map_path)
         manifest = {
-            "round": 3,
+            "stage": "ingest",
             "run_id": run_id,
             "generated_at": utc_now(),
             "connection": config.redacted(),
@@ -313,7 +322,7 @@ def run(
         return 1
     if not skip_compile and not passed:
         print(
-            "\nquality gate FAILED — do not proceed to round 4. "
+            "\nquality gate FAILED — do not proceed to the query stage. "
             "A half-built index produces meaningless metrics. "
             "Use POST /api/llm-wiki/admin/retry-pages for failed pages.",
             file=sys.stderr,

@@ -1,8 +1,8 @@
-"""End-to-end round 5 on synthetic responses.
+"""End-to-end evaluate on synthetic responses.
 
-Rounds 3 and 4 need a live Akasha, so this fabricates their outputs — a page_map
+Ingest and query need a live Akasha, so this fabricates their outputs — a page_map
 and a response jsonl shaped like a real ``/api/llm-wiki/query`` body — and drives
-the evaluator over them. That covers the plumbing rounds 3/4 feed into: page_id ->
+the evaluator over them. That covers the plumbing they feed into: page_id ->
 doc_id translation, the question-text cross-check, the answerMode split, and
 report rendering.
 """
@@ -52,7 +52,7 @@ def _knowledge_response(retrieved: list[str], cited: list[str], answer: str, sni
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
-    """搭出轮次 2/3/4 的产出，让轮次 5 有完整输入可读。"""
+    """搭出子集、入库、查询的产出，让评测有完整输入可读。"""
     data = tmp_path / "data"
 
     subset = data / "subsets" / RUN_ID / DATASET
@@ -65,7 +65,7 @@ def workspace(tmp_path: Path) -> Path:
         ],
     )
 
-    # 轮次 3 的产出：page id 反查回语料 doc_id。
+    # 入库的产出：page id 反查回语料 doc_id。
     atomic_write_jsonl(
         data / "ingest" / RUN_ID / "page_map.jsonl",
         [
@@ -151,7 +151,7 @@ def workspace(tmp_path: Path) -> Path:
     )
     atomic_write_json(
         responses / "manifest.json",
-        {"model_configs": {"embedding": "m1"}, "model_configs_match_round3": True,
+        {"model_configs": {"embedding": "m1"}, "model_configs_match_ingest": True,
          "total_failures": 1, "score_threshold": None},
     )
     return data
@@ -169,9 +169,11 @@ def test_evaluate_splits_knowledge_only_from_all_samples(workspace: Path):
     assert summary["retrieval_knowledge_only"]["recall@2"] == pytest.approx(1.0)
     assert summary["retrieval"]["full_coverage@2"] == pytest.approx(1 / 3)
 
-    # EM：只有 s1 答对。
-    assert summary["qa"]["em"] == pytest.approx(1 / 3)
-    assert summary["qa"]["em_knowledge_only"] == pytest.approx(1.0)
+    # F1：只有 s1 答对，且答得与参考逐词相同，所以它那条是 1.0。
+    # 不报 EM，见 metrics/qa.py。
+    assert "em" not in summary["qa"]
+    assert summary["qa"]["f1"] == pytest.approx(1 / 3)
+    assert summary["qa"]["f1_knowledge_only"] == pytest.approx(1.0)
     assert summary["answer_mode_distribution"]["no_match"] == pytest.approx(1 / 3)
 
     # p7 -> d7 能反查到、只是不是 gold；这里不该有反查不到的 page。
@@ -228,6 +230,35 @@ def test_run_writes_all_three_artifacts(workspace: Path):
     # 那条架构说明必须出现在每份报告里，不能只写在计划文档里。
     assert "not valid" in report
     assert "knowledge only" in report
+    # 不报 EM 的理由也要在报告里，否则熟悉 hotpotqa 的读者会去找这一列。
+    assert "no Exact Match column" in report
+    assert "| EM |" not in report
 
     metrics = load_json(out / "metrics.json")
     assert metrics["datasets"][0]["dataset"] == DATASET
+    assert "em" not in metrics["datasets"][0]["qa"]
+
+
+def test_report_tables_have_matching_column_counts(workspace: Path):
+    """每张表的表头、分隔行与数据行列数必须一致。
+
+    删掉 EM 列时只改表头不改数据行（或反之）不会报错，只会让 Markdown 表格错行，
+    而错行的表格照样是「一份报告」—— 看起来正常，读出来的数却对错了列。
+    """
+    assert run(RUN_ID, [DATASET], workspace, (2, 5)) == 0
+    report = (reports_dir(RUN_ID, workspace) / "report.md").read_text(encoding="utf-8")
+
+    lines = report.splitlines()
+    tables = 0
+    for index, line in enumerate(lines):
+        # 分隔行（| --- | --- |）定位一张表：它上面是表头，下面是数据行。
+        if not line.startswith("|") or set(line.replace("|", "").replace("-", "").strip()):
+            continue
+        tables += 1
+        width = line.count("|")
+        assert lines[index - 1].count("|") == width, f"header/separator mismatch:\n{lines[index-1]}\n{line}"
+        for row in lines[index + 1 :]:
+            if not row.startswith("|"):
+                break
+            assert row.count("|") == width, f"row has {row.count('|')} pipes, header has {width}:\n{row}"
+    assert tables >= 2, f"expected the retrieval and stratified tables, found {tables}"

@@ -5,13 +5,12 @@
 四组 QA 文件与对应语料下载到 ``dataset/``。仓库里 NarrativeQA 那一份叫
 ``narrativeqa_dev_10_doc``，本地统一存成 ``narrativeqa``，让四组的命名一致。
 
-用法：
-    uv run python download_dataset.py
-    uv run python download_dataset.py --check      # 只校验，不下载
-    HF_ENDPOINT=https://huggingface.co uv run python download_dataset.py
+用法（从仓库根执行）：
+    uv run python scripts/download_datasets.py
+    uv run python scripts/download_datasets.py --check      # 只校验，不下载
+    HF_ENDPOINT=https://huggingface.co uv run python scripts/download_datasets.py
 
-重跑很便宜：已存在且字节数符合预期的文件会跳过，
-所以下载中断后直接重跑即可。
+已存在且字节数符合预期的文件会跳过，下载中断后直接重跑即可。
 """
 
 from __future__ import annotations
@@ -29,7 +28,8 @@ from huggingface_hub.utils import HfHubHTTPError
 
 REPO_ID = "osunlp/HippoRAG_2"
 REPO_TYPE = "dataset"
-DEST = Path(__file__).parent / "dataset"
+# 仓库根的 dataset/，不是脚本目录下的 —— 本文件在 scripts/
+DEST = Path(__file__).resolve().parent.parent / "dataset"
 
 # 候选站点，按顺序尝试。hf-mirror.com 是只读的社区镜像，
 # 在访问不到 huggingface.co 的网络环境下有用。

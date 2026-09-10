@@ -1,4 +1,4 @@
-"""轮次 5：从落盘的响应算指标。纯离线，不再碰 Akasha。
+"""评测：从落盘的响应算指标。纯离线，不再碰 Akasha。
 
 每个检索指标都出两份 —— 全样本，以及只算 ``answerMode == "knowledge"`` 的切片。
 原因是 ``no_match`` 和 ``general`` 两种模式无条件返回
@@ -38,10 +38,10 @@ def reports_dir(run_id: str, data_dir: Path | None = None) -> Path:
 
 
 def _page_to_doc(run_id: str, dataset: str, data_dir: Path | None) -> dict[str, str]:
-    """读轮次 3 的 page_map，建 page_id -> doc_id 的反查表。"""
+    """读入库阶段的 page_map，建 page_id -> doc_id 的反查表。"""
     path = ingest_dir(run_id, data_dir) / "page_map.jsonl"
     if not path.is_file():
-        raise FileNotFoundError(f"{path} missing; round 3 has not produced a page map")
+        raise FileNotFoundError(f"{path} missing; the ingest stage has not produced a page map")
     mapping: dict[str, str] = {}
     for row in read_jsonl(path):
         if row.get("dataset") == dataset:
@@ -73,7 +73,7 @@ def evaluate_dataset(
     }
     response_path = responses_dir(run_id, data_dir) / f"{dataset}.jsonl"
     if not response_path.is_file():
-        raise FileNotFoundError(f"{response_path} missing; run round 4 first")
+        raise FileNotFoundError(f"{response_path} missing; run the query stage first")
 
     page_to_doc = _page_to_doc(run_id, dataset, data_dir) if has_gold else {}
 
@@ -91,7 +91,7 @@ def evaluate_dataset(
         sample = samples.get(sample_id)
         if sample is None:
             raise ValueError(
-                f"{response_path}: sample_id {sample_id!r} is not in the round 2 subset; "
+                f"{response_path}: sample_id {sample_id!r} is not in the subset; "
                 "the response file and the subset are from different runs"
             )
         # PLAN.md 3.4：按 ID 匹配后**再比一次 question 文本**。
@@ -104,7 +104,7 @@ def evaluate_dataset(
 
         status = row.get("http_status") or 0
         body = row.get("response") or {}
-        # 失败行照样参与统计（EM/F1 记 0），因为失败率本身是结果的一部分。
+        # 失败行照样参与统计（F1 记 0），因为失败率本身是结果的一部分。
         ok = 200 <= status < 300 and isinstance(body, dict)
         if not ok:
             http_failures += 1
@@ -158,10 +158,9 @@ def evaluate_dataset(
         "answer_mode_distribution": qa.answer_mode_distribution(
             [e["answer_mode"] for e in per_sample]
         ),
+        # 只有 F1，没有 EM：EM 对散文答案恒等于 0，不随质量变化。见 metrics/qa.py。
         "qa": {
-            "em": _mean([e["qa"]["em"] for e in per_sample]),
             "f1": _mean([e["qa"]["f1"] for e in per_sample]),
-            "em_knowledge_only": _mean([e["qa"]["em"] for e in knowledge_rows]),
             "f1_knowledge_only": _mean([e["qa"]["f1"] for e in knowledge_rows]),
         },
         "latency_ms_mean": _mean([float(e["latency_ms"] or 0) for e in per_sample]),
@@ -186,10 +185,7 @@ def evaluate_dataset(
                 "count": len(rows),
                 "retrieval": retrieval.aggregate([r["retrieval"] for r in rows]),
                 "multihop": multihop.aggregate([r["multihop"] for r in rows]),
-                "qa": {
-                    "em": _mean([r["qa"]["em"] for r in rows]),
-                    "f1": _mean([r["qa"]["f1"] for r in rows]),
-                },
+                "qa": {"f1": _mean([r["qa"]["f1"] for r in rows])},
                 "knowledge_answer_share": len(knowledge) / len(rows) if rows else 0.0,
             }
         summary["stratified"] = {"key": key, "strata": strata}
@@ -223,12 +219,19 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
         "tuning fixes, and multi-hop performance may be inflated because the compiler",
         "can merge entities across documents into a single artifact. **Comparing these",
         "figures directly against published baselines is not valid.** The only",
-        "meaningful control is the round 6 raw-text baseline.",
+        "meaningful control is the raw-text baseline.",
         "",
         "`no_match` and `general` answers return an empty `retrievedSources`, so their",
         "retrieval scores are 0 by construction. Each retrieval table therefore appears",
         "twice: over all samples, and over `knowledge` answers only. The difference is",
         "generation-side rejection, not retrieval failure.",
+        "",
+        "**There is no Exact Match column, deliberately.** EM requires the whole",
+        "normalized answer to equal the reference, but Akasha answers in explanatory",
+        "prose while these datasets reference short spans, so EM is identically 0",
+        "regardless of answer quality, and a metric with no variance carries no",
+        "information. Answer F1 is kept but is diluted by the same verbosity, so read",
+        "it only across configurations of this system, never against published numbers.",
         "",
         "## Model configuration",
         "",
@@ -245,9 +248,8 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
             f"- samples: {summary['responses_evaluated']}/{summary['samples_in_subset']}"
             f" (http failures: {summary['http_failures']})",
             f"- answer modes: {summary['answer_mode_distribution']}",
-            f"- EM/F1: {summary['qa']['em']:.4f} / {summary['qa']['f1']:.4f}"
-            f"  (knowledge-only: {summary['qa']['em_knowledge_only']:.4f} /"
-            f" {summary['qa']['f1_knowledge_only']:.4f})",
+            f"- answer F1: {summary['qa']['f1']:.4f}"
+            f"  (knowledge-only: {summary['qa']['f1_knowledge_only']:.4f})",
         ]
         if "retrieval" in summary:
             overall, knowledge = summary["retrieval"], summary["retrieval_knowledge_only"]
@@ -277,15 +279,15 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
                 "",
                 f"### Stratified by `{summary['stratified']['key']}`",
                 "",
-                "| stratum | n | recall@10 | full_coverage@10 | EM | F1 | knowledge share |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| stratum | n | recall@10 | full_coverage@10 | F1 | knowledge share |",
+                "| --- | --- | --- | --- | --- | --- |",
             ]
             for name, bucket in summary["stratified"]["strata"].items():
                 lines.append(
                     f"| {name} | {bucket['count']} |"
                     f" {bucket['retrieval'].get('recall@10', 0.0):.4f} |"
                     f" {bucket['retrieval'].get('full_coverage@10', 0.0):.4f} |"
-                    f" {bucket['qa']['em']:.4f} | {bucket['qa']['f1']:.4f} |"
+                    f" {bucket['qa']['f1']:.4f} |"
                     f" {bucket['knowledge_answer_share']:.4f} |"
                 )
             if summary["unmapped_page_ids"]:
@@ -304,7 +306,7 @@ def _format_report(run_id: str, summaries: list[dict[str, Any]], context: dict[s
 def run(
     run_id: str, datasets: list[str], data_dir: Path | None, ks: tuple[int, ...]
 ) -> int:
-    """执行轮次 5，产出 metrics.json / per_sample.jsonl / report.md。"""
+    """执行评测，产出 metrics.json / per_sample.jsonl / report.md。"""
     out_dir = reports_dir(run_id, data_dir)
     response_manifest_path = responses_dir(run_id, data_dir) / "manifest.json"
     response_manifest = (
@@ -318,7 +320,7 @@ def run(
         try:
             summary, rows = evaluate_dataset(dataset, run_id, data_dir, ks)
         except FileNotFoundError as exc:
-            # 该数据集没跑过轮次 4，跳过而不算失败。
+            # 该数据集没跑过查询，跳过而不算失败。
             print(f"skip {dataset}: {exc}", file=sys.stderr)
             continue
         except Exception as exc:  # noqa: BLE001 - 报告后继续做下一个数据集
@@ -337,12 +339,12 @@ def run(
         "model_configs_excerpt": str(response_manifest.get("model_configs", "unavailable"))[:2000],
     }
     metrics = {
-        "round": 5,
+        "stage": "evaluate",
         "run_id": run_id,
         "generated_at": context["generated_at"],
         "ks": list(ks),
-        "round4_manifest": {
-            "model_configs_match_round3": response_manifest.get("model_configs_match_round3"),
+        "query_manifest": {
+            "model_configs_match_ingest": response_manifest.get("model_configs_match_ingest"),
             "total_failures": response_manifest.get("total_failures"),
             "score_threshold": response_manifest.get("score_threshold"),
         },
@@ -355,7 +357,7 @@ def run(
     for summary in summaries:
         line = (
             f"ok   {summary['dataset']:<16} n={summary['responses_evaluated']:<4} "
-            f"EM={summary['qa']['em']:.3f} F1={summary['qa']['f1']:.3f}"
+            f"F1={summary['qa']['f1']:.3f}"
         )
         if "retrieval" in summary:
             line += (

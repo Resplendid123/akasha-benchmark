@@ -1,6 +1,4 @@
-"""轮次 1：把四组数据归一化成 samples.jsonl + corpus.jsonl。
-
-全量，不抽样。抽样是轮次 2 的事，而且它需要一个已经校验过的规范化底座才能抽。
+"""归一化：把四组数据整成 samples.jsonl + corpus.jsonl。
 
     uv run python -m akasha_benchmark.normalize
     uv run python -m akasha_benchmark.normalize --dataset hotpotqa
@@ -19,6 +17,7 @@ from .datasets import (
     CanonicalSample,
     load_corpus,
     normalized_dir,
+    repo_relative,
     resolve,
 )
 from .io_utils import atomic_write_json, atomic_write_jsonl, load_json, sha256_file, utc_now
@@ -71,7 +70,7 @@ def normalize_dataset(
         gold_dist[len(sample.gold_doc_ids)] = gold_dist.get(len(sample.gold_doc_ids), 0) + 1
 
     manifest = {
-        "round": 1,
+        "stage": "normalize",
         "dataset": adapter.name,
         "adapter": type(adapter).__name__,
         "adapter_version": adapter.version,
@@ -83,12 +82,12 @@ def normalize_dataset(
         },
         "sources": {
             "qa": {
-                "path": str(resolved.qa_path.resolve()),
+                "path": repo_relative(resolved.qa_path),
                 "sha256": sha256_file(resolved.qa_path),
                 "rows": len(rows),
             },
             "corpus": {
-                "path": str(resolved.corpus_path.resolve()),
+                "path": repo_relative(resolved.corpus_path),
                 "sha256": sha256_file(resolved.corpus_path),
                 "rows": len(corpus.docs),
             },
@@ -100,9 +99,10 @@ def normalize_dataset(
         # 只报告不执行：musique 的重复 title 是不同段落，去重会丢 gold。
         "corpus_dedup_stats": corpus.dedup_stats(),
         "dedup_applied": False,
-        # 注意这是**去重后**的 gold 篇数分布，与 PLAN.md 0.4 的去重前数字不同。
+        # 这是**去重后**的 gold 篇数分布（PLAN.md 0.2），与原始标注条数不同 ——
+        # hotpotqa 的 supporting_facts 是 (title, 句子下标) 对，同一篇会出现多次。
         "gold_count_distribution": {str(k): v for k, v in sorted(gold_dist.items())},
-        # 轮次 5 按 sha256(query) join 审计表，重复 question 会让那一行没法连。
+        # 审计归因按 sha256(query) join 审计表，重复 question 会让那一行没法连。
         "unique_question_texts": len({s.question for s in samples}),
     }
     atomic_write_json(out_dir / "manifest.json", manifest)

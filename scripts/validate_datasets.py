@@ -1,16 +1,14 @@
-"""轮次 1 的验收检查（PLAN.md 4.5）。
+"""归一化产物的验收检查。
 
-**逐行过全量数据，不是只看 row 0**，并把归一化产物与原始文件对比。
+逐行过全量数据，并把归一化产物与原始文件对比。
 
-刻意不复用 normalize.py 的结果：它从源数据重新推导一遍再比对，
-这样写入侧的 bug 会表现为「对不上」，而不是被自己的输出确认为正确。
 
 每个数据集检查：
   * 每一行原始数据能否通过适配器
   * dataset_sample_id 是否缺失或重复
   * gold 篇数分布；「声明了 EVIDENCE_RECALL 却抽不出 gold」的行
   * 每个 gold doc_id 是否都能在 corpus 中找到
-  * 重复的 question 文本（影响轮次 5 的审计表 join）
+  * 重复的 question 文本
   * corpus 的 (title, text) 唯一性
   * 归一化产物与重新推导的结果是否逐行一致
   * manifest 里的 sha256 与磁盘上的文件是否还对得上
@@ -132,7 +130,7 @@ def validate(dataset: str, dataset_dir: Path | None, data_dir: Path | None) -> R
         f"questions={len(rederived)} unique={len(questions)} duplicate_texts={len(duplicates)}"
     )
     if duplicates:
-        # 不算致命错误。但轮次 5 按 sha256(query) join 审计表，
+        # 不算致命错误。但审计归因按 sha256(query) join 审计表，
         # 这些行必须从那个 join 里排除，所以要在这里点出来。
         sample_q = next(iter(duplicates))
         report.note(

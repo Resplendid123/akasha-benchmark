@@ -9,7 +9,7 @@ from .common import gold_titles_from_supporting_facts, resolve_gold_doc_ids
 from .corpus import CorpusIndex
 from .models import Capability, CanonicalSample, make_sample_id
 
-# 本集的 context 句子用空串拼接才能还原成 corpus 的 text。第六轮基线要用。
+# 本集的 context 句子用空串拼接才能还原成 corpus 的 text。原文基线要用。
 SENTENCE_JOINER = ""
 
 
@@ -19,7 +19,7 @@ class HotpotQAAdapter(DatasetAdapter):
     qa_filename: ClassVar[str] = "hotpotqa.json"
     corpus_filename: ClassVar[str] = "hotpotqa_corpus.json"
     capabilities: ClassVar[frozenset[Capability]] = frozenset(
-        {Capability.EVIDENCE_RECALL, Capability.ANSWER_EM_F1}
+        {Capability.EVIDENCE_RECALL, Capability.ANSWER_F1}
     )
 
     def expected_qa_rows(self) -> int:

@@ -1,14 +1,14 @@
 # 数据集字段说明
 
 四组多跳/长文档问答数据集，取自 [osunlp/HippoRAG_2](https://huggingface.co/datasets/osunlp/HippoRAG_2)，
-由 [download_dataset.py](download_dataset.py) 下载到 [dataset/](dataset/)。
+由 [download_datasets.py](../scripts/download_datasets.py) 下载到 [dataset/](../dataset/)。
 
 每组两个文件，职责分开：
 
-- `<name>.json` —— **QA 文件**。问题、标准答案、以及标注好的 gold evidence。用来出题和打分。
-- `<name>_corpus.json` —— **检索语料**。扁平的文档列表，喂给检索器建索引。
+- `<name>.json` —— **QA 文件**。
+- `<name>_corpus.json` —— **检索语料**。
 
-下表数字均为实际读文件统计：
+本文只讲原始字段。抹平之后的统一 schema 见 [normalized_datasets.md](normalized_datasets.md)。
 
 | 数据集 | QA 行数 | corpus 行数 | 题型 | evidence 标注 |
 | --- | --- | --- | --- | --- |
@@ -18,8 +18,6 @@
 | narrativeqa | 293 | 4111 | 长文档 | 无 |
 
 ## corpus 文件
-
-三个字段，但 `idx` 并不统一，写加载器时要注意：
 
 | 字段 | 类型 | 作用 |
 | --- | --- | --- |
@@ -32,24 +30,6 @@
   `4b30ab1c49b62dc59b9773954958d9ac6807a865_0`。4111 个值全局唯一。
 - 2wikimultihopqa / musique：**没有 `idx`**，只有 `title` + `text`。
 
-`title` 能否当唯一键也分数据集：hotpotqa（9811）和 2wiki（6119）的 title 全局唯一；
-musique 有 1818 行 title 重复（同名文档的不同段落）；narrativeqa 的 4111 个 chunk
-只有 10 个不同 title，因为它是按文档切块的，title 是书/剧本名。
-
-## hotpotqa
-
-维基百科 2 跳问答。全部为 `level: hard`。
-
-| 字段 | 类型 | 作用 |
-| --- | --- | --- |
-| `_id` | str | 24 位十六进制，行唯一标识 |
-| `question` | str | 问题 |
-| `answer` | str | 标准答案，EM/F1 的比对对象 |
-| `context` | list | 10 个 `[title, [句子, ...]]`。每题的候选文档，2 个 gold + 8 个干扰 |
-| `supporting_facts` | list | gold evidence，元素为 `[title, 句子下标]`，下标指向 `context` 里对应 title 的句子列表 |
-| `type` | str | `bridge`(811) / `comparison`(189)，桥接推理还是比较 |
-| `level` | str | 难度，本集恒为 `hard` |
-
 ## 2wikimultihopqa
 
 维基百科 + Wikidata，2–4 跳。结构与 hotpotqa 基本对齐，多了知识图谱侧的标注。
@@ -59,13 +39,27 @@ musique 有 1818 行 title 重复（同名文档的不同段落）；narrativeqa
 | `_id` | str | 32 位十六进制，行唯一标识 |
 | `question` | str | 问题 |
 | `answer` | str | 标准答案 |
-| `context` | list | 10 个 `[title, [句子, ...]]`，同 hotpotqa |
-| `supporting_facts` | list | gold evidence，`[title, 句子下标]` |
+| `context` | list | 10 个 `[title, [句子, ...]]`，title同时是supporting_facts和corpus中的title关联键；每题的候选文档中 2 个 gold + 8 个干扰  |
+| `supporting_facts` | list | gold evidence，`[title, 句子下标]` ，title再context中，句子下标是对应corpus中的第几个片段（细粒度）|
 | `evidences` | list | 三元组 `[主语, 关系, 宾语]`，如 `["Lothair II", "mother", "Ermengarde of Tours"]`。推理链的符号化表示 |
 | `evidences_id` | list | 同上，但换成 Wikidata QID，如 `["Q298945", "mother", "Q235653"]` |
-| `entity_ids` | str | 下划线连接的 QID，如 `Q298945_Q235653` |
-| `type` | str | `compositional`(413) / `comparison`(244) / `bridge_comparison`(235) / `inference`(108) |
-| `answer_id` | str \| null | 答案实体的 QID，163 行为 `null`（答案是日期、数字等非实体时） |
+| `entity_ids` | str | 上述中通过下划线连接QID的关系链表示，如 `Q298945_Q235653` |
+| `type` | str | `compositional`(413) - 组合推理（评估多源汇聚） / `comparison`(244) - 比较推理（评估领域内优劣）/ `bridge_comparison`(235) - 桥接推理（评估跨领域类比） / `inference`(108) - 推断推理（评估因果链条） |
+| `answer_id` | str \| null | 答案对应实体的 QID， `null`（答案是日期、数字等非实体时） |
+
+## hotpotqa
+
+维基百科 2 跳问答。全部为 `level: hard`。
+
+| 字段 | 类型 | 作用 |
+| --- | --- | --- |
+| `_id` | str | 24 位十六进制，行唯一标识 |
+| `question` | str | 问题 |
+| `answer` | str | 标准答案 |
+| `context` | list | 10 个 `[title, [句子, ...]]`。title同时是supporting_facts和corpus中的title关联键；每题的候选文档中 2 个 gold + 8 个干扰 |
+| `supporting_facts` | list | gold evidence，元素为 `[title, 句子下标]`，下标指向 `context` 里对应 title 的句子列表 |
+| `type` | str | `bridge`(811) - 桥接推理（评估跨领域类比）/ `comparison`(189) - 比较推理（评估领域内优劣）|
+| `level` | str | 难度，本集恒为 `hard` |
 
 ## musique
 
@@ -76,7 +70,7 @@ musique 有 1818 行 title 重复（同名文档的不同段落）；narrativeqa
 | `id` | str | 行标识，前缀即跳数：`2hop`(518) / `3hop1`(243) / `3hop2`(73) / `4hop1`(108) / `4hop2`(27) / `4hop3`(31) |
 | `question` | str | 问题 |
 | `answer` | str | 标准答案 |
-| `answer_aliases` | list | 答案别名，276 行非空。打 EM 时应并入候选，命中任一即算对 |
+| `answer_aliases` | list | 答案别名，276 行非空。打分时应并入候选，命中任一即算对 |
 | `answerable` | bool | 是否可答，本集全为 `true` |
 | `paragraphs` | list | 20 个候选段落，每个含 `idx`(int) / `title` / `paragraph_text` / `is_supporting`(bool) |
 | `question_decomposition` | list | 推理链，每步含 `id` / `question` / `answer` / `paragraph_support_idx`（指向 `paragraphs[].idx`） |
@@ -91,14 +85,14 @@ gold evidence 取 `paragraphs` 里 `is_supporting == true` 的项，每题 2–4
 | 字段 | 类型 | 作用 |
 | --- | --- | --- |
 | `question` | str | 问题 |
-| `answer` | list[str] | **2 个**人工参考答案，全部 293 行都是 2 个。评分需对多参考取最优 |
+| `answer` | list[str] | **2 个**人工参考答案。 |
 | `document` | dict | 源文档，见下 |
 
 `document` 的字段：
 
 | 字段 | 作用 |
 | --- | --- |
-| `id` | 40 位 SHA1，文档标识。注意只有 **10 个**唯一值 |
+| `id` | 40 位 SHA1，文档标识。 |
 | `kind` | `movie`(204) / `gutenberg`(89) |
 | `url` | 原文地址 |
 | `file_size` / `word_count` | 原文体积 |
@@ -106,35 +100,228 @@ gold evidence 取 `paragraphs` 里 `is_supporting == true` 的项，每题 2–4
 | `summary` | 含 `text` / `tokens` / `url` / `title`，人工摘要 |
 | `text` | **整篇原文全文**，166KB–505KB |
 
-## 几个实测注意点
-
-**QA 与 corpus 的关联**已逐行验证：
-
-- hotpotqa：2468 条 gold evidence 的 title 全部命中 corpus，句子下标无越界。
-- musique：19990 个内联段落（含 2648 条 supporting）的 `(title, text)` 全部能在 corpus 中找到。
-- narrativeqa：10 个 `document.id` 全部对应上 corpus 的 `idx` 前缀。
-- 2wiki：有两处小瑕疵 —— 9/2471 条 gold evidence 的句子下标越界或 title 不在
-  该行 `context` 里；6120 个 context title 中有 1 个不在 corpus。写适配器时别假设 100%。
-
-**句子拼接方式不一致。** 把 `context` 的句子列表还原成 corpus 里的 `text` 时，
-hotpotqa 用空串 `""` 拼，2wiki 用空格 `" "` 拼。两边 `text` 都以 title 开头。
-这意味着「gold evidence 字符串精确命中 corpus」的比例不会是 100%，
-evidence recall 的比对口径需要容忍这个差异。
-
-**narrativeqa 的 `document.id` 不能当行标识。** 293 个问题只有 10 个文档，
-它是文档级 ID。需要行身份时用行号。
-
-**narrativeqa QA 文件 94MB**，因为每行都内联了整篇 `document.text`（约 210KB），
-10 篇原文被重复了 293 次。corpus 反而只有 2.9MB。按行流式处理或只取需要的字段，
-不要无脑全量 load 进内存。
-
 ## 校验
 
 ```bash
-uv run python download_dataset.py --check
+uv run python scripts/download_datasets.py --check
 ```
 
 逐个文件确认存在、能解析成 JSON，并打印体积和记录数。
 
+## 附录：各数据集首行样本
 
+每个数据集 QA 文件的 `[0]` 号样本，字段与上文表格对应。候选段落统一裁到 3 个、过长文本截断，省略处均有标注，其余原样保留。
 
+### hotpotqa
+
+10 个候选段落裁到 3 个：`supporting_facts` 指向的 2 个 gold 加 1 个干扰，保持原始顺序。
+
+```json
+{
+  "_id": "5abe953b5542993f32c2a170",
+  "answer": "superhero roles as the Marvel Comics",
+  "question": "what is one of the stars of  The Newcomers known for",
+  "supporting_facts": [
+    [
+      "The Newcomers (film)",
+      0
+    ],
+    [
+      "Chris Evans (actor)",
+      1
+    ]
+  ],
+  "context": [
+    [
+      "Vaada Poda Nanbargal",
+      [
+        "Vaada Poda Nanbargal is a 2011 Indian Tamil-language romantic comedy film directed by Manikai.",
+        " P. Arumaichandran has produced this movie under the banner 8 Point Entertainments.",
+        " The film stars newcomers Nanda, Sharran Kumar and Yashika in the lead roles.",
+        " The lead actor Nanda happens to be one of the strong contender of a popular television series \"Yaar Adutha Prabhu Deva\" aired on Vijay TV."
+      ]
+    ],
+    [
+      "Chris Evans (actor)",
+      [
+        "Christopher Robert Evans (born June 13, 1981) is an American actor and filmmaker.",
+        " Evans is known for his superhero roles as the Marvel Comics characters Steve Rogers / Captain America in the Marvel Cinematic Universe and Johnny Storm / Human Torch in \"Fantastic Four\" and ."
+      ]
+    ],
+    [
+      "The Newcomers (film)",
+      [
+        "The Newcomers is a 2000 American family drama film directed by James Allen Bradley and starring Christopher McCoy, Kate Bosworth, Paul Dano and Chris Evans.",
+        " Christopher McCoy plays Sam Docherty, a boy who moves to Vermont with his family, hoping to make a fresh start away from the city.",
+        " It was filmed in Vermont, and released by Artist View Entertainment and MTI Home Video."
+      ]
+    ],
+    // ... 其余 7 个省略，结构相同
+  ],
+  "type": "bridge",
+  "level": "hard"
+}
+```
+
+### 2wikimultihopqa
+
+同上，10 个裁到 3 个，2 gold + 1 干扰。
+
+```json
+{
+  "_id": "83bf3b5a0bd911eba7f7acde48001122",
+  "type": "compositional",
+  "question": "When did Lothair Ii's mother die?",
+  "context": [
+    [
+      "Teutberga",
+      [
+        "Teutberga( died 11 November 875) was a queen of Lotharingia by marriage to Lothair II.",
+        "She was a daughter of Bosonid Boso the Elder and sister of Hucbert, the lay- abbot of St. Maurice's Abbey."
+      ]
+    ],
+    [
+      "Lothair II",
+      [
+        "Lothair II (835 –) was the king of Lotharingia from 855 until his death.",
+        "He was the second son of Emperor Lothair I and Ermengarde of Tours.",
+        "He was married to Teutberga (died 875), daughter of Boso the Elder."
+      ]
+    ],
+    [
+      "Ermengarde of Tours",
+      [
+        "Ermengarde of Tours (d. 20 March 851) was the daughter of Hugh of Tours, a member of the Etichonen family.",
+        "In October 821 in Thionville, she married the Carolingian Emperor Lothair I of the Franks (795–855).",
+        "In 849, two years before her death, she made a donation to the abbey Erstein in the Elsass, in which she is buried.",
+        "Lothair and Ermengarde had eight children:"
+      ]
+    ],
+    // ... 其余 7 个省略，结构相同
+  ],
+  "entity_ids": "Q298945_Q235653",
+  "supporting_facts": [
+    [
+      "Lothair II",
+      1
+    ],
+    [
+      "Ermengarde of Tours",
+      0
+    ]
+  ],
+  "evidences": [
+    [
+      "Lothair II",
+      "mother",
+      "Ermengarde of Tours"
+    ],
+    [
+      "Ermengarde of Tours",
+      "date of death",
+      "20 March 851"
+    ]
+  ],
+  "answer": "20 March 851",
+  "evidences_id": [
+    [
+      "Q298945",
+      "mother",
+      "Q235653"
+    ],
+    [
+      "Q235653",
+      "date of death",
+      "date_information"
+    ]
+  ],
+  "answer_id": null
+}
+```
+
+### musique
+
+20 个候选段落裁到 3 个，含 1 个 `is_supporting: true`。本题 gold 共 2 个，另一个在省略部分。
+
+```json
+{
+  "id": "2hop__13548_13529",
+  "paragraphs": [
+    {
+      "idx": 0,
+      "title": "Lionel Messi",
+      "paragraph_text": "After a year at Barcelona's youth academy, La Masia, Messi was finally enrolled in the Royal Spanish Football Federation (RFEF) in February 2002. Now playing in all competitions, he befriended his teammates, among whom were Cesc Fàbregas and Gerard Piqué. After completing his growth hormone treatment aged 14, Messi became an integral part of the ``Baby Dream Team '', Barcelona's greatest - ever youth side. During his first full season (2002 -- 03), he was top scorer with 36 goals in 30 games for the Cadetes A, who won an unprecedented treble of the league and both the Spanish and Catalan cups. The Copa Catalunya final, a 4 -- 1 victory over Espanyol, became known in club lore as the partido de la máscara, the final of the mask. A week after suffering a broken cheekbone during a league match, Messi was allowed to start the game on the condition that he wear a plastic protector; soon hindered by the mask, he took it off and scored two goals in 10 minutes before his substitution. At the close of the season, he received an offer to join Arsenal, his first from a foreign club, but while Fàbregas and Piqué soon left for England, he chose to remain in Barcelona.",
+      "is_supporting": false
+    },
+    {
+      "idx": 1,
+      "title": "FC Barcelona",
+      "paragraph_text": "Despite being the favourites and starting strongly, Barcelona finished the 2006–07 season without trophies. A pre-season US tour was later blamed for a string of injuries to key players, including leading scorer Eto'o and rising star Lionel Messi. There was open feuding as Eto'o publicly criticized coach Frank Rijkaard and Ronaldinho. Ronaldinho also admitted that a lack of fitness affected his form. In La Liga, Barcelona were in first place for much of the season, but inconsistency in the New Year saw Real Madrid overtake them to become champions. Barcelona advanced to the semi-finals of the Copa del Rey, winning the first leg against Getafe 5–2, with a goal from Messi bringing comparison to Diego Maradona's goal of the century, but then lost the second leg 4–0. They took part in the 2006 FIFA Club World Cup, but were beaten by a late goal in the final against Brazilian side Internacional. In the Champions League, Barcelona were knocked out of the competition in the last 16 by eventual runners-up Liverpool on away goals.",
+      "is_supporting": true
+    },
+    {
+      "idx": 2,
+      "title": "FC Barcelona",
+      "paragraph_text": "In June 1982, Diego Maradona was signed for a world record fee of £5 million from Boca Juniors. In the following season, under coach Luis, Barcelona won the Copa del Rey, beating Real Madrid. However, Maradona's time with Barcelona was short-lived and he soon left for Napoli. At the start of the 1984–85 season, Terry Venables was hired as manager and he won La Liga with noteworthy displays by German midfielder Bernd Schuster. The next season, he took the team to their second European Cup final, only to lose on penalties to Steaua Bucureşti during a dramatic evening in Seville.",
+      "is_supporting": true
+    },
+    // ... 其余 17 个省略，结构相同
+  ],
+  "question": "When was the person who Messi's goals in Copa del Rey compared to get signed by Barcelona?",
+  "question_decomposition": [
+    {
+      "id": 13548,
+      "question": "To whom was Messi's goal in the first leg of the Copa del Rey compared?",
+      "answer": "Diego Maradona",
+      "paragraph_support_idx": 1
+    },
+    {
+      "id": 13529,
+      "question": "When was #1 signed by Barcelona?",
+      "answer": "June 1982",
+      "paragraph_support_idx": 2
+    }
+  ],
+  "answer": "June 1982",
+  "answer_aliases": [],
+  "answerable": true
+}
+```
+
+### narrativeqa
+
+无候选段落列表，只有单篇 `document.text`（本例 210,625 字符）。该字段与 `summary.tokens` 均截断标注。
+
+```json
+{
+  "document": {
+    "id": "4b30ab1c49b62dc59b9773954958d9ac6807a865",
+    "kind": "movie",
+    "url": "http://www.imsdb.com/scripts/All-About-Steve.html",
+    "file_size": 211827,
+    "word_count": 28085,
+    "start": "ALL ABOUT STEVE",
+    "end": ". THE END",
+    "summary": {
+      "text": " Mary Horowitz, a crossword puzzle writer for the Sacramento Herald, is socially awkward and considers her pet hamster her only true friend.\nHer parents decide to set her up on a blind date. Mary's ex ...<截断>",
+      "tokens": [
+        "Mary",
+        "Horowitz",
+        ",",
+        "a",
+        "crossword",
+        "puzzle",
+        "...<截断，共 492 个 token>"
+      ],
+      "url": "http://en.wikipedia.org/wiki/All_About_Steve",
+      "title": "All About Steve"
+    },
+    "text": "<html>\n<head><title>All About Steve Script at IMSDb.</title>\n<meta name=\"description\" content=\"All About Steve script at the Internet Movie Script Database.\">\n<meta name=\"keywords\" content=\"All About  ...<截断，全文共 210,625 字符>"
+  },
+  "question": "What is Mary Horowitz's job?",
+  "answer": [
+    "She is a crossword writer for the Sacramento Herald.",
+    "She is a crossword puzzle writer."
+  ]
+}
+```

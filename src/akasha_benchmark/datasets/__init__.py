@@ -1,4 +1,4 @@
-"""数据集适配器，以及五轮共用的规范化模型。"""
+"""数据集适配器，以及各阶段共用的规范化模型。"""
 
 from .base import DatasetAdapter
 from .corpus import CorpusIndex, load_corpus
@@ -12,7 +12,7 @@ from .models import (
     make_sample_id,
 )
 from .registry import ADAPTER_CLASSES, DATASET_NAMES, all_adapters, get_adapter
-from .resolver import ResolvedDataset, normalized_dir, resolve, subset_dir
+from .resolver import ResolvedDataset, normalized_dir, repo_relative, resolve, subset_dir
 
 __all__ = [
     "ADAPTER_CLASSES",
@@ -31,6 +31,7 @@ __all__ = [
     "load_corpus",
     "make_sample_id",
     "normalized_dir",
+    "repo_relative",
     "resolve",
     "subset_dir",
 ]

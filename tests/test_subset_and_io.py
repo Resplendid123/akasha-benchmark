@@ -1,4 +1,4 @@
-"""轮次 2 的抽样不变量、原子写、以及配置的优先级。"""
+"""抽子集的不变量、原子写、以及配置的优先级。"""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def test_safe_doc_id_rejects_path_traversal():
 
 
 def _write_normalized(data: Path, dataset: str, samples: list[dict], corpus: list[dict]) -> None:
-    """伪造一份轮次 1 的产出，供抽样测试当输入。"""
+    """伪造一份归一化产出，供抽样测试当输入。"""
     out = data / "normalized" / dataset
     atomic_write_jsonl(out / "samples.jsonl", samples)
     atomic_write_jsonl(out / "corpus.jsonl", corpus)
@@ -77,7 +77,7 @@ def normalized(tmp_path: Path) -> Path:
 
 
 def test_subset_guarantees_full_gold_coverage(normalized: Path):
-    """轮次 2 的验收标准：每条 sample 的 gold 都在子集 corpus 内。"""
+    """抽子集的验收标准：每条 sample 的 gold 都在子集 corpus 内。"""
     manifest = build_subset(
         "hotpotqa", run_id="r1", seed=1, qa_limit=5, negatives_ratio=1.0, data_dir=normalized
     )
@@ -106,7 +106,7 @@ def test_subset_is_deterministic_for_a_seed(normalized: Path):
 
 
 def test_subset_removes_stale_markdown_from_an_earlier_sampling(normalized: Path):
-    """上次抽样残留的 md 必须清掉，否则轮次 3 会把它一起导进库。"""
+    """上次抽样残留的 md 必须清掉，否则入库会把它一起导进库。"""
     build_subset("hotpotqa", run_id="r1", seed=7, qa_limit=10, data_dir=normalized)
     corpus_dir = normalized / "subsets" / "r1" / "hotpotqa" / "corpus"
     stray = corpus_dir / "9999.md"

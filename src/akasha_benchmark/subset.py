@@ -1,4 +1,4 @@
-"""轮次 2：在同一个 run_id 下，给每个数据集抽出可独立评测的子集。
+"""子集：在同一个 run_id 下，给每个数据集抽出可独立评测的子集。
 
 抽样顺序必须是**先 QA 后 corpus**。随机抽 100 篇 corpus 的话，
 大部分 gold 文档会落在子集外，Recall 会因为跟检索器毫无关系的原因被钉在 0 附近。
@@ -42,7 +42,7 @@ DEFAULT_NARRATIVEQA_DOCS = 2
 def _load_normalized(
     dataset: str, data_dir: Path | None
 ) -> tuple[list[CanonicalSample], list[CorpusDoc], dict]:
-    """读轮次 1 的产出。顺带把上游 manifest 带出来，好把 sha256 记进本轮 manifest。"""
+    """读归一化产出。顺带把上游 manifest 带出来，好把 sha256 记进本阶段 manifest。"""
     src = normalized_dir(dataset, data_dir)
     manifest_path = src / "manifest.json"
     if not manifest_path.is_file():
@@ -191,7 +191,7 @@ def build_subset(
         atomic_write_text(corpus_dir / f"{_safe_doc_id(doc_id)}.md", markdown)
         md_hashes[doc_id] = sha256_text(markdown)
 
-    # 上一次用不同抽样跑出来的残留 md，会在轮次 3 被一起导进库，
+    # 上一次用不同抽样跑出来的残留 md，会在入库时被一起导进库，
     # 所以把不属于本次子集的文件删掉。
     removed = 0
     for existing in corpus_dir.glob("*.md"):
@@ -204,7 +204,7 @@ def build_subset(
 
     gold_per_sample = [len(s.gold_doc_ids) for s in picked]
     manifest = {
-        "round": 2,
+        "stage": "subset",
         "run_id": run_id,
         "dataset": adapter.name,
         "generated_at": utc_now(),

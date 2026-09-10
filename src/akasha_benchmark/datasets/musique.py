@@ -5,11 +5,11 @@
 * gold 按 ``(title, paragraph_text)`` 定位，**不能只按 title**。
   2648 条 gold 段落里有 769 条的 title 对应多行 corpus；而 (title, text)
   在全部 11656 行上唯一。这是实测结论，不是推测。
-* ``answer_aliases`` 并入 ``answers``，这样 EM/F1 对多参考取 max 时
+* ``answer_aliases`` 并入 ``answers``，这样答案 F1 对多参考取 max 时
   自动覆盖别名，不用在打分侧再写一遍别名逻辑。
 
-跳数编码在 id 前缀里（``2hop__…``、``3hop1__…``），轮次 2 靠它分层抽样，
-轮次 5 靠它出随跳数的衰减曲线。
+跳数编码在 id 前缀里（``2hop__…``、``3hop1__…``），抽子集靠它分层，
+评测靠它出随跳数的衰减曲线。
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class MusiqueAdapter(DatasetAdapter):
     qa_filename: ClassVar[str] = "musique.json"
     corpus_filename: ClassVar[str] = "musique_corpus.json"
     capabilities: ClassVar[frozenset[Capability]] = frozenset(
-        {Capability.EVIDENCE_RECALL, Capability.ANSWER_EM_F1}
+        {Capability.EVIDENCE_RECALL, Capability.ANSWER_F1}
     )
 
     def expected_qa_rows(self) -> int:

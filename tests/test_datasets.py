@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -11,9 +14,11 @@ from akasha_benchmark.datasets import (
     CanonicalSample,
     CorpusDoc,
     get_adapter,
+    repo_relative,
 )
 from akasha_benchmark.datasets.corpus import CorpusIndex, assign_doc_id
 from akasha_benchmark.datasets.musique import hop_count, hop_prefix
+from akasha_benchmark.datasets.resolver import REPO_ROOT
 
 
 def make_corpus(dataset: str, rows: list[tuple[str, str]]) -> CorpusIndex:
@@ -139,7 +144,7 @@ def test_only_narrativeqa_lacks_evidence_recall():
     for name in ("hotpotqa", "2wikimultihopqa", "musique"):
         assert get_adapter(name).supports(Capability.EVIDENCE_RECALL)
     assert not get_adapter("narrativeqa").supports(Capability.EVIDENCE_RECALL)
-    assert get_adapter("narrativeqa").supports(Capability.ANSWER_EM_F1)
+    assert get_adapter("narrativeqa").supports(Capability.ANSWER_F1)
 
 
 # --- hotpotqa / 2wiki 的 gold 解析 ---
@@ -257,7 +262,7 @@ def test_narrativeqa_uses_row_index_and_declares_no_gold():
     assert sample.sample_id == "narrativeqa:17"
     assert sample.gold_doc_ids == ()
     assert sample.answers == ("ref one", "ref two")
-    # document.id 是文档级的，只留给轮次 2 抽样用，不是行身份。
+    # document.id 是文档级的，只留给抽子集用，不是行身份。
     assert sample.metadata["document_id"] == "abc123"
 
 
@@ -268,3 +273,20 @@ def test_narrativeqa_rejects_non_list_answer():
         get_adapter("narrativeqa").parse_row(
             {"question": "q", "answer": "single string", "document": {"id": "a"}}, 0, corpus
         )
+
+
+# --- manifest 里记录的路径 ---
+
+
+def test_repo_relative_writes_portable_paths():
+    """仓库内的路径记成相对形式，分隔符恒为 /，不带盘符也不带任何本机目录。"""
+    assert repo_relative(REPO_ROOT / "dataset" / "hotpotqa.json") == "dataset/hotpotqa.json"
+    assert "\\" not in repo_relative(REPO_ROOT / "dataset" / "musique_corpus.json")
+
+
+def test_repo_relative_keeps_paths_outside_the_repo_absolute():
+    """仓库外没有有意义的相对表示，保持绝对形式，而不是拼一串 ../.. 出来。"""
+    outside = Path(tempfile.gettempdir()).resolve() / "elsewhere" / "qa.json"
+    result = repo_relative(outside)
+    assert ".." not in result
+    assert Path(result).is_absolute()

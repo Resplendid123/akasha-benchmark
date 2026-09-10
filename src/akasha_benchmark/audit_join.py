@@ -1,4 +1,4 @@
-"""轮次 5 补充：从 ``knowledge_query_audit`` 做三段归因。
+"""评测补充：从 ``knowledge_query_audit`` 做三段归因。
 
 ``retrievalDiagnostics`` 被 controller 从 HTTP 响应里解构排除了
 （``llm-wiki.controller.ts:174``），只写进 ``knowledge_query_audit.metadata``。
@@ -15,7 +15,7 @@
 连接键是 ``sha256:<hex>``，**带前缀**。重复的 question 文本会让那一行有歧义，
 所以这些行直接排除，不去随便连一个 —— 在锁定快照上是 musique 1 行、其余 0 行。
 
-本模块可选：需要 ``psycopg`` 和 ``database_url``。轮次 5 的其余指标不依赖它。
+本模块可选：需要 ``psycopg`` 和 ``database_url``。评测的其余指标不依赖它。
 
     uv run python -m akasha_benchmark.audit_join --run-id run001
 """
@@ -49,7 +49,6 @@ def query_hash(query: str) -> str:
 
     ``llm-wiki.controller.ts:1170`` 返回的是 ``sha256:<hex>``，**带前缀**。
     裸的十六进制值一行都匹配不上，所以这个前缀不是可选的。
-    PLAN.md 8.5 写成了裸 sha256，那是错的。
     """
     digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
@@ -81,7 +80,7 @@ def run(run_id: str, datasets: list[str], config_path: Path | None, data_dir: Pa
     if not config.database_url:
         print(
             "ERROR no database_url configured. Set AKASHA_DATABASE_URL to enable the "
-            "audit join; every other round 5 metric works without it.",
+            "audit join; every other metric works without it.",
             file=sys.stderr,
         )
         return 1
@@ -101,7 +100,7 @@ def run(run_id: str, datasets: list[str], config_path: Path | None, data_dir: Pa
 
     per_sample_path = reports_dir(run_id, data_dir) / "per_sample.jsonl"
     if not per_sample_path.is_file():
-        print(f"ERROR {per_sample_path} missing; run round 5 (evaluate) first", file=sys.stderr)
+        print(f"ERROR {per_sample_path} missing; run the evaluate stage first", file=sys.stderr)
         return 1
     evaluated = {row["sample_id"]: row for row in read_jsonl(per_sample_path)}
 
@@ -121,7 +120,7 @@ def run(run_id: str, datasets: list[str], config_path: Path | None, data_dir: Pa
 
     window_path = responses_dir(run_id, data_dir) / "manifest.json"
     if not window_path.is_file():
-        print(f"ERROR {window_path} missing; run round 4 first", file=sys.stderr)
+        print(f"ERROR {window_path} missing; run the query stage first", file=sys.stderr)
         return 1
     window = load_json(window_path)
 
@@ -131,7 +130,7 @@ def run(run_id: str, datasets: list[str], config_path: Path | None, data_dir: Pa
                 QUERY,
                 {
                     "workspace_id": config.workspace_id,
-                    # 用轮次 4 自己的运行时间窗卡住范围，
+                    # 用查询阶段自己的运行时间窗卡住范围，
                     # 否则上一次运行的审计行会混进这次的 join。
                     "start": window["started_at"],
                     "end": window["generated_at"],
@@ -194,8 +193,7 @@ def run(run_id: str, datasets: list[str], config_path: Path | None, data_dir: Pa
         }
 
     report = {
-        "round": 5,
-        "section": "audit_join",
+        "stage": "audit_join",
         "run_id": run_id,
         "generated_at": utc_now(),
         "audit_rows_in_window": len(rows),

@@ -1,10 +1,10 @@
-"""需要连 Akasha 的那几轮的配置。
+"""需要连 Akasha 的那几个阶段的配置。
 
 一切都不硬编码。取值来自 JSON 配置文件（默认仓库根的 ``akasha.config.json``,
 已 gitignore），并可被同名环境变量逐项覆盖，**环境变量优先**。
 
 密钥只存在 :class:`AkashaConfig` 里，绝不写进 manifest ——
-轮次 3、4 记录的是 :meth:`AkashaConfig.redacted` 的结果。
+入库与查询记录的是 :meth:`AkashaConfig.redacted` 的结果。
 
     AKASHA_BASE_URL=http://localhost:3000 \
     AKASHA_EMAIL=eval@example.com \
@@ -33,17 +33,15 @@ class AkashaConfig:
     email: str = ""
     password: str = ""
     # 自建部署的 Akasha 用 workspaceRepo.findFirst() 定位 workspace，
-    # 所以这一项只有轮次 5 join 审计表时才必须填。
+    # 所以这一项只有 join 审计表时才必须填。
     workspace_id: str = ""
     api_prefix: str = "/api"
     timeout_seconds: float = 180.0
-    # PLAN.md 6.2 / 7.1：严格串行。调大会让延迟数字失去意义，
-    # 也容易在跑到一半时撞上 LLM 配额限流。
     concurrency: int = 1
     request_interval_seconds: float = 0.5
     poll_interval_seconds: float = 10.0
     poll_timeout_seconds: float = 7200.0
-    # 仅轮次 5 需要，且是可选的：不填则跳过审计表归因，其余指标照常算。
+    # 仅审计归因需要，且是可选的：不填则跳过，其余指标照常算。
     database_url: str = ""
     space_slug_prefix: str = "bench"
     # 配置文件里出现的未知键，隔离存放，不静默丢弃。

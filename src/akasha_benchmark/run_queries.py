@@ -1,6 +1,6 @@
-"""轮次 4：逐条串行跑 query，把完整响应落盘。
+"""查询：逐条串行跑 query，把完整响应落盘。
 
-**这一轮不算任何指标。** 它只负责产出证据，解释证据是轮次 5 的事。
+**这一步不算任何指标。** 它只负责产出证据，解释证据是评测的事。
 
 存的是**完整响应体**，不是当下用得到的那几个字段。重跑一次要烧 LLM 调用，
 所以以后想到要看某个新字段时，不该被迫重跑。
@@ -18,6 +18,8 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from .akasha_client import AkashaClient, AkashaError
 from .config import DEFAULT_CONFIG_PATH, load_config
@@ -83,8 +85,14 @@ def run_dataset(
                 )
                 status, body, latency_ms = response.status, response.body, response.latency_ms
                 error = None
-            except (AkashaError, OSError) as exc:
+            except (AkashaError, httpx.RequestError, OSError) as exc:
                 # 连接层面的失败（超时、断连），同样写一行，记下错误。
+                #
+                # httpx.RequestError **不是** OSError 的子类，它走的是
+                # TransportError -> RequestError -> HTTPError -> Exception。
+                # 少了它，跑到一半网络抖一下整个阶段就带 traceback 崩掉，
+                # 那一行也不会落盘 —— 而 query() 用 raise_for_status=False，
+                # 非 2xx 根本不抛，所以传输层异常是这里唯一能逃出来的东西。
                 status, body, latency_ms = 0, None, 0
                 error = f"{type(exc).__name__}: {exc}"
 
@@ -138,17 +146,17 @@ def run(
     limit: int | None,
     allow_config_drift: bool,
 ) -> int:
-    """执行轮次 4。返回进程退出码。"""
+    """执行查询。返回进程退出码。"""
     config = load_config(config_path)
     config.require_credentials()
-    # 给轮次 5 的审计表查询划定时间窗；没有它就得扫这个 workspace 的全部审计行，
+    # 给审计表查询划定时间窗；没有它就得扫这个 workspace 的全部审计行，
     # 而且会把上一次运行的记录混进来。
     started_at = utc_now()
 
     ingest_manifest_path = ingest_dir(run_id, data_dir) / "manifest.json"
     if not ingest_manifest_path.is_file():
         print(
-            f"ERROR missing {ingest_manifest_path}; run round 3 (ingest) first",
+            f"ERROR missing {ingest_manifest_path}; run the ingest stage first",
             file=sys.stderr,
         )
         return 1
@@ -159,13 +167,13 @@ def run(
         client.login()
 
         # PLAN.md 7.3：入库和查询之间换了 embedding 或 answer 模型，
-        # 两轮就不可比了（换 embedding 还会让旧 chunk 永远召回不到），
+        # 两次运行就不可比了（换 embedding 还会让旧 chunk 永远召回不到），
         # 所以比对快照，不一致就停。
         current_configs = client.get_model_configs()
         drift = current_configs != ingest_manifest.get("model_configs")
         if drift:
             message = (
-                "model configs changed since round 3. Metrics would mix two "
+                "model configs changed since ingest. Metrics would mix two "
                 "configurations; a changed embedding model also orphans existing chunks."
             )
             if not allow_config_drift:
@@ -176,7 +184,7 @@ def run(
         results = []
         for dataset in datasets:
             if dataset not in spaces:
-                print(f"skip {dataset}: not in round 3 manifest", file=sys.stderr)
+                print(f"skip {dataset}: not in the ingest manifest", file=sys.stderr)
                 continue
             results.append(
                 run_dataset(
@@ -191,7 +199,7 @@ def run(
             )
 
     manifest = {
-        "round": 4,
+        "stage": "query",
         "run_id": run_id,
         "started_at": started_at,
         "generated_at": utc_now(),
@@ -200,7 +208,7 @@ def run(
         "concurrency": config.concurrency,
         "request_interval_seconds": config.request_interval_seconds,
         "model_configs": current_configs,
-        "model_configs_match_round3": not drift,
+        "model_configs_match_ingest": not drift,
         "spaces": {name: spaces[name]["id"] for name in spaces},
         "datasets": results,
         "total_requested": sum(r["requested"] for r in results),
