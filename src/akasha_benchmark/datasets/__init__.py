@@ -5,10 +5,10 @@ from .corpus import CorpusIndex, load_corpus
 from .models import (
     CORPUS_ID_RULES,
     SAMPLE_ID_RULES,
-    Capability,
-    CapabilityError,
     CanonicalSample,
     CorpusDoc,
+    DataDependency,
+    DependencyError,
     make_sample_id,
 )
 from .registry import ADAPTER_CLASSES, DATASET_NAMES, all_adapters, get_adapter
@@ -19,12 +19,12 @@ __all__ = [
     "CORPUS_ID_RULES",
     "DATASET_NAMES",
     "SAMPLE_ID_RULES",
-    "Capability",
-    "CapabilityError",
     "CanonicalSample",
     "CorpusDoc",
     "CorpusIndex",
+    "DataDependency",
     "DatasetAdapter",
+    "DependencyError",
     "ResolvedDataset",
     "all_adapters",
     "get_adapter",

@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 from .base import DatasetAdapter
 from .common import gold_titles_from_supporting_facts, resolve_gold_doc_ids
 from .corpus import CorpusIndex
-from .models import Capability, CanonicalSample, make_sample_id
+from .models import CanonicalSample, DataDependency, make_sample_id
 
 # 本集的 context 句子用空格拼接（hotpotqa 是空串），差异见 common.py。
 SENTENCE_JOINER = " "
@@ -24,8 +24,8 @@ class TwoWikiMultihopQAAdapter(DatasetAdapter):
     aliases: ClassVar[tuple[str, ...]] = ("2wiki", "twowiki", "2wikimultihop", "two_wiki")
     qa_filename: ClassVar[str] = "2wikimultihopqa.json"
     corpus_filename: ClassVar[str] = "2wikimultihopqa_corpus.json"
-    capabilities: ClassVar[frozenset[Capability]] = frozenset(
-        {Capability.EVIDENCE_RECALL, Capability.ANSWER_F1}
+    provides: ClassVar[frozenset[DataDependency]] = frozenset(
+        {DataDependency.GOLD_DOCS, DataDependency.REFERENCE_ANSWERS}
     )
 
     def expected_qa_rows(self) -> int:

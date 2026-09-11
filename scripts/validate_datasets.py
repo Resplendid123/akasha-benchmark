@@ -6,7 +6,7 @@
 每个数据集检查：
   * 每一行原始数据能否通过适配器
   * dataset_sample_id 是否缺失或重复
-  * gold 篇数分布；「声明了 EVIDENCE_RECALL 却抽不出 gold」的行
+  * gold 篇数分布；「声明了 GOLD_DOCS 却抽不出 gold」的行
   * 每个 gold doc_id 是否都能在 corpus 中找到
   * 重复的 question 文本
   * corpus 的 (title, text) 唯一性
@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
@@ -30,12 +31,12 @@ if str(REPO_ROOT / "src") not in sys.path:
 
 from akasha_benchmark.datasets import (  # noqa: E402
     DATASET_NAMES,
-    Capability,
+    DataDependency,
     load_corpus,
-    normalized_dir,
     resolve,
 )
-from akasha_benchmark.io_utils import load_json, read_jsonl, sha256_file  # noqa: E402
+from akasha_benchmark.io_utils import load_json, sha256_file  # noqa: E402
+from akasha_benchmark.store import connect, repo  # noqa: E402
 
 
 class Report:
@@ -57,8 +58,11 @@ class Report:
         return not self.errors
 
 
-def validate(dataset: str, dataset_dir: Path | None, data_dir: Path | None) -> Report:
-    """检查一个数据集。发现问题时尽量继续走完，好一次性报出全部错误。"""
+def validate(dataset: str, dataset_dir: Path | None, connection: sqlite3.Connection) -> Report:
+    """检查一个数据集。发现问题时尽量继续走完，好一次性报出全部错误。
+
+    ``connection`` 是只读连接：这一步只核对，不写任何东西。
+    """
     report = Report(dataset)
     resolved = resolve(dataset, dataset_dir)
     adapter = resolved.adapter
@@ -79,7 +83,7 @@ def validate(dataset: str, dataset_dir: Path | None, data_dir: Path | None) -> R
 
     # --- 每一行原始数据都过一遍适配器 ---
     rows = load_json(resolved.qa_path)
-    declares_recall = adapter.supports(Capability.EVIDENCE_RECALL)
+    declares_recall = adapter.has(DataDependency.GOLD_DOCS)
     rederived = []
     seen: dict[str, int] = {}
     gold_dist: Counter[int] = Counter()
@@ -116,7 +120,7 @@ def validate(dataset: str, dataset_dir: Path | None, data_dir: Path | None) -> R
     report.note(f"gold_count_distribution={dict(sorted(gold_dist.items()))}")
     if empty_gold:
         report.fail(
-            f"{len(empty_gold)} rows declare EVIDENCE_RECALL but yield no gold "
+            f"{len(empty_gold)} rows declare GOLD_DOCS but yield no gold "
             f"(first: {empty_gold[:5]})"
         )
 
@@ -138,55 +142,72 @@ def validate(dataset: str, dataset_dir: Path | None, data_dir: Path | None) -> R
             f"{sum(duplicates.values())} rows, e.g. {sample_q[:70]!r}"
         )
 
-    # --- 归一化产物必须与重新推导的结果一致 ---
-    out_dir = normalized_dir(adapter.name, data_dir)
-    samples_path, corpus_path = out_dir / "samples.jsonl", out_dir / "corpus.jsonl"
-    manifest_path = out_dir / "manifest.json"
-
-    if not samples_path.is_file():
-        report.fail(f"missing {samples_path}; run `python -m akasha_benchmark.normalize` first")
+    # --- 库里的产物必须与重新推导的结果一致 ---
+    #
+    # 库是事实来源，所以这里比对的是 sample / corpus_doc 表，不是 jsonl 文件。
+    # 校验的性质没变：**逐行重新推导一遍再比**，这样「归一化跑过之后原始数据
+    # 又变了」或者「适配器改过但没重跑」都会在这里暴露，而不是等到指标算出来
+    # 才发现数字对不上。
+    record = repo.get_dataset(connection, adapter.name)
+    if record is None:
+        report.fail(
+            f"{adapter.name} is not in the database; run "
+            "`python -m akasha_benchmark.normalize` first"
+        )
         return report
 
-    stored = list(read_jsonl(samples_path))
+    stored = repo.samples_of(connection, adapter.name)
     if len(stored) != len(rederived):
-        report.fail(f"samples.jsonl has {len(stored)} rows, re-derived {len(rederived)}")
+        report.fail(f"database has {len(stored)} samples, re-derived {len(rederived)}")
     else:
-        for stored_row, fresh in zip(stored, rederived, strict=True):
+        by_id = {s.sample_id: s for s in rederived}
+        for row in stored:
+            fresh = by_id.get(row["sample_id"])
+            if fresh is None:
+                report.fail(f"database has sample_id {row['sample_id']!r} that no longer derives")
+                break
             fresh_row = fresh.model_dump(mode="json")
-            if stored_row != fresh_row:
-                differing = sorted(
-                    k for k in set(stored_row) | set(fresh_row)
-                    if stored_row.get(k) != fresh_row.get(k)
-                )
+            differing = sorted(
+                key
+                for key in ("question", "dataset_sample_id")
+                if row[key] != fresh_row[key]
+            )
+            if tuple(row["answers"]) != tuple(fresh_row["answers"]):
+                differing.append("answers")
+            if tuple(row["gold_doc_ids"]) != tuple(fresh_row["gold_doc_ids"]):
+                differing.append("gold_doc_ids")
+            if row["metadata"] != fresh_row["metadata"]:
+                differing.append("metadata")
+            if differing:
                 report.fail(
-                    f"samples.jsonl drifted from source at sample_id="
-                    f"{fresh.sample_id!r}, fields={differing}"
+                    f"database drifted from source at sample_id="
+                    f"{row['sample_id']!r}, fields={sorted(differing)}"
                 )
                 break
 
-    stored_corpus_ids = [r["doc_id"] for r in read_jsonl(corpus_path)]
-    if stored_corpus_ids != [d.doc_id for d in corpus.docs]:
-        report.fail("corpus.jsonl doc_ids differ from the re-derived corpus order/identity")
+    stored_corpus_ids = [r["doc_id"] for r in repo.corpus_of(connection, adapter.name)]
+    if sorted(stored_corpus_ids) != sorted(d.doc_id for d in corpus.docs):
+        report.fail("database corpus doc_ids differ from the re-derived corpus identity")
+    report.note(f"corpus rows in database={len(stored_corpus_ids)}")
 
-    manifest = load_json(manifest_path)
-    for label, path in (("samples", samples_path), ("corpus", corpus_path)):
-        recorded = manifest["outputs"][label]["sha256"]
+    # 上游哈希链的起点：库里记的原始文件 sha256 必须仍与磁盘上的一致。
+    # 不一致意味着 normalize 之后原始数据又换过，而这一层的下游全部过期。
+    for label, path, column in (
+        ("qa", resolved.qa_path, "qa_sha256"),
+        ("corpus", resolved.corpus_path, "corpus_sha256"),
+    ):
         actual = sha256_file(path)
-        if recorded != actual:
-            report.fail(f"manifest sha256 for {label} is stale: {recorded[:12]} != {actual[:12]}")
-    for label, path in (("qa", resolved.qa_path), ("corpus", resolved.corpus_path)):
-        recorded = manifest["sources"][label]["sha256"]
-        actual = sha256_file(path)
-        if recorded != actual:
+        if record[column] != actual:
             report.fail(
                 f"source {label} changed since normalization: "
-                f"manifest {recorded[:12]} != actual {actual[:12]}"
+                f"database {record[column][:12]} != actual {actual[:12]}"
             )
 
-    caps = sorted(c.value for c in adapter.capabilities)
-    if manifest["capabilities"] != caps:
-        report.fail(f"manifest capabilities {manifest['capabilities']} != adapter {caps}")
-    report.note(f"capabilities={','.join(caps)}")
+    provides = sorted(d.value for d in adapter.provides)
+    stored_provides = repo.loads(record["provides_json"], [])
+    if stored_provides != provides:
+        report.fail(f"database provides {stored_provides} != adapter {provides}")
+    report.note(f"provides={','.join(provides)}")
     return report
 
 
@@ -194,29 +215,40 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", action="append", choices=list(DATASET_NAMES))
     parser.add_argument("--dataset-dir", type=Path, default=None)
-    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--db", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    failed = 0
-    for name in args.dataset or list(DATASET_NAMES):
-        try:
-            report = validate(name, args.dataset_dir, args.data_dir)
-        except Exception as exc:  # noqa: BLE001 - 直接抛出来的硬失败也是一种结果
-            failed += 1
-            print(f"\n=== {name}\n  ERROR {type(exc).__name__}: {exc}")
-            continue
+    # 只读连接：这一步只核对产物，不写任何东西。库不存在时给一句清楚的提示,
+    # 而不是让 read_only 的 FileNotFoundError 从循环深处冒出来。
+    try:
+        connection = connect(args.db, read_only=True)
+    except FileNotFoundError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
 
-        print(f"\n=== {name}: {'PASS' if report.ok else 'FAIL'}")
-        for note in report.notes:
-            print(f"  {note}")
-        for error in report.errors[:20]:
-            print(f"  ERROR {error}")
-        if len(report.errors) > 20:
-            print(f"  ... and {len(report.errors) - 20} more errors")
-        failed += not report.ok
+    try:
+        failed = 0
+        for name in args.dataset or list(DATASET_NAMES):
+            try:
+                report = validate(name, args.dataset_dir, connection)
+            except Exception as exc:  # noqa: BLE001 - 直接抛出来的硬失败也是一种结果
+                failed += 1
+                print(f"\n=== {name}\n  ERROR {type(exc).__name__}: {exc}")
+                continue
 
-    print(f"\n{'all datasets pass' if not failed else f'{failed} dataset(s) FAILED'}")
-    return 1 if failed else 0
+            print(f"\n=== {name}: {'PASS' if report.ok else 'FAIL'}")
+            for note in report.notes:
+                print(f"  {note}")
+            for error in report.errors[:20]:
+                print(f"  ERROR {error}")
+            if len(report.errors) > 20:
+                print(f"  ... and {len(report.errors) - 20} more errors")
+            failed += not report.ok
+
+        print(f"\n{'all datasets pass' if not failed else f'{failed} dataset(s) FAILED'}")
+        return 1 if failed else 0
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":

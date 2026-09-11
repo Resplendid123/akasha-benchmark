@@ -16,11 +16,11 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import psycopg
 
-from akasha_benchmark.config import load_config
+from akasha_benchmark.config import load_config_from_db_path
 
 
 def main() -> int:
-    config = load_config()
+    config = load_config_from_db_path()
     with psycopg.connect(config.database_url) as conn, conn.cursor() as cur:
         print("=" * 72)
         print("1. 每篇原始 page 编出多少 artifact（按 page_type）")

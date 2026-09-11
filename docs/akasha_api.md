@@ -8,8 +8,7 @@
 | 入库 | `POST /api/pages/import` | 把 `{doc_id}.md` 导入 space，拿 `page_id` |
 | 查询 | `POST /api/llm-wiki/query` | 跑一条问题，落盘完整响应 |
 
-下面的形状都对着服务端源码核过（`../Akasha`），不是照文档抄的。
-字段名右侧标注的行号指向 Akasha 仓库。
+下面的形状都对着服务端源码核过（`../Akasha`），字段名右侧标注的行号指向 Akasha 仓库。
 
 ## 零、所有响应都套一层信封
 

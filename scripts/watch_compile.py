@@ -29,7 +29,7 @@ if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from akasha_benchmark.akasha_client import ACTIVE_RUN_STATUSES, AkashaClient
-from akasha_benchmark.config import load_config
+from akasha_benchmark.config import load_config_from_db_path
 
 LOCAL_OFFSET = timedelta(hours=8)  # 输出用本地时间，方便和墙上时钟对照
 
@@ -272,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         for line in page_map_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     )
-    config = load_config()
+    config = load_config_from_db_path()
     state_path = out_dir / ".watch_state.json"
 
     if args.via_db:

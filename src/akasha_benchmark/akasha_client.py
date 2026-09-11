@@ -299,26 +299,40 @@ class AkashaClient:
 
     # --- 导入 ---
 
-    def import_page(self, markdown_path: Path, space_id: str) -> dict[str, Any]:
-        """导入一个 .md 文件，返回创建的 page（含 ``id``）。
+    def import_page_text(
+        self, filename: str, markdown: str, space_id: str
+    ) -> dict[str, Any]:
+        """导入一段 Markdown 正文，返回创建的 page（含 ``id``）。
 
-        导入服务会取首个 Markdown heading 当 page title 并从正文移除，
-        所以文件名只承担 doc_id 的职责，两者互不干扰。
+        正文的权威副本在库里（``subset_doc.md_text``），所以这是入库阶段实际走的
+        入口 —— 不再需要先把 1722 篇落成临时文件再读回来。
 
-        **不重试**（``retry=False``）。5xx 的结果是有歧义的：服务端可能已经建好 page，
-        只是代理在响应前挂了。重试于是建出第二个 page —— 语料里多一篇没人引用的重复，
-        它不在 ``page_map`` 里，续跑也发现不了，只会悄悄抬高语料规模并污染检索指标。
+        ``filename`` 只承担 doc_id 的职责：导入服务会取首个 Markdown heading 当
+        page title 并从正文移除，两者互不干扰，所以 title 重复也不影响身份追踪。
 
-        不重试的代价很小：导入失败会被记进 ``failures`` 并继续跑下一篇，
-        而入库阶段本身可续跑，重跑一次就会把缺的补上（缺篇能被发现，重复不能）。
+        **不重试**（``retry=False``）。5xx 的结果是有歧义的：服务端可能已经建好 page,
+        只是代理在响应前挂了。重试于是建出第二个 page —— 语料里多一篇没人引用的
+        重复，它不在 ``page_map`` 里，续跑也发现不了，只会悄悄抬高语料规模并污染
+        检索指标。
+
+        不重试的代价很小：导入失败会被记下并继续跑下一篇，而入库阶段本身可续跑,
+        重跑一次就会把缺的补上（缺篇能被发现，重复不能）。
         """
-        with markdown_path.open("rb") as handle:
-            return self.post(
-                "pages/import",
-                files={"file": (markdown_path.name, handle, "text/markdown")},
-                data={"spaceId": space_id},
-                retry=False,
-            )
+        return self.post(
+            "pages/import",
+            files={"file": (filename, markdown.encode("utf-8"), "text/markdown")},
+            data={"spaceId": space_id},
+            retry=False,
+        )
+
+    def import_page(self, markdown_path: Path, space_id: str) -> dict[str, Any]:
+        """从磁盘导入一个 .md 文件。见 :meth:`import_page_text`。
+
+        留着这个入口是给在线冒烟测试和一次性导入用的；评测流程本身走库里的正文。
+        """
+        return self.import_page_text(
+            markdown_path.name, markdown_path.read_text(encoding="utf-8"), space_id
+        )
 
     # --- 知识编译 ---
 

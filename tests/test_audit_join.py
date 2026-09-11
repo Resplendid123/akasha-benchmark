@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 
-from akasha_benchmark.audit_join import _stage_attribution, query_hash
+from akasha_benchmark.audit_join import stage_attribution, query_hash
 
 
 def test_query_hash_carries_the_server_prefix():
@@ -15,7 +15,7 @@ def test_query_hash_carries_the_server_prefix():
     assert query_hash(text).startswith("sha256:")
 
 
-def test_stage_attribution_splits_the_three_losses():
+def teststage_attribution_splits_the_three_losses():
     """候选 50 -> 排序后 20 -> 授权丢 5，三段损失要各自算清。"""
     metadata = {
         "candidateChunkCount": 50,
@@ -23,7 +23,7 @@ def test_stage_attribution_splits_the_three_losses():
         "filteredChunkCount": 5,
         "accessPolicyFallbackUsed": True,
     }
-    stages = _stage_attribution(metadata, gold_hit=False)
+    stages = stage_attribution(metadata, gold_hit=False)
     assert stages["ranking_loss"] == 30
     assert stages["authorization_loss"] == 5
     assert stages["recall_ceiling_miss"] is False
@@ -32,7 +32,7 @@ def test_stage_attribution_splits_the_three_losses():
 
 def test_zero_candidates_is_a_recall_ceiling_miss():
     """候选集为空属于召回上限问题，下游没有任何损失可言。"""
-    stages = _stage_attribution({"candidateChunkCount": 0}, gold_hit=False)
+    stages = stage_attribution({"candidateChunkCount": 0}, gold_hit=False)
     assert stages["recall_ceiling_miss"] is True
     assert stages["ranking_loss"] == 0
     assert stages["authorization_loss"] == 0
@@ -40,7 +40,7 @@ def test_zero_candidates_is_a_recall_ceiling_miss():
 
 def test_ranking_loss_never_goes_negative():
     """防御性检查：排序后数量本不该超过候选数，但真出现时也不能给出负值。"""
-    stages = _stage_attribution(
+    stages = stage_attribution(
         {"candidateChunkCount": 5, "rankedCandidateCount": 9}, gold_hit=True
     )
     assert stages["ranking_loss"] == 0

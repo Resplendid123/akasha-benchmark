@@ -1,0 +1,226 @@
+/* 白色主题。
+ *
+ * 颜色不只是配色：这个界面上「缺失」与「0」是两种不同的状态，
+ * 「算不了」与「没勾选」是两种不同的原因 —— 它们必须在视觉上分得开，
+ * 所以 tag 与 note 各有三档语义色，而不是统一一个灰。
+ *
+ * 对比度按 WCAG AA 取：正文 #1f2430 对白底约 14:1，muted #5b6472 约 5.4:1,
+ * 三档语义色的文字都取深色调（不是原来的亮色调），落在 4.5:1 以上。
+ */
+
+:root {
+  --bg: #ffffff;
+  --panel: #fbfcfd;
+  --panel-2: #f2f4f7;
+  --border: #e3e7ed;
+  --border-strong: #cbd2dc;
+  --text: #1f2430;
+  --muted: #5b6472;
+  --accent: #1f5fd0;
+  --accent-soft: #eaf1fd;
+  --ok: #12704f;
+  --ok-soft: #e6f5ee;
+  --warn: #8a5a06;
+  --warn-soft: #fdf3e1;
+  --bad: #a3282f;
+  --bad-soft: #fdecec;
+  --mono: ui-monospace, "Cascadia Code", "Consolas", monospace;
+  --shadow: 0 1px 2px rgba(31, 36, 48, 0.05);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--mono); }
+
+.app { display: flex; min-height: 100vh; }
+
+/* --- 左栏：八层，顺序即流水线顺序 --- */
+
+.sidebar {
+  width: 232px;
+  flex: 0 0 232px;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  padding: 18px 12px;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: -0.01em; }
+.sidebar .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+
+.nav { display: flex; flex-direction: column; gap: 1px; }
+.nav button {
+  display: flex; align-items: baseline; gap: 8px;
+  width: 100%; text-align: left;
+  background: none; border: 0; color: var(--text);
+  padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.nav button:hover:not(:disabled) { background: var(--panel-2); }
+.nav button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.nav button:disabled { color: #a4acb9; cursor: not-allowed; }
+/* 层号：让「第几层」在视觉上就是有序的。 */
+.nav .step {
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  min-width: 12px;
+}
+.nav button.active .step { color: var(--accent); }
+
+.sidebar .foot {
+  margin-top: auto; padding-top: 14px; border-top: 1px solid var(--border);
+  font-size: 12px; color: var(--muted);
+}
+
+.main { flex: 1; padding: 22px 26px; min-width: 0; overflow-x: hidden; }
+
+h2 { font-size: 19px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h3 { font-size: 15px; margin: 22px 0 8px; }
+h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
+.lede { color: var(--muted); margin: 0 0 18px; max-width: 82ch; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  box-shadow: var(--shadow);
+}
+.panel.flat { box-shadow: none; background: transparent; }
+
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.row.tight { gap: 6px; }
+.spread { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 1100px) {
+  .grid2, .grid3 { grid-template-columns: 1fr; }
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+th {
+  color: var(--muted); font-weight: 600; white-space: nowrap;
+  border-bottom-color: var(--border-strong);
+}
+td.num, th.num { text-align: right; font-family: var(--mono); }
+tbody tr:hover { background: var(--panel-2); }
+tbody tr.selected { background: var(--accent-soft); }
+
+/* --- 语义色：三档，文字都取深色调 --- */
+
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 10px;
+  font-size: 11px; font-family: var(--mono);
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2); color: var(--muted);
+}
+.tag.ok { color: var(--ok); border-color: #a8d8c4; background: var(--ok-soft); }
+.tag.warn { color: var(--warn); border-color: #e6c98a; background: var(--warn-soft); }
+.tag.bad { color: var(--bad); border-color: #eaa9ac; background: var(--bad-soft); }
+.tag.accent { color: var(--accent); border-color: #a9c5f0; background: var(--accent-soft); }
+
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 9px 12px; margin: 10px 0; color: #1a3d7c; font-size: 13px;
+  border-radius: 0 6px 6px 0;
+}
+.note.warn { border-left-color: var(--warn); background: var(--warn-soft); color: #6b4705; }
+.note.bad { border-left-color: var(--bad); background: var(--bad-soft); color: #7d1f25; }
+.note.plain { border-left-color: var(--border-strong); background: var(--panel-2); color: var(--muted); }
+.note strong { font-weight: 600; }
+.note ul { margin: 6px 0 0; padding-left: 20px; }
+
+/* --- 控件 --- */
+
+button.action {
+  background: #fff; color: var(--text);
+  border: 1px solid var(--border-strong);
+  padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+button.action:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button.action:disabled { opacity: 0.45; cursor: not-allowed; }
+button.action.primary {
+  background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600;
+}
+button.action.primary:hover:not(:disabled) { background: #1a52b8; color: #fff; }
+button.action.danger { color: var(--bad); border-color: #eaa9ac; }
+button.action.danger:hover:not(:disabled) { background: var(--bad-soft); color: var(--bad); }
+button.action.small { padding: 2px 8px; font-size: 12px; }
+
+input, select, textarea {
+  background: #fff; color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 5px 8px; font-size: 13px; font-family: inherit;
+}
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid var(--accent-soft); outline-offset: 0; border-color: var(--accent);
+}
+input[type="checkbox"] { accent-color: var(--accent); }
+label.field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+label.field input, label.field select { min-width: 180px; }
+label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+
+pre.block {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; overflow-x: auto; font-size: 12px; max-height: 340px; margin: 0;
+  white-space: pre-wrap; word-break: break-word; color: var(--text);
+}
+pre.block.tall { max-height: 520px; }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.clickable { cursor: pointer; }
+.mode-group { margin-bottom: 18px; }
+.mode-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46ch; }
+
+/* --- diff：丢掉的词与新增的词 --- */
+
+.chip {
+  display: inline-block; padding: 1px 6px; margin: 2px;
+  border-radius: 4px; font-family: var(--mono); font-size: 12px;
+}
+.chip.dropped { background: var(--bad-soft); color: var(--bad); border: 1px solid #eaa9ac; }
+.chip.added { background: var(--ok-soft); color: var(--ok); border: 1px solid #a8d8c4; }
+/* 问题里的实词被编译丢掉 —— 这条样本的词法召回已经断了。最显眼的一档。 */
+.chip.lost { background: var(--bad); color: #fff; font-weight: 600; border: 1px solid var(--bad); }
+
+.bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+.bar > div { height: 100%; background: var(--accent); }
+.bar.ok > div { background: var(--ok); }
+.bar.bad > div { background: var(--bad); }
+
+/* --- 两栏并排：原文 vs 编译产物 --- */
+
+.side-by-side { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 1000px) { .side-by-side { grid-template-columns: 1fr; } }
+.side-by-side h4 { margin-top: 0; }
+
+/* --- 指标勾选 --- */
+
+.metric-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 14px;
+}
+.metric-grid label { font-size: 13px; }
+.metric-grid label.unavailable { color: #a4acb9; cursor: not-allowed; }
+
+/* --- 详情键值对 --- */
+
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }

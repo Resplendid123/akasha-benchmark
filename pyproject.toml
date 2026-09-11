@@ -5,15 +5,17 @@ description = "Retrieval, attribution and answer-quality benchmark for Akasha"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi==0.121.2",
     "httpx==0.28.1",
     "huggingface-hub==0.35.3",
-    "numpy==2.5.3",
     "psycopg[binary]==3.3.5",
     "pydantic==2.13.5",
+    "uvicorn==0.42.0",
 ]
 
 [project.scripts]
 akasha-benchmark = "akasha_benchmark:main"
+akasha-platform = "akasha_platform.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

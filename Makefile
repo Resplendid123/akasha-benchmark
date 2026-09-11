@@ -1,65 +1,44 @@
-# Akasha-Benchmark 流程。命令与 README / docs/PLAN.md §1 一致。
+# Akasha-Benchmark。
 #
-#   make              # 看有哪些目标（默认不做事：第一步要下 137MB）
-#   make offline      # 本地阶段：download -> normalize -> validate -> subset
-#   make smoke        # 单样本在线冒烟，验接口约定（便宜，先跑这个）
-#   make ingest       # 入库，需要 Akasha 在线
-#   make query        # 查询，需要 Akasha 在线
-#   make report       # 评测，纯本地
-#
-# 常用覆盖：
-#   make offline RUN_ID=run002 SEED=42
-#   make normalize DATASETS=hotpotqa
-#   make query RUN_ID=run001 ARGS="--limit 5"
-#
-
+#   make            # 看有哪些目标
+#   make setup      # sync -> download -> migrate -> normalize -> validate
+#   make serve      # 起平台，之后所有实验从界面里跑
 SHELL := /bin/sh
 
-RUN_ID   ?= run001
-SEED     ?= 20260908
-QA_LIMIT ?=
 DATASETS ?=
 ARGS     ?=
 
 PY := uv run python
+DB := akasha_bench.db
 
-# DATASETS 为空时不传 --dataset，默认全量数据集。
 DATASET_FLAGS := $(foreach d,$(DATASETS),--dataset $(d))
-SUBSET_FLAGS  := $(if $(QA_LIMIT),--qa-limit $(QA_LIMIT),)
 
-DATA_DIR := data
-
-INGEST_MANIFEST   := $(DATA_DIR)/ingest/$(RUN_ID)/manifest.json
-RESPONSE_MANIFEST := $(DATA_DIR)/responses/$(RUN_ID)/manifest.json
-REPORT           := $(DATA_DIR)/reports/$(RUN_ID)/report.md
-
-.PHONY: help all offline sync download check-download normalize validate \
-        subset smoke ingest query report audit test clean-data distclean
+.PHONY: help setup sync download check-download migrate migrate-status normalize \
+        validate web serve dev test smoke distclean
 
 help:
-	@echo 'Akasha-Benchmark  (RUN_ID=$(RUN_ID))'
+	@echo 'Akasha-Benchmark'
 	@echo ''
-	@echo '按顺序执行：'
+	@echo '装环境与底座：'
 	@echo '  sync            uv sync，装依赖（Python 3.12）'
 	@echo '  download        下载四组数据到 dataset/  (~137MB)'
-	@echo '  check-download  只校验已下载的文件，不下载'
-	@echo '  normalize       归一化成 samples.jsonl + corpus.jsonl'
+	@echo '  migrate         建库 / 升级 schema（迁移前自动备份）'
+	@echo '  migrate-status  看迁移状态'
+	@echo '  normalize       原始数据 -> 库里的 sample + corpus_doc'
 	@echo '  validate        验收：逐行过全量数据，四组须全过'
-	@echo '  subset          抽子集，保证 gold 全覆盖'
-	@echo '  smoke           单样本在线冒烟，核对接口字段约定  [需要 Akasha 在线]'
-	@echo '  ingest          入库+编译+质量闸门   [需要 Akasha 在线]'
-	@echo '  query           逐条跑 query 存响应   [需要 Akasha 在线]'
-	@echo '  report          离线算指标出报告'
-	@echo '  audit           可选    审计表归因（需 psycopg + database_url）'
+	@echo '  setup           以上全做一遍'
 	@echo ''
-	@echo '组合目标：'
-	@echo '  offline         download -> normalize -> validate -> subset'
-	@echo '  all             offline，再提示在线阶段需要手动执行'
+	@echo '平台：'
+	@echo '  web             构建前端（npm install + build）'
+	@echo '  serve           起平台，单进程单端口，只绑 127.0.0.1'
+	@echo '  dev             开发模式提示（Vite dev server + FastAPI 两进程）'
+	@echo ''
+	@echo '其他：'
 	@echo '  test            跑 pytest'
+	@echo '  smoke           在线冒烟，核对接口字段约定  [需要 Akasha 在线]'
+	@echo '  distclean       删导出/缓存/前端产物（不删库与 dataset/）'
 	@echo ''
-	@echo '变量：RUN_ID SEED QA_LIMIT DATASETS ARGS'
-	@echo '  例：make normalize DATASETS="hotpotqa musique"'
-	@echo '      make query ARGS="--limit 5"'
+	@echo 'Akasha 连接（含密钥）在配置层里填，存库。项目目录不留配置文件。'
 
 # --- 依赖与数据 ---------------------------------------------------------------
 
@@ -72,97 +51,63 @@ download:
 check-download:
 	$(PY) scripts/download_datasets.py --check
 
+# --- 库 -----------------------------------------------------------------------
+
+# 迁移前自动备份成 akasha_bench.db.pre-{version}。已应用的迁移被改过会报错。
+migrate:
+	$(PY) -m akasha_benchmark.store.migrate
+
+migrate-status:
+	$(PY) -m akasha_benchmark.store.migrate --status
+
 # --- 归一化 -------------------------------------------------------------------
+#
+# 归一化留在 make 里而不是只在界面上，因为它是「库能用起来」的一部分：
+# 没有它数据集那一栏是空的，界面上也就没有可选的东西。它同时也在界面上有入口。
 
 # 依赖 check-download 而不是 download：数据已在位时不该为了跑一次归一化去连 HF。
-# 缺文件时 --check 以非零退出，这里就会停下，并报出缺哪几个。
-normalize: check-download
+normalize: check-download migrate
 	$(PY) -m akasha_benchmark.normalize $(DATASET_FLAGS) $(ARGS)
 
-# 依赖 normalize，这样 offline 的链条是 check-download -> normalize -> validate -> subset。
-# 只想单独跑验收（不重新归一化）用：make -o normalize validate
 validate: normalize
-	$(PY) scripts/validate_datasets.py $(DATASET_FLAGS) $(ARGS)
+	$(PY) scripts/validate_datasets.py --db $(DB) $(DATASET_FLAGS) $(ARGS)
 
-# --- 抽子集 -------------------------------------------------------------------
-
-# 走 validate：子集是从归一化产物里抽的，底座没验收过就抽，抽出来的问题
-# 会一路带到入库和查询，而那两步很贵。
-subset: validate
-	$(PY) -m akasha_benchmark.subset --run-id $(RUN_ID) --seed $(SEED) \
-		$(SUBSET_FLAGS) $(DATASET_FLAGS) $(ARGS)
-
-# --- 入库与查询：需要 Akasha 在线 ---------------------------------------------
-
-ingest:
-	@test -f $(DATA_DIR)/subsets/$(RUN_ID)/$(firstword $(DATASETS) hotpotqa)/manifest.json \
-		|| { echo 'ERROR 没有 $(RUN_ID) 的子集产物，先执行：make subset RUN_ID=$(RUN_ID)' >&2; exit 1; }
-	$(PY) -m akasha_benchmark.ingest --run-id $(RUN_ID) $(DATASET_FLAGS) $(ARGS)
-
-# 入库的质量闸门在这里再拦一道。ingest 在闸门失败时已经会非零退出，
-# 但那之后可以手工重跑 query；这条检查让「闸门没过就跑查询」在 make 这一层也拦住。
-#
-# 提示信息由 echo 输出、Python 只当一个不出声的退出码判据：Windows 上
-# Python 的 stdout/stderr 编码跟随控制台（实测 gbk），从 Python 里打中文会变成乱码，
-# 而 shell 的 echo 直接透传字节、显示正常。别把这段信息搬回 Python 里。
-query:
-	@test -f $(INGEST_MANIFEST) \
-		|| { echo 'ERROR 缺 $(INGEST_MANIFEST)，先执行：make ingest RUN_ID=$(RUN_ID)' >&2; exit 1; }
-	@$(PY) -c "import json,sys; sys.exit(0 if json.load(open(r'$(INGEST_MANIFEST)',encoding='utf-8')).get('quality_passed') else 1)" \
-		|| { echo 'ERROR 入库质量闸门未通过，不要开始跑查询。详见 $(INGEST_MANIFEST) 的 quality / quality_passed 字段' >&2; exit 1; }
-	$(PY) -m akasha_benchmark.run_queries --run-id $(RUN_ID) $(DATASET_FLAGS) $(ARGS)
-
-# --- 评测：离线指标 -----------------------------------------------------------
-
-report:
-	@test -f $(RESPONSE_MANIFEST) \
-		|| { echo 'ERROR 缺 $(RESPONSE_MANIFEST)，先执行：make query RUN_ID=$(RUN_ID)' >&2; exit 1; }
-	$(PY) -m akasha_benchmark.evaluate --run-id $(RUN_ID) $(DATASET_FLAGS) $(ARGS)
-	@echo '报告：$(REPORT)'
-
-audit:
-	@test -f $(DATA_DIR)/reports/$(RUN_ID)/per_sample.jsonl \
-		|| { echo 'ERROR 缺评测产物，先执行：make report RUN_ID=$(RUN_ID)' >&2; exit 1; }
-	$(PY) -m akasha_benchmark.audit_join --run-id $(RUN_ID) $(DATASET_FLAGS) $(ARGS)
-
-# --- 组合与杂项 ---------------------------------------------------------------
-
-offline: subset
+setup: validate
 	@echo ''
-	@echo 'OK 本地阶段完成（RUN_ID=$(RUN_ID)）。'
-	@echo '   产物：$(DATA_DIR)/normalized/  $(DATA_DIR)/subsets/$(RUN_ID)/'
+	@echo 'OK 底座就绪。产物在 $(DB)。'
+	@echo '   接下来：make web && make serve，然后在界面上配置 Akasha 连接并跑实验。'
 
-all: offline
-	@echo ''
-	@echo '入库和查询需要 Akasha 在线，请确认配置后手动执行：'
-	@echo '   make smoke  RUN_ID=$(RUN_ID)     # 先用一条样本验接口，便宜且快'
-	@echo '   make ingest RUN_ID=$(RUN_ID)     # 跑完看质量闸门结果'
-	@echo '   make query  RUN_ID=$(RUN_ID)     # 闸门通过后再执行'
-	@echo '   make report RUN_ID=$(RUN_ID)'
+# --- 平台 ---------------------------------------------------------------------
+
+web:
+	npm --prefix web install
+	npm --prefix web run build
+
+# 生产形态：单进程单端口，FastAPI 挂 web/dist。
+# 不在这里做前置检查：库不存在与前端未构建两件事，akasha-platform 的 main()
+# 自己就会报（分别是非零退出与首页的提示）。放两份的话，从 PowerShell 直接跑
+# uv run akasha-platform 的人看不到 make 这一份，而两份迟早会漂。
+serve:
+	uv run akasha-platform
+
+dev:
+	@echo '开发模式要两个进程：'
+	@echo '  终端 1：uv run akasha-platform            # API on :8848'
+	@echo '  终端 2：npm --prefix web run dev          # Vite on :5173（/api 代理过去）'
+
+# --- 杂项 ---------------------------------------------------------------------
 
 test:
 	uv run pytest -q
 
-# 在线冒烟。默认 skip，所以 make test 不需要 Akasha 在线；这个目标显式开 AKASHA_LIVE=1。
-# 两组用例：单样本往返核对字段约定（约 5 分钟），批量三段走真实阶段入口、
-# 覆盖批量与续跑与报告产出（约 9 分钟）。只跑后者：make smoke ARGS="-k pipeline"
-#
-# 建的都是 smoke 前缀的独立 Space 并在跑完删掉，不碰 bench 前缀那几个。
-# 产物写进 data/smoke/，单样本那趟可离线重放：
-#   AKASHA_LIVE_REPLAY=data/smoke/<ts>-roundtrip.json uv run pytest tests/test_live_akasha.py
-smoke:
-	@test -f $(DATA_DIR)/subsets/$(RUN_ID)/$(firstword $(DATASETS) hotpotqa)/manifest.json \
-		|| { echo 'ERROR 没有 $(RUN_ID) 的子集产物，先执行：make subset RUN_ID=$(RUN_ID)' >&2; exit 1; }
-	AKASHA_LIVE=1 AKASHA_LIVE_RUN_ID=$(RUN_ID) \
-		$(if $(DATASETS),AKASHA_LIVE_DATASET=$(firstword $(DATASETS)),) \
-		uv run pytest tests/test_live_akasha.py -v $(ARGS)
+SMOKE_DATASET := $(firstword $(DATASETS) hotpotqa)
+SMOKE_LABEL   ?= run002
 
-# 只删本次 run 的在线产物，留着归一化底座和数据集 —— 重下 137MB 很贵。
-clean-data:
-	rm -rf $(DATA_DIR)/subsets/$(RUN_ID) $(DATA_DIR)/ingest/$(RUN_ID) \
-		$(DATA_DIR)/responses/$(RUN_ID) $(DATA_DIR)/reports/$(RUN_ID)
-	@echo '已删除 $(RUN_ID) 的子集及下游产物；normalized/ 和 dataset/ 保留。'
+smoke: export AKASHA_LIVE = 1
+smoke: export AKASHA_LIVE_LABEL = $(SMOKE_LABEL)
+smoke: export AKASHA_LIVE_DATASET = $(SMOKE_DATASET)
+smoke:
+	uv run pytest tests/test_live_akasha.py -v $(ARGS)
 
 distclean:
-	rm -rf $(DATA_DIR) .pytest_cache .ruff_cache
-	@echo '已删除全部产物；dataset/ 保留（重下要 137MB，需要时手工删）。'
+	$(PY) scripts/clean.py all

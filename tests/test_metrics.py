@@ -10,7 +10,7 @@ from math import log2
 
 import pytest
 
-from akasha_benchmark.datasets import Capability, CapabilityError, get_adapter
+from akasha_benchmark.datasets import DataDependency, DependencyError, get_adapter
 from akasha_benchmark.metrics import attribution, multihop, qa, retrieval
 
 
@@ -67,12 +67,12 @@ def test_ranked_doc_ids_keeps_rank_slot_for_unmapped_pages():
 def test_retrieval_metrics_refuse_datasets_without_gold():
     """narrativeqa 没有 gold，请求检索指标必须抛异常而不是返回 0。"""
     narrativeqa = get_adapter("narrativeqa")
-    assert Capability.EVIDENCE_RECALL not in narrativeqa.capabilities
-    with pytest.raises(CapabilityError):
-        retrieval.require_evidence_capability("narrativeqa", narrativeqa.capabilities)
-    # 另外三组声明了该 capability，应当放行。
+    assert DataDependency.GOLD_DOCS not in narrativeqa.provides
+    with pytest.raises(DependencyError):
+        retrieval.require_gold_docs("narrativeqa", narrativeqa.provides)
+    # 另外三组提供 gold 文档，应当放行。
     for name in ("hotpotqa", "2wikimultihopqa", "musique"):
-        retrieval.require_evidence_capability(name, get_adapter(name).capabilities)
+        retrieval.require_gold_docs(name, get_adapter(name).provides)
 
 
 def test_recall_raises_without_gold_rather_than_returning_zero():

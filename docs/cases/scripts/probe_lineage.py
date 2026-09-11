@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import psycopg
 
-from akasha_benchmark.config import load_config
+from akasha_benchmark.config import load_config_from_db_path
 
 PAGE_6365 = "01a089d1-fdc7-7e19-9d4b-05109dc38745"  # Dee Does Broadway
 PAGE_6369 = "01a089d2-07d5-72d5-bf7e-a38f23fe2c51"  # Cyndi Lauper
@@ -43,7 +43,7 @@ def artifacts(cur, page: str) -> list[tuple]:
 
 
 def main() -> int:
-    config = load_config()
+    config = load_config_from_db_path()
     with psycopg.connect(config.database_url) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT column_name FROM information_schema.columns "

@@ -2,14 +2,13 @@
 
 **样本** `hotpotqa:5ae4f2595542990ba0bbb1a8`（bridge / hard，gold 2 篇）
 **run** `run001`，2026-09-10
-**结论** 非调参可解。调 `scoreThreshold`、加大 k、换检索模式都救不回来。
+**结论** 非调参可解。
 
 ---
 
 ## 一句话
 
-原文里有一个能和查询逐字对应的短语，**它在编译产物里消失了**；
-而编译产物才是被索引的文本。
+原文里有能和查询逐字对应的短语，**它在编译产物里消失了**；而编译产物是被索引的文本。
 
 ## 表面现象
 
@@ -18,8 +17,6 @@
 | `recall@5` | 0.500 | 一半的 gold 没找到 |
 | `recall@20` | 0.500 | 加大 k 也没用 |
 | `mrr` | 1.000 | 但第一名就是 gold |
-| `f1` | 0.136 | 答案质量很差 |
-| `em` | 0.000 | 完全没答对 |
 
 **而答案是对的。** 参考答案 `June 22, 1953`，模型答 "born on **June 22, 1953**"，
 还主动声明了证据缺口：
@@ -28,6 +25,43 @@
 > explicitly mention an Emmy Award.)*
 
 所以五个指标里有四个在误导，只有 `mrr` 是对的。
+
+### 漏了一篇，为什么还答对
+
+因为**问句本身泄露了桥接实体，6369 一篇就够**。
+
+查询里 `American singer, songwriter, actress and LGBT rights activist` 这一串，
+在这 400 篇语料里唯一命中 6369；而它在编译产物里完整活了下来，**并且与答案同句**：
+
+```
+knowledge_chunks（被索引的那张表）中 6369 的正文：
+  "Cyndi Lauper (born Cynthia Ann Stephanie Lauper on June 22, 1953) is an American
+   singer, songwriter, actress and LGBT rights activist…"
+                     含描述串: True   含 June 22, 1953: True   含 Emmy: False
+```
+
+语料层面的唯一性：
+
+| 检索串 | 命中文档数（共 400 篇） |
+| --- | --- |
+| `LGBT rights activist` | **1**（就是 6369） |
+| `singer, songwriter, actress` 且含 `LGBT` | **1** |
+| 含 `singer` 且含 `activist` | 3（Cyndi Lauper / Shirley Manson / Dianne Hiles） |
+| 只含 `singer` | 22 |
+
+一跳到底，所以 `mrr = 1.000` 不是巧合：修饰语逐字命中首句，答案就在同一句里。
+
+**模型那句 gap 声明，正是它没走桥接路径的证据。** 全部 11 篇召回 snippet 里
+`Emmy` 出现 **0 次**（`Grammy` 出现在 5 篇里 —— 6369 自己的 1985 获奖记录就够）。
+Emmy 只存在于 6365，而 6365 没进候选集。模型如果用上了 6365，就会看到 Emmy。
+
+这是 hotpotqa 众所皆知的 shortcut 问题：bridge 题的第二篇常常只是出题时的痕迹，
+问句已经把桥接实体唯一确定了。**400 篇子集把这个效应放大了** ——
+全库里「歌手 + activist」的干扰项多得多，子集里几乎没有消歧压力。
+
+于是「答案对」与「recall@5 = 0.5」并不矛盾，两者量的不是一回事：
+gold 标注量的是**标注者的推理路径覆盖**，而答对需要的是**证据充分性**。
+在 shortcut 题上这两者系统性地不等价，本例落在后者。
 
 ## 这道题的结构
 
@@ -44,9 +78,13 @@ hotpotqa 的 bridge 题要两篇文档接力：
 | `6369` Cyndi Lauper | "(born June 22, 1953) is an American singer, songwriter, actress and LGBT rights activist" | **答案在这里** |
 | `6365` Dee Does Broadway | "Guests in the album include the **Grammy and Emmy award winning** Cyndi Lauper…" | **识别线索在这里** |
 
-查询里的 `who won Grammy and Emmy award` 这一段，出处是 6365。
-标注要求两篇都召回，因为按题目设计你得靠 6365 才能把「拿过 Grammy 和 Emmy 的那位」
+查询里的 `who won Grammy and Emmy award` 这一段，出处是 6365，
+所以标注要求两篇都召回 —— **按出题设计**，你得靠 6365 才能把「拿过 Grammy 和 Emmy 的那位」
 锁定到 Cyndi Lauper。
+
+但**在这份语料上实测并不需要**：同一个问句里还有 `American singer, songwriter,
+actress and LGBT rights activist`，它在 400 篇里唯一命中 6369（见上节）。
+识别线索在 6365，也在问句自己身上。这就是漏了一篇还答对的原因。
 
 实际召回 11 篇：
 
@@ -64,9 +102,9 @@ hotpotqa 的 bridge 题要两篇文档接力：
 11. 1307  Dianne Hiles
 ```
 
-6365 **不在里面**，到 k=20 也没有。
+6365 **不在里面**。
 
-## 先排除两个常见解释
+## 排除可能的解释
 
 **不是上下文预算挤掉的。** `budget` 里 `includedItemCount: 20`、
 `omittedItemCount: 0` —— 一条都没被截断。
@@ -74,7 +112,7 @@ hotpotqa 的 bridge 题要两篇文档接力：
 **不是候选集为空。** `audit_join.json` 的 `recall_ceiling_miss_rate` 是 0.0，
 `mean_candidate_chunks` 恒为 200.0。候选集从来不空。
 
-6365 是**压根没进候选集**，不是进了之后被丢掉。
+6365 是**没进候选集**，不是进了之后被丢掉。
 
 ---
 
@@ -97,7 +135,7 @@ hotpotqa 的 bridge 题要两篇文档接力：
 
 6365 编出的三个 artifact，chunk 正文**全部** `含 Grammy: False` / `含 Emmy: False`。
 
-拆开看丢了什么：
+对比：
 
 ```
 原文:  the Grammy and Emmy award winning    Cyndi Lauper
@@ -147,7 +185,7 @@ Cyndi Lauper --[released second record]-----> True Colors (Album)
 
 图扩展这次确实跑了（5 条 snippet 挂 `graph-neighbor`），连到的是
 Cyndi Lauper 自己的专辑、以及别的女歌手/activist —— 全是「同类实体」，
-而 6365 需要的是一条「嘉宾/参演」关系边。**不是走错路，是那条路不存在。**
+而 6365 需要的是一条「嘉宾/参演」关系边。
 
 ---
 
@@ -156,21 +194,7 @@ Cyndi Lauper 自己的专辑、以及别的女歌手/activist —— 全是「�
 跨已入库的 hotpotqa 文档统计（[probe_extraction.py](scripts/probe_extraction.py)）。
 三条结论，第一条与直觉相反。
 
-> 下面的数字是 **2026-09-10 的快照**，当时编译已完成约 400–410 篇。
-> 编译仍在推进，重跑脚本得到的绝对值会变（实测 401→410 篇时中位压缩率 2.19→2.20），
-> 但三条结论的量级不受影响。
-
 ### 编译不是在压缩，是在扩写
-
-| 编译后字符数 / 原文字符数 | |
-| --- | --- |
-| 中位数 | **2.19** |
-| p25 / p75 | 1.81 / 2.65 |
-| 最小 / 最大 | 0.67 / 6.62 |
-| 净压缩（< 1.0）占比 | **2.7%** |
-
-只有 2.7% 变短，中位数扩到 2.19 倍。
-**所以「因为要压缩所以省略细节」不成立** —— 它写的字比原文多一倍。
 
 丢修饰语是**改写策略**的结果，不是空间不够：改写成以主实体为中心的叙述时，
 挂在次要实体身上的定语被剥掉。这篇的主实体是 Dee Snider 和专辑，
@@ -245,15 +269,29 @@ Rijksmuseum / Ricky Skaggs / Isabella Bird / Al Gore / Kovno Ghetto / … 各 2 
 混在一起看会把 1 条检索问题读成 4 条。全样本 `recall@5` 0.965、
 knowledge-only 0.9948，差值 0.03 就是那三条。
 
-**二、`full_coverage@k` 比 `recall@k` 更该当主指标。**
+**二、`full_coverage@k` 比 `recall@k` 更该当主指标 —— 但治不了本例。**
 hotpotqa 全部 2 篇 gold，recall 只有 0/0.5/1 三个取值。
 `recall@5 = 0.5` 看着像「一半没找到」，真实含义是「两篇差一篇」——
 `full_coverage@5` 直接是 0，更准。
 
+代价是它在本例上更悲观：`full_coverage@5 = 0`，而答案是对的。
+两者都只量「标注路径覆盖了没有」，不量「证据够不够答对」。
+换主指标解决的是取值粒度问题，不是本例这种 shortcut 造成的口径错位。
+
 **三、这条样本是 judge 指标的典型靶子。**
-答案对、`f1 = 0.136`、`recall@5 = 0.5`：三个确定性指标全给出「不好」的信号，
-而它实质是好的（答案正确，且模型主动声明了证据缺口）。
-reference-free 的 faithfulness / answer relevancy 才能识别这种情况。
+本样本的确定性指标实测值：
+
+| 读作「不好」 | | 读作「好」 | |
+| --- | --- | --- | --- |
+| `em` | 0.0 | `mrr` | 1.0 |
+| `f1` | 0.136 | `hit@5` | 1.0 |
+| `recall@5` | 0.5 | | |
+| `full_coverage@5` | 0.0 | | |
+
+四比二，而它实质是好的：答案正确，且模型主动声明了证据缺口。
+`em = 0` 只因为答案裹在完整句子里；`f1 = 0.136` 是同一个原因的连续版。
+**reference-free 的 faithfulness / answer relevancy 是这里唯一能给对信号的指标** ——
+不是补充口径，是唯一可用的口径，因为四个确定性指标全错了方向。
 
 **四、这是 §0.3「Recall@k 系统性偏低且非调参可解」的具体证据。**
 要匹配的词已经不在被索引的文本里，任何检索侧参数都改不了。

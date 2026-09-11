@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 from .base import DatasetAdapter
 from .common import gold_titles_from_supporting_facts, resolve_gold_doc_ids
 from .corpus import CorpusIndex
-from .models import Capability, CanonicalSample, make_sample_id
+from .models import CanonicalSample, DataDependency, make_sample_id
 
 # 本集的 context 句子用空串拼接才能还原成 corpus 的 text。原文基线要用。
 SENTENCE_JOINER = ""
@@ -18,8 +18,8 @@ class HotpotQAAdapter(DatasetAdapter):
     aliases: ClassVar[tuple[str, ...]] = ("hotpot", "hotpot_qa", "hotpotqa_dev")
     qa_filename: ClassVar[str] = "hotpotqa.json"
     corpus_filename: ClassVar[str] = "hotpotqa_corpus.json"
-    capabilities: ClassVar[frozenset[Capability]] = frozenset(
-        {Capability.EVIDENCE_RECALL, Capability.ANSWER_F1}
+    provides: ClassVar[frozenset[DataDependency]] = frozenset(
+        {DataDependency.GOLD_DOCS, DataDependency.REFERENCE_ANSWERS}
     )
 
     def expected_qa_rows(self) -> int:

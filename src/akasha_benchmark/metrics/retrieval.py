@@ -18,16 +18,20 @@ from collections.abc import Sequence
 from math import log2
 from typing import Any
 
-from ..datasets import Capability, CapabilityError
+from ..datasets import DataDependency, DependencyError
 
 DEFAULT_KS: tuple[int, ...] = (2, 5, 10, 20)
 
 
-def require_evidence_capability(dataset: str, capabilities: frozenset[Capability]) -> None:
-    """没有 gold 标注就没有检索指标，此时拒绝计算而不是返回 0.0。"""
-    if Capability.EVIDENCE_RECALL not in capabilities:
-        raise CapabilityError(
-            f"{dataset} does not declare EVIDENCE_RECALL: it has no gold documents, so "
+def require_gold_docs(dataset: str, provides: frozenset[DataDependency]) -> None:
+    """没有 gold 文档就没有检索指标，此时拒绝计算而不是返回 0.0。
+
+    通用形式在 :mod:`..metrics.registry` 的 ``require()``；这个薄封装留给
+    检索族的调用方，省得每处都写一遍指标名。
+    """
+    if DataDependency.GOLD_DOCS not in provides:
+        raise DependencyError(
+            f"{dataset} does not provide GOLD_DOCS: it has no gold documents, so "
             "Recall/nDCG/MRR/Hit are undefined. Returning 0.0 would silently pollute "
             "any aggregate that includes it."
         )

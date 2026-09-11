@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from akasha_benchmark.datasets import (
     CORPUS_ID_RULES,
-    Capability,
+    DataDependency,
     CanonicalSample,
     CorpusDoc,
     get_adapter,
@@ -139,12 +139,12 @@ def test_registry_resolves_aliases_case_insensitively():
         get_adapter("triviaqa")
 
 
-def test_only_narrativeqa_lacks_evidence_recall():
-    """只有 narrativeqa 不声明 EVIDENCE_RECALL。"""
+def test_only_narrativeqa_lacks_gold_docs():
+    """只有 narrativeqa 不提供 GOLD_DOCS，但四组都有参考答案。"""
     for name in ("hotpotqa", "2wikimultihopqa", "musique"):
-        assert get_adapter(name).supports(Capability.EVIDENCE_RECALL)
-    assert not get_adapter("narrativeqa").supports(Capability.EVIDENCE_RECALL)
-    assert get_adapter("narrativeqa").supports(Capability.ANSWER_F1)
+        assert get_adapter(name).has(DataDependency.GOLD_DOCS)
+    assert not get_adapter("narrativeqa").has(DataDependency.GOLD_DOCS)
+    assert get_adapter("narrativeqa").has(DataDependency.REFERENCE_ANSWERS)
 
 
 # --- hotpotqa / 2wiki 的 gold 解析 ---

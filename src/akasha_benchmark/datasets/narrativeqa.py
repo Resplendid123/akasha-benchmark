@@ -1,6 +1,6 @@
 """narrativeqa 适配器。293 个问题、10 篇长文档，无 evidence 标注。
 
-**故意不声明** ``EVIDENCE_RECALL``：这份数据没有 gold 文档，检索指标在它上面
+**故意不声明** ``GOLD_DOCS``：这份数据没有 gold 文档，检索指标在它上面
 是无定义的。对它请求检索指标会抛异常，而不是把 0.0 混进平均值。
 
 身份：没有原生 QA ID，所以 ``dataset_sample_id`` 用它在**全量**数据文件里的
@@ -19,7 +19,7 @@ from typing import Any, ClassVar
 
 from .base import DatasetAdapter
 from .corpus import CorpusIndex
-from .models import Capability, CanonicalSample, make_sample_id
+from .models import CanonicalSample, DataDependency, make_sample_id
 
 
 def document_id_of(doc_id: str) -> str:
@@ -36,8 +36,8 @@ class NarrativeQAAdapter(DatasetAdapter):
     )
     qa_filename: ClassVar[str] = "narrativeqa.json"
     corpus_filename: ClassVar[str] = "narrativeqa_corpus.json"
-    # 不含 EVIDENCE_RECALL，原因见模块 docstring。
-    capabilities: ClassVar[frozenset[Capability]] = frozenset({Capability.ANSWER_F1})
+    # 不含 GOLD_DOCS，原因见模块 docstring。
+    provides: ClassVar[frozenset[DataDependency]] = frozenset({DataDependency.REFERENCE_ANSWERS})
 
     def expected_qa_rows(self) -> int:
         return 293

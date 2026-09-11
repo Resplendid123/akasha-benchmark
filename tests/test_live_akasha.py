@@ -28,7 +28,7 @@ retrievalDiagnostics」「citationEvidence 与 citations 等长」「budget 上�
 ===========================  ==================================================
 ``AKASHA_LIVE``              置 1 才跑；其余全部可选
 ``AKASHA_LIVE_REPLAY``       离线重放已有的 roundtrip.json，不连服务器
-``AKASHA_LIVE_RUN_ID``       取哪个 run 的子集，默认 run001
+``AKASHA_LIVE_LABEL``        取哪个索引层的子集，默认 run001
 ``AKASHA_LIVE_DATASET``      取哪个数据集，默认 hotpotqa
 ``AKASHA_LIVE_SAMPLE_ID``    指定 sample_id，默认第一条 gold 文件齐全的
 ``AKASHA_LIVE_DISTRACTORS``  额外导入的非 gold 文档数，默认 3
@@ -56,16 +56,11 @@ from akasha_benchmark.akasha_client import (
     AkashaError,
 )
 from akasha_benchmark.config import AkashaConfig, load_config
-from akasha_benchmark.datasets import CanonicalSample, subset_dir
+from akasha_benchmark.datasets import CanonicalSample
 from akasha_benchmark.ingest import MODEL_FEATURES
-from akasha_benchmark.io_utils import (
-    atomic_write_json,
-    atomic_write_jsonl,
-    load_json,
-    read_jsonl,
-    sha256_text,
-    utc_now,
-)
+from akasha_benchmark.store import DEFAULT_DB_PATH, connect, repo
+from akasha_benchmark.store.migrate import migrate
+from akasha_benchmark.io_utils import atomic_write_json, load_json, sha256_text, utc_now
 from akasha_benchmark.metrics import qa, retrieval
 
 # --- 服务端已核对过的常量（行号指向 ../Akasha） -------------------------------
@@ -106,31 +101,73 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
-def _eligible_samples(dataset: str, run_id: str) -> tuple[list[CanonicalSample], Path]:
-    """子集里 gold 文档全部落在磁盘上的样本，以及 corpus 目录。
+def _materialize_subset(dataset: str, label: str) -> tuple[list[CanonicalSample], Path]:
+    """从**库里**取子集，并把 md 正文摊到一个临时目录。
 
-    gold 不全的排除掉：那种样本「召回不到」时分不清是检索问题还是根本没导进去。
-    子集不存在就 skip —— 在线冒烟不负责生产离线产物，那是 ``make subset`` 的事。
+    库是事实来源，所以样本与正文都从 ``subset_sample`` / ``subset_doc`` 读。
+    摊成文件是为了让下游那几处「读 `{doc_id}.md`」的代码不用改 —— 它们验的是
+    导入接口的行为，与正文从哪来无关。
+
+    目录放在 pytest 的 tmp 之外（``data/smoke/subset-{label}-{dataset}/``），
+    这样跑完还能看；每次覆盖写，不累积。
     """
-    src = subset_dir(run_id, dataset, Path("data"))
-    samples_path = src / "samples.jsonl"
-    if not samples_path.is_file():
-        pytest.skip(f"no subset at {samples_path}; run: make subset RUN_ID={run_id}")
+    connection = connect(DEFAULT_DB_PATH, read_only=True)
+    try:
+        layer = repo.index_layer_by_label(connection, label)
+        if layer is None:
+            pytest.skip(
+                f"库里没有标签为 {label!r} 的索引层；先跑：make subset LABEL={label}"
+            )
+        layer_id = int(layer["id"])
+        rows = repo.subset_samples(connection, layer_id, dataset)
+        docs = repo.subset_docs(connection, layer_id, dataset)
+    finally:
+        connection.close()
 
-    corpus = src / "corpus"
+    if not rows:
+        pytest.skip(f"索引层 {label!r} 里没有 {dataset} 的子集样本")
+
+    corpus = Path("data") / "smoke" / f"subset-{label}-{dataset}"
+    corpus.mkdir(parents=True, exist_ok=True)
+    for doc in docs:
+        (corpus / f"{doc['doc_id']}.md").write_text(
+            doc["md_text"], encoding="utf-8", newline="\n"
+        )
+
+    on_disk = {doc["doc_id"] for doc in docs}
     eligible = [
-        s
-        for s in (CanonicalSample.model_validate(row) for row in read_jsonl(samples_path))
-        if s.gold_doc_ids and all((corpus / f"{d}.md").is_file() for d in s.gold_doc_ids)
+        CanonicalSample.model_validate(
+            {
+                "dataset": row["dataset"],
+                "sample_id": row["sample_id"],
+                "dataset_sample_id": row["dataset_sample_id"],
+                "question": row["question"],
+                "answers": list(row["answers"]),
+                "gold_doc_ids": list(row["gold_doc_ids"]),
+                "metadata": row["metadata"],
+            }
+        )
+        for row in rows
+        # gold 不全的排除掉：那种样本「召回不到」时分不清是检索问题还是
+        # 根本没导进去。
+        if row["gold_doc_ids"] and all(d in on_disk for d in row["gold_doc_ids"])
     ]
-    if not eligible:
-        pytest.skip(f"no sample in {samples_path} has all of its gold documents on disk")
     return eligible, corpus
 
 
-def _pick_sample(dataset: str, run_id: str) -> tuple[CanonicalSample, Path]:
+def _eligible_samples(dataset: str, label: str) -> tuple[list[CanonicalSample], Path]:
+    """gold 文档齐全的样本，以及摊好正文的 corpus 目录。"""
+    eligible, corpus = _materialize_subset(dataset, label)
+    if not eligible:
+        pytest.skip(
+            f"索引层 {label!r} 的 {dataset} 子集里，没有一条样本的 gold 是齐的"
+        )
+    return eligible, corpus
+
+
+def _pick_sample(dataset: str, label: str) -> tuple[CanonicalSample, Path]:
     """单样本往返用的那一条。``AKASHA_LIVE_SAMPLE_ID`` 可以指定。"""
-    eligible, corpus = _eligible_samples(dataset, run_id)
+    eligible, corpus = _eligible_samples(dataset, label)
     wanted = os.environ.get("AKASHA_LIVE_SAMPLE_ID")
     if not wanted:
         return eligible[0], corpus
@@ -140,9 +177,9 @@ def _pick_sample(dataset: str, run_id: str) -> tuple[CanonicalSample, Path]:
     pytest.skip(f"sample {wanted!r} is not in the subset, or its gold md is missing")
 
 
-def _pick_samples(dataset: str, run_id: str, count: int) -> tuple[list[CanonicalSample], Path]:
+def _pick_samples(dataset: str, label: str, count: int) -> tuple[list[CanonicalSample], Path]:
     """批量阶段用的前 N 条。取前 N 条而不是随机抽，让整趟可复现。"""
-    eligible, corpus = _eligible_samples(dataset, run_id)
+    eligible, corpus = _eligible_samples(dataset, label)
     return eligible[:count], corpus
 
 
@@ -159,41 +196,106 @@ def _distractor_ids(corpus: Path, gold: tuple[str, ...], count: int) -> list[str
 # --- 批量三段的输入：切一份迷你子集 -------------------------------------------
 
 
-def _carve_subset(
-    dest_data: Path,
+def _carve_layer(
+    db_path: Path,
     dataset: str,
-    run_id: str,
+    label: str,
     samples: list[CanonicalSample],
     corpus: Path,
     distractors: int,
 ) -> list[str]:
-    """把选中的样本连同其 gold 文档切成一份独立子集，返回 doc_id 列表。
+    """在一个**独立的库**里建出一个迷你索引层，返回 doc_id 列表。
 
     批量三段走的是真实的 ``ingest.run()`` / ``run_queries.run()`` /
-    ``evaluate.run()``，它们都从 ``<data>/subsets/<run>/<dataset>/`` 读输入，
-    所以给它们一份真实产物的**子集**，而不是另造一套假数据 —— 这样
-    corpus 的 md 字节、``manifest.json`` 的 sha256、``samples.jsonl`` 的字段
-    全都和正式跑的时候一致。
+    ``evaluate.run()``，它们都从库里读输入，所以这里给它们一个真实产物的
+    **子集**，而不是另造一套假数据 —— md 正文的字节、``md_sha256``、
+    样本字段全都和正式跑的时候一致。
 
-    ``manifest.json`` 只列这几篇。``import_corpus`` 是按 manifest 的
-    ``corpus_md_sha256`` 决定导什么，多列一篇就会去导一个不存在的文件。
+    用独立的库文件（而不是往主库加一层）是为了让这趟冒烟不污染主库：
+    它会建 Space、导入、跑查询，那些行留在主库里会混进真实实验的统计。
     """
     gold = {d for s in samples for d in s.gold_doc_ids}
     extra = [p.stem for p in sorted(corpus.glob("*.md")) if p.stem not in gold][:distractors]
     doc_ids = sorted(gold) + extra
 
-    dest = dest_data / "subsets" / run_id / dataset
-    (dest / "corpus").mkdir(parents=True, exist_ok=True)
-    hashes: dict[str, str] = {}
-    for doc_id in doc_ids:
-        markdown = (corpus / f"{doc_id}.md").read_text(encoding="utf-8")
-        # newline="\n" 是必须的：Windows 上默认会写成 CRLF，sha256 立刻对不上，
-        # 而 ingest 校验哈希不符时会直接抛错。
-        (dest / "corpus" / f"{doc_id}.md").write_text(markdown, encoding="utf-8", newline="\n")
-        hashes[doc_id] = sha256_text(markdown)
-
-    atomic_write_jsonl(dest / "samples.jsonl", [s.model_dump(mode="json") for s in samples])
-    atomic_write_json(dest / "manifest.json", {"corpus_md_sha256": hashes})
+    migrate(db_path, verbose=False)
+    connection = connect(db_path)
+    try:
+        # 数据集行：ingest 的上游哈希链要比对它，所以哈希必须与样本一致地自洽。
+        repo.upsert_dataset(
+            connection,
+            name=dataset,
+            adapter="SmokeAdapter",
+            adapter_version="1",
+            provides=["gold_docs", "reference_answers"],
+            identity_rules={},
+            qa_path=f"smoke/{dataset}.json",
+            qa_sha256=sha256_text(repr([s.sample_id for s in samples])),
+            qa_rows=len(samples),
+            corpus_path=f"smoke/{dataset}_corpus.json",
+            corpus_sha256=sha256_text(repr(doc_ids)),
+            corpus_rows=len(doc_ids),
+            dedup_stats={},
+            gold_count_distribution={str(len(gold)): len(samples)},
+            unique_question_texts=len({s.question for s in samples}),
+        )
+        repo.replace_samples(
+            connection, dataset, [s.model_dump(mode="json") for s in samples]
+        )
+        docs = []
+        for doc_id in doc_ids:
+            markdown = (corpus / f"{doc_id}.md").read_text(encoding="utf-8")
+            docs.append(
+                {
+                    "doc_id": doc_id,
+                    "md_text": markdown,
+                    "md_sha256": sha256_text(markdown),
+                    "is_gold": doc_id in gold,
+                }
+            )
+        repo.replace_corpus(
+            connection,
+            dataset,
+            [
+                {
+                    "doc_id": d["doc_id"],
+                    "title": d["doc_id"],
+                    "text": d["md_text"],
+                    "text_sha256": d["md_sha256"],
+                }
+                for d in docs
+            ],
+        )
+        record = repo.get_dataset(connection, dataset)
+        layer_id = repo.create_index_layer(
+            connection,
+            label=label,
+            subset_hash="",
+            seed=0,
+            qa_limit=len(samples),
+            negatives_ratio=1.0,
+            narrativeqa_docs=0,
+        )
+        repo.upsert_index_layer_dataset(
+            connection,
+            layer_id,
+            dataset,
+            strategy="smoke_carve",
+            qa_count=len(samples),
+            corpus_count=len(doc_ids),
+            gold_doc_count=len(gold),
+            negative_doc_count=len(extra),
+            strata={},
+            normalized_qa_sha256=record["qa_sha256"],
+            normalized_corpus_sha256=record["corpus_sha256"],
+        )
+        repo.replace_subset(
+            connection, layer_id, dataset, [s.sample_id for s in samples], docs
+        )
+        repo.recompute_subset_hash(connection, layer_id)
+        connection.commit()
+    finally:
+        connection.close()
     return doc_ids
 
 
@@ -235,10 +337,10 @@ def _round_trip() -> dict[str, Any]:
     任何一步抛异常都直接冒出去 —— 冒烟测试的意义就是让这些失败可见，
     在这里 catch 成 skip 等于把「服务端坏了」伪装成「没跑」。
     """
-    run_id = os.environ.get("AKASHA_LIVE_RUN_ID", "run001")
-    dataset = os.environ.get("AKASHA_LIVE_DATASET", "hotpotqa")
+    label = os.environ.get("AKASHA_LIVE_LABEL") or "run001"
+    dataset = os.environ.get("AKASHA_LIVE_DATASET") or "hotpotqa"
     timeout = _env_int("AKASHA_LIVE_TIMEOUT", 900)
-    sample, corpus = _pick_sample(dataset, run_id)
+    sample, corpus = _pick_sample(dataset, label)
     distractors = _distractor_ids(
         corpus, sample.gold_doc_ids, _env_int("AKASHA_LIVE_DISTRACTORS", 3)
     )
@@ -254,14 +356,14 @@ def _round_trip() -> dict[str, Any]:
         "kind": "akasha-live-smoke",
         "generated_at": utc_now(),
         "connection": config.redacted(),
-        "run_id": run_id,
+        "label": label,
         "dataset": dataset,
         "sample": sample.model_dump(mode="json"),
         "gold_doc_ids": list(sample.gold_doc_ids),
         "distractor_doc_ids": distractors,
     }
     try:
-        return _execute(config, observed, sample, corpus, doc_ids, dataset, run_id, timeout)
+        return _execute(config, observed, sample, corpus, doc_ids, dataset, label, timeout)
     finally:
         _persist(observed)
 
@@ -273,7 +375,7 @@ def _execute(
     corpus: Path,
     doc_ids: list[str],
     dataset: str,
-    run_id: str,
+    label: str,
     timeout: int,
 ) -> dict[str, Any]:
     space_id: str | None = None
@@ -308,7 +410,7 @@ def _execute(
         # 独立 Space，slug 带随机后缀：并发跑或上一次没删干净都不会撞。
         slug = f"{SMOKE_SLUG_PREFIX}{uuid.uuid4().hex[:10]}"
         space = client.create_space(
-            name=f"smoke {dataset} {run_id}"[:100],
+            name=f"smoke {dataset} {label}"[:100],
             slug=slug,
             description="Akasha-Benchmark live smoke test. Generated, safe to delete.",
         )
@@ -362,73 +464,128 @@ def _persist(observed: dict[str, Any]) -> None:
 
 
 def _run_pipeline(
-    data_dir: Path, dataset: str, source_run: str, run_id: str, samples: int
+    data_dir: Path, dataset: str, source_label: str, run_id: str, samples: int
 ) -> dict[str, Any]:
     """跑真实的 ingest → query → report 三段，入库和查询各跑两遍验续跑。
 
     调的是各阶段的 ``run()``，不是重写一遍它们的逻辑 —— 冒烟要验的就是那几个
     真实入口在真实服务上的行为，自己再实现一份等于什么都没验。
 
-    ``source_run`` 是读的那个 run（正式子集，通常 run001），``run_id`` 是这一趟
-    自己的输出 run。两者必须分开：拿输出 run 去读源子集会找不到文件。
+    ``source_label`` 是读的那个索引层（正式子集，通常 run001），``run_id`` 是这一趟
+    自己建的迷你层。两者必须分开，且这一趟用**独立的库文件**，不污染主库。
     """
     from akasha_benchmark import evaluate as ev_mod
     from akasha_benchmark import ingest as ingest_mod
     from akasha_benchmark import run_queries as rq_mod
     from akasha_benchmark.metrics.retrieval import DEFAULT_KS
 
-    picked, corpus = _pick_samples(dataset, source_run, samples)
-    doc_ids = _carve_subset(
-        data_dir, dataset, run_id, picked, corpus, _env_int("AKASHA_LIVE_DISTRACTORS", 3)
+    picked, corpus = _pick_samples(dataset, source_label, samples)
+    db_path = data_dir / f"{run_id}.db"
+    doc_ids = _carve_layer(
+        db_path, dataset, run_id, picked, corpus, _env_int("AKASHA_LIVE_DISTRACTORS", 3)
     )
+    query_label = f"{run_id}-query"
+    eval_label = f"{run_id}-eval"
     out: dict[str, Any] = {
-        "run_id": run_id,
-        "source_run": source_run,
+        "label": run_id,
+        "source_label": source_label,
         "dataset": dataset,
+        "db": str(db_path),
         "sample_ids": [s.sample_id for s in picked],
         "doc_ids": doc_ids,
     }
-    print(f"\npipeline: {len(picked)} sample(s), {len(doc_ids)} doc(s), run_id={run_id}")
+    print(f"\npipeline: {len(picked)} sample(s), {len(doc_ids)} doc(s), label={run_id}")
+
+    def snapshot(**extra: Any) -> dict[str, Any]:
+        """从库里读一份当前状态。断言都对着库，因为库才是权威。"""
+        connection = connect(db_path, read_only=True)
+        try:
+            layer = repo.index_layer_by_label(connection, run_id)
+            layer_id = int(layer["id"])
+            query_layer = repo.query_layer_by_label(connection, query_label)
+            result = {
+                "quality_passed": layer["quality_passed"],
+                "config_hash": layer["config_hash"],
+                "page_map": [
+                    dict(r)
+                    for r in connection.execute(
+                        "SELECT dataset, doc_id, page_id FROM page_map WHERE index_layer_id = ?"
+                        " ORDER BY doc_id",
+                        (layer_id,),
+                    )
+                ],
+                "spaces": repo.spaces_of(connection, layer_id),
+                "readiness": repo.index_layer_readiness(connection, layer_id),
+                "import_failures": repo.import_failures(connection, layer_id),
+            }
+            if query_layer:
+                qid = int(query_layer["id"])
+                result["responses"] = repo.responses_of(connection, qid, dataset)
+                result["request_window"] = repo.request_window(connection, qid)
+                result["response_stats"] = {
+                    k: dict(v) for k, v in repo.response_stats(connection, qid).items()
+                }
+            return {**result, **extra}
+        finally:
+            connection.close()
 
     # --- 入库 ---
-    out["ingest_exit"] = ingest_mod.run(run_id, [dataset], None, data_dir)
-    ingest_manifest_path = ingest_mod.ingest_dir(run_id, data_dir) / "manifest.json"
-    out["ingest_manifest"] = load_json(ingest_manifest_path)
-    out["page_map"] = list(read_jsonl(ingest_mod.ingest_dir(run_id, data_dir) / "page_map.jsonl"))
-    out["space_ids"] = [s["id"] for s in out["ingest_manifest"]["spaces"].values()]
+    out["ingest_exit"] = ingest_mod.run(run_id, [dataset], None, db_path)
+    after_ingest = snapshot()
+    out["page_map"] = after_ingest["page_map"]
+    out["quality_passed"] = after_ingest["quality_passed"]
+    out["space_ids"] = list(after_ingest["spaces"].values())
+    out["readiness"] = after_ingest["readiness"]
 
     # --- 查询，两遍 ---
-    out["query_exit"] = rq_mod.run(run_id, [dataset], None, data_dir, None, None, False)
-    responses_path = rq_mod.responses_dir(run_id, data_dir) / f"{dataset}.jsonl"
-    out["responses"] = list(read_jsonl(responses_path))
-    out["query_manifest"] = load_json(rq_mod.responses_dir(run_id, data_dir) / "manifest.json")
+    out["query_exit"] = rq_mod.run(
+        run_id, [dataset], None, db_path, None, None, False, query_label
+    )
+    after_query = snapshot()
+    out["responses"] = after_query["responses"]
+    out["response_stats"] = after_query["response_stats"]
 
     print("query stage again (resume: nothing should be re-requested)")
-    out["query_resume_exit"] = rq_mod.run(run_id, [dataset], None, data_dir, None, None, False)
-    out["query_manifest_resume"] = load_json(
-        rq_mod.responses_dir(run_id, data_dir) / "manifest.json"
+    out["query_resume_exit"] = rq_mod.run(
+        run_id, [dataset], None, db_path, None, None, False, query_label
     )
-    out["responses_after_resume"] = list(read_jsonl(responses_path))
+    after_resume = snapshot()
+    out["responses_after_resume"] = after_resume["responses"]
+    # 时间窗从行里现算，所以续跑之后它必须仍然覆盖第一遍的请求。
+    out["request_window"] = after_resume["request_window"]
 
     # --- 报告 ---
-    out["report_exit"] = ev_mod.run(run_id, [dataset], data_dir, DEFAULT_KS)
-    reports = ev_mod.reports_dir(run_id, data_dir)
+    out["report_exit"] = ev_mod.run(
+        query_label, [dataset], db_path, DEFAULT_KS, eval_label, True, data_dir
+    )
+    connection = connect(db_path, read_only=True)
+    try:
+        eval_layer = repo.eval_layer_by_label(connection, eval_label)
+        eid = int(eval_layer["id"])
+        out["dataset_eval"] = repo.dataset_evals(connection, eid)
+        out["metric_summaries"] = repo.metric_summaries(connection, eid)
+        out["per_sample"] = [
+            {
+                **{k: v for k, v in row.items() if k != "detail_json"},
+                "metrics": repo.sample_metrics_of(connection, eid, row["sample_id"]),
+            }
+            for row in repo.sample_evals(connection, eid)
+        ]
+    finally:
+        connection.close()
+    reports = ev_mod.reports_dir(eval_label, data_dir)
     out["metrics"] = load_json(reports / "metrics.json")
-    out["per_sample"] = list(read_jsonl(reports / "per_sample.jsonl"))
     out["report_md"] = (reports / "report.md").read_text(encoding="utf-8")
 
     # --- 入库续跑放最后 ---
-    # 它会覆盖 manifest（--skip-compile 让 quality_passed 变 False），所以必须在
-    # 查询和报告都读完之后再跑。带 skip_compile 是为了省一次没有意义的重编译 ——
-    # 导入侧的续跑与编译无关。
+    # 带 skip_compile 是为了省一次没有意义的重编译（导入侧的续跑与编译无关）,
+    # 而它现在会让 ingest 以非零码退出 —— 那是有意的：--skip-compile 不是验收通过。
+    # 所以放最后，且退出码单独记，不与第一遍的混。
     print("ingest stage again (resume: nothing should be re-imported)")
     out["ingest_resume_exit"] = ingest_mod.run(
-        run_id, [dataset], None, data_dir, skip_compile=True
+        run_id, [dataset], None, db_path, skip_compile=True
     )
-    out["ingest_manifest_resume"] = load_json(ingest_manifest_path)
-    out["page_map_after_resume"] = list(
-        read_jsonl(ingest_mod.ingest_dir(run_id, data_dir) / "page_map.jsonl")
-    )
+    out["page_map_after_resume"] = snapshot()["page_map"]
     return out
 
 
@@ -478,8 +635,8 @@ def pipeline(tmp_path_factory: pytest.TempPathFactory) -> Any:
     if os.environ.get("AKASHA_LIVE") != "1":
         pytest.skip("live test; set AKASHA_LIVE=1 to run it against a real Akasha")
 
-    dataset = os.environ.get("AKASHA_LIVE_DATASET", "hotpotqa")
-    source_run = os.environ.get("AKASHA_LIVE_RUN_ID", "run001")
+    dataset = os.environ.get("AKASHA_LIVE_DATASET") or "hotpotqa"
+    source_label = os.environ.get("AKASHA_LIVE_LABEL") or "run001"
     samples = _env_int("AKASHA_LIVE_PIPELINE_SAMPLES", 3)
     timeout = _env_int("AKASHA_LIVE_TIMEOUT", 900)
 
@@ -504,7 +661,7 @@ def pipeline(tmp_path_factory: pytest.TempPathFactory) -> Any:
 
     result: dict[str, Any] = {}
     try:
-        result = _run_pipeline(data_dir, dataset, source_run, run_id, samples)
+        result = _run_pipeline(data_dir, dataset, source_label, run_id, samples)
         yield result
     finally:
         patch.undo()
@@ -917,21 +1074,23 @@ def test_single_sample_retrieval_and_answer_are_reported(
 def test_pipeline_ingest_maps_every_document_and_passes_the_gate(pipeline: dict[str, Any]):
     """入库阶段的验收标准：page_map 身份集合等于子集，且质量闸门通过。"""
     assert pipeline["ingest_exit"] == 0, "ingest stage returned a non-zero exit code"
-    manifest = pipeline["ingest_manifest"]
 
-    assert manifest["quality_passed"] is True, f"quality gates: {manifest['quality']['gates']}"
-    assert manifest["import_failure_count"] == 0
+    assert pipeline["quality_passed"] == 1, f"quality gate failed: {pipeline['readiness']}"
+    assert pipeline["import_failures"] == []
 
     mapped = {row["doc_id"] for row in pipeline["page_map"]}
     assert mapped == set(pipeline["doc_ids"]), (
         f"page_map covers {sorted(mapped)} but the subset has {sorted(pipeline['doc_ids'])}"
     )
-    assert manifest["page_map_rows"] == len(pipeline["doc_ids"])
     # page_id 必须两两不同，反查表靠它把 sourcePageId 映回 doc_id。
     page_ids = [row["page_id"] for row in pipeline["page_map"]]
     assert len(set(page_ids)) == len(page_ids)
-    # 密钥绝不能进 manifest。
-    assert manifest["connection"]["password"] == "***"
+
+    # 索引层的身份到入库才凑齐 —— config_hash 在那之前是 NULL。
+    assert pipeline["config_hash"], "config_hash should be sealed once ingest completes"
+
+    # 三项前置闸门全过，这一层才允许跑查询。
+    assert pipeline["readiness"]["ready"] is True, pipeline["readiness"]["reasons"]
 
 
 def test_pipeline_ingest_used_a_smoke_prefixed_space(pipeline: dict[str, Any]):
@@ -939,10 +1098,18 @@ def test_pipeline_ingest_used_a_smoke_prefixed_space(pipeline: dict[str, Any]):
 
     slug 前缀是靠环境变量覆盖的，这条同时验了「环境变量优先于配置文件」。
     """
-    for name, space in pipeline["ingest_manifest"]["spaces"].items():
-        assert space["slug"].startswith(SMOKE_SLUG_PREFIX), (
-            f"{name} landed in space {space['slug']!r}, which is not smoke-prefixed; "
-            "a real ingest space would have its page_map and quality counts polluted"
+    assert pipeline["space_ids"], "ingest recorded no space"
+    connection = connect(Path(pipeline["db"]), read_only=True)
+    try:
+        layer = repo.index_layer_by_label(connection, pipeline["label"])
+        rows = repo.index_layer_datasets(connection, int(layer["id"]))
+    finally:
+        connection.close()
+    for row in rows:
+        assert (row["space_slug"] or "").startswith(SMOKE_SLUG_PREFIX), (
+            f"{row['dataset']} landed in space {row['space_slug']!r}, which is not "
+            "smoke-prefixed; a real ingest space would have its page_map and quality "
+            "counts polluted"
         )
 
 
@@ -952,18 +1119,20 @@ def test_pipeline_ingest_resume_reimports_nothing(pipeline: dict[str, Any]):
     这条坏了不会报错 —— 只会让 page_map 出现重复行，然后反查表里同一个 doc_id
     对上多个 page_id，检索指标跟着虚高或虚低。
     """
-    assert pipeline["ingest_resume_exit"] == 0
-    resumed = pipeline["ingest_manifest_resume"]
-    imports = resumed["imports"][0]
-    assert imports["imported"] == 0, f"resume re-imported {imports['imported']} document(s)"
-    assert imports["skipped_already_present"] == len(pipeline["doc_ids"])
-    assert imports["failures"] == []
+    # 第二遍带 --skip-compile，而那**必定**非零退出（它不是验收通过，§10.1）。
+    # 所以这里断言的是 1，不是 0 —— 断言 0 才是错的。
+    assert pipeline["ingest_resume_exit"] == 1, (
+        "--skip-compile must exit non-zero: it is a debug entry point, not an accepted ingest"
+    )
+
     # 行数与身份集合都不能变。
     before, after = pipeline["page_map"], pipeline["page_map_after_resume"]
     assert len(after) == len(before), f"page_map grew from {len(before)} to {len(after)} rows"
     assert {(r["dataset"], r["doc_id"]) for r in after} == {
         (r["dataset"], r["doc_id"]) for r in before
     }
+    # page_id 也必须逐个不变：变了说明重导过一遍，只是行数凑巧一样。
+    assert {r["page_id"] for r in after} == {r["page_id"] for r in before}
 
 
 # --- 批量：查询 ---------------------------------------------------------------
@@ -974,38 +1143,60 @@ def test_pipeline_query_writes_exactly_one_row_per_sample(pipeline: dict[str, An
     assert pipeline["query_exit"] == 0
     rows = pipeline["responses"]
     ids = [r["sample_id"] for r in rows]
-    assert ids == pipeline["sample_ids"], f"expected {pipeline['sample_ids']}, got {ids}"
-    assert len(set(ids)) == len(ids), "duplicate sample_id in the response file"
+    assert sorted(ids) == sorted(pipeline["sample_ids"]), (
+        f"expected {pipeline['sample_ids']}, got {ids}"
+    )
+    # 一个 sample_id 只能有一行 —— 主键保证，这里再确认一次。
+    assert len(set(ids)) == len(ids), "duplicate sample_id in the response rows"
 
-    failed = [(r["sample_id"], r["http_status"], r["error"]) for r in rows if r["http_status"] != 200]
+    failed = [
+        (r["sample_id"], r["http_status"], r["error"]) for r in rows if r["http_status"] != 200
+    ]
     assert not failed, f"these queries failed: {failed}"
-    # 完整响应体必须落盘 —— 重跑要烧 LLM 调用，字段不全就等于要重跑。
+    # 完整响应体必须落库 —— 重跑要烧 LLM 调用，字段不全就等于要重跑。
     for row in rows:
         assert isinstance(row["response"], dict) and row["response"].get("answerMode")
+        # answer_mode 抽成列，UI 的默认切分靠它，不必每次解析 JSON。
+        assert row["answer_mode"] == row["response"]["answerMode"]
 
-    manifest = pipeline["query_manifest"]
-    assert manifest["total_failures"] == 0
-    assert manifest["model_configs_match_ingest"] is True, (
+    stats = pipeline["response_stats"][pipeline["dataset"]]
+    assert stats["failures"] == 0
+    assert stats["responses"] == len(pipeline["sample_ids"])
+
+    connection = connect(Path(pipeline["db"]), read_only=True)
+    try:
+        query_layer = repo.query_layer_by_label(connection, f"{pipeline['label']}-query")
+    finally:
+        connection.close()
+    assert query_layer["model_configs_match_index"] == 1, (
         "model configs drifted between ingest and query within a single smoke run"
     )
-    modes = [r["response"]["answerMode"] for r in rows]
+    modes = [r["answer_mode"] for r in rows]
     print(f"answer modes: {modes}")
 
 
 def test_pipeline_query_resume_reissues_nothing(pipeline: dict[str, Any]):
     """续跑：第二遍查询一条都不该重发，行数也不该变。
 
-    这条坏了要么重复烧 LLM 调用，要么产生重复行 —— 后者会让 evaluate 直接以
-    「duplicate sample_id」终止。
+    这条坏了要么重复烧 LLM 调用，要么撞主键 —— 后者现在会直接抛
+    IntegrityError，比原来悄悄多出一行要好。
     """
     assert pipeline["query_resume_exit"] == 0
-    resumed = pipeline["query_manifest_resume"]["datasets"][0]
-    assert resumed["requested"] == 0, f"resume re-issued {resumed['requested']} query/queries"
-    assert resumed["skipped_already_done"] == len(pipeline["sample_ids"])
-
     before, after = pipeline["responses"], pipeline["responses_after_resume"]
-    assert len(after) == len(before), f"response file grew from {len(before)} to {len(after)} rows"
-    assert [r["sample_id"] for r in after] == [r["sample_id"] for r in before]
+    assert len(after) == len(before), f"responses grew from {len(before)} to {len(after)}"
+    # requested_at 逐行不变，才说明真的没重发（行数一样也可能是删了又写）。
+    assert {(r["sample_id"], r["requested_at"]) for r in after} == {
+        (r["sample_id"], r["requested_at"]) for r in before
+    }
+
+    # 时间窗从行的 min/max 现算，所以续跑之后它必须仍然覆盖第一遍的请求 ——
+    # 这是 §10.1 那条「manifest 被本次统计覆盖、审计漏掉早期请求」的反面。
+    window = pipeline["request_window"]
+    assert window is not None
+    earliest = min(r["requested_at"] for r in before)
+    assert window[0] <= earliest, (
+        f"request window starts at {window[0]} but the first request was {earliest}"
+    )
 
 
 # --- 批量：报告 ---------------------------------------------------------------
@@ -1033,40 +1224,57 @@ def test_pipeline_report_resolves_every_retrieved_page(pipeline: dict[str, Any])
     非空就说明 page_map 反查断了 —— 那不会报错，只会让这些页永远算不上 gold，
     Recall 因此虚低，看起来像检索差。
     """
-    summary = pipeline["metrics"]["datasets"][0]
-    assert summary["unmapped_page_ids"] == [], (
-        f"{len(summary['unmapped_page_ids'])} retrieved page id(s) are absent from page_map: "
-        f"{summary['unmapped_page_ids'][:5]}"
+    row = pipeline["dataset_eval"][0]
+    unmapped = repo.loads(row["unmapped_page_ids_json"], [])
+    assert unmapped == [], (
+        f"{len(unmapped)} retrieved page id(s) are absent from page_map: {unmapped[:5]}"
     )
 
 
 def test_pipeline_report_metrics_are_well_formed(pipeline: dict[str, Any]):
-    """指标本身要成形：取值在定义域内、两份检索切片都在。
+    """指标本身要成形：取值在定义域内、两份口径都在。
 
-    **不断言指标高低** —— 三条样本说明不了检索质量。这里验的是「算得出来且没算错口径」。
+    **不断言指标高低** —— 三条样本说明不了检索质量。这里验的是「算得出来且
+    没算错口径」。
     """
-    summary = pipeline["metrics"]["datasets"][0]
-    for key in ("retrieval", "retrieval_knowledge_only", "attribution", "multihop", "stratified"):
-        assert key in summary, f"summary lacks {key}; keys are {sorted(summary)}"
+    scopes: dict[str, dict[str, float]] = {}
+    for entry in pipeline["metric_summaries"]:
+        scopes.setdefault(entry["scope"], {})[entry["metric"]] = entry["value"]
 
-    for slice_name in ("retrieval", "retrieval_knowledge_only"):
-        for metric, value in summary[slice_name].items():
-            assert 0.0 <= value <= 1.0, f"{slice_name}.{metric} = {value} is out of [0, 1]"
+    # 两份口径必须都在：差值就是生成端拒答的规模，缺一份就算不出来。
+    for scope in ("overall", "knowledge_only"):
+        assert scope in scopes, f"missing scope {scope}; have {sorted(scopes)}"
+    assert any(s.startswith("stratum:") for s in scopes), sorted(scopes)
+
+    # 比例类指标必须落在 [0, 1]。计数类（retrieved_count 等）不受此限。
+    bounded = {"recall", "ndcg", "hit", "full_coverage", "mrr", "em", "f1",
+               "citation_precision", "citation_recall", "evidence_verifiable_rate",
+               "graph_neighbor_share", "graph_neighbor_precision",
+               "graph_exclusive_gold_share"}
+    for scope in ("overall", "knowledge_only"):
+        for metric, value in scopes[scope].items():
+            if metric.split("@")[0] in bounded and value is not None:
+                assert 0.0 <= value <= 1.0, f"{scope}.{metric} = {value} is out of [0, 1]"
 
     # EM 报出来但预期为 0（散文答案对不上短跨度参考，见 metrics/qa.py）。
     # 这里不断言它必须为 0 —— 换了 answer prompt 后它可能变正，那是形态变化不是失败。
-    assert 0.0 <= summary["qa"]["em"] <= 1.0
-    assert 0.0 <= summary["qa"]["f1"] <= 1.0
+    assert 0.0 <= scopes["overall"]["em"] <= 1.0
+    assert 0.0 <= scopes["overall"]["f1"] <= 1.0
 
-    # knowledge 切片是全样本的子集，所以计数不可能更多。
-    assert summary["knowledge_answer_count"] <= summary["responses_evaluated"]
-    modes = summary["answer_mode_distribution"]
+    row = pipeline["dataset_eval"][0]
+    modes = repo.loads(row["answer_mode_distribution_json"], {})
     assert abs(sum(modes.values()) - 1.0) < 1e-9, f"mode shares do not sum to 1: {modes}"
+    # 有 gold 的数据集不该省略任何确定性指标。
+    assert repo.loads(row["omitted_metrics_json"], []) == []
+
+    # 扁平指标表要能按名字直接查 —— UI 的筛选排序靠它。
+    for entry in pipeline["per_sample"]:
+        assert entry["metrics"], f"{entry['sample_id']} has no flat metrics"
 
     print(
-        f"  R@10 {summary['retrieval'].get('recall@10', 0.0):.3f}"
-        f" (knowledge-only {summary['retrieval_knowledge_only'].get('recall@10', 0.0):.3f})"
-        f"   EM {summary['qa']['em']:.3f}   F1 {summary['qa']['f1']:.3f}"
+        f"  R@10 {scopes['overall'].get('recall@10', 0.0):.3f}"
+        f" (knowledge-only {scopes['knowledge_only'].get('recall@10', 0.0):.3f})"
+        f"   EM {scopes['overall']['em']:.3f}   F1 {scopes['overall']['f1']:.3f}"
     )
 
 

@@ -1,30 +1,26 @@
-"""需要连 Akasha 的那几个阶段的配置。
+"""需要连 Akasha 的那几个阶段的配置。**只存在库里。**
 
-一切都不硬编码。取值来自 JSON 配置文件（默认仓库根的 ``akasha.config.json``,
-已 gitignore），并可被同名环境变量逐项覆盖，**环境变量优先**。
+配置的唯一来源是评测库的 ``connection`` 表，在平台的配置层里填。曾经有过两条
+旁路（``akasha.config.json``、``AKASHA_*`` 环境变量覆盖），两条都删了 ——
+同一份配置有多个来源时，「我改了但没生效」是查不出来的，而那个成本远高于
+少一条旁路带来的不便。
 
-密钥只存在 :class:`AkashaConfig` 里，绝不写进 manifest ——
-入库与查询记录的是 :meth:`AkashaConfig.redacted` 的结果。
+**只有一份配置**（``connection`` 表的 ``CHECK (id = 1)`` 把这一点写进了 schema）,
+只能改，不能新增。:class:`AkashaConfig` 是它的运行时形态。
 
-    AKASHA_BASE_URL=http://localhost:3000 \
-    AKASHA_EMAIL=eval@example.com \
-    AKASHA_PASSWORD=... \
-    uv run python -m akasha_benchmark.ingest --run-id run001
+历史记录不靠外键：``index_layer.connection_json`` 存了入库时那份配置的 redacted
+快照，所以「这一层当时跑在什么上」查得到，而不必让配置本身变成多行。
+
+密钥只存在 :class:`AkashaConfig` 里，绝不写进 manifest —— 入库与查询记录的是
+:meth:`AkashaConfig.redacted` 的结果。
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field, replace
+import sqlite3
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
-
-from .io_utils import load_json
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG_PATH = REPO_ROOT / "akasha.config.json"
-
-ENV_PREFIX = "AKASHA_"
 
 
 @dataclass(frozen=True)
@@ -32,20 +28,14 @@ class AkashaConfig:
     base_url: str = "http://localhost:3000"
     email: str = ""
     password: str = ""
-    # 自建部署的 Akasha 用 workspaceRepo.findFirst() 定位 workspace，
-    # 所以这一项只有 join 审计表时才必须填。
-    workspace_id: str = ""
     api_prefix: str = "/api"
     timeout_seconds: float = 180.0
     concurrency: int = 1
     request_interval_seconds: float = 0.5
     poll_interval_seconds: float = 10.0
     poll_timeout_seconds: float = 7200.0
-    # 仅审计归因需要，且是可选的：不填则跳过，其余指标照常算。
+    # 仅审计归因与血缘视图需要，且是可选的：不填则跳过，其余指标照常算。
     database_url: str = ""
-    space_slug_prefix: str = "bench"
-    # 配置文件里出现的未知键，隔离存放，不静默丢弃。
-    extra: dict[str, Any] = field(default_factory=dict)
 
     def api(self, path: str) -> str:
         """拼出完整 API URL，两侧的斜杠都容错。"""
@@ -55,8 +45,8 @@ class AkashaConfig:
         missing = [n for n in ("base_url", "email", "password") if not getattr(self, n)]
         if missing:
             raise ValueError(
-                f"missing Akasha credentials: {missing}. Set {', '.join(ENV_PREFIX + m.upper() for m in missing)} "
-                f"or create {DEFAULT_CONFIG_PATH.name}."
+                f"the Akasha connection is missing {missing}. "
+                "Fill it in the platform's settings view."
             )
 
     def redacted(self) -> dict[str, Any]:
@@ -66,15 +56,39 @@ class AkashaConfig:
             "api_prefix": self.api_prefix,
             "email": self.email,
             "password": "***" if self.password else "",
-            "workspace_id": self.workspace_id,
             "database_url": "***" if self.database_url else "",
             "timeout_seconds": self.timeout_seconds,
             "concurrency": self.concurrency,
             "request_interval_seconds": self.request_interval_seconds,
         }
 
+    def for_ui(self) -> dict[str, Any]:
+        """给配置层的视图：密钥字段只报「是否已设置」，不回传取值。
 
-# 环境变量是字符串，这两组需要按类型转换。
+        白名单式 —— 新增字段的默认行为是不输出，漏写一个不会泄露密钥。
+        取值与「是否设置」分开，这样 UI 能显示占位符而不必拿到明文。
+        """
+        return {
+            "base_url": self.base_url,
+            "email": self.email,
+            "api_prefix": self.api_prefix,
+            "timeout_seconds": self.timeout_seconds,
+            "concurrency": self.concurrency,
+            "request_interval_seconds": self.request_interval_seconds,
+            "poll_interval_seconds": self.poll_interval_seconds,
+            "poll_timeout_seconds": self.poll_timeout_seconds,
+            "password_set": bool(self.password),
+            "database_url_set": bool(self.database_url),
+        }
+
+
+# 这些字段是密钥，UI 传空串表示「不改」而不是「清空」。
+SECRET_FIELDS = frozenset({"password", "database_url"})
+
+# 连接行里属于 AkashaConfig 的列。那张表另有 id / 时间戳 / 上次测连接的结果,
+# 那些不进配置。
+FIELD_NAMES = frozenset(f.name for f in fields(AkashaConfig))
+
 _FLOATS = {
     "timeout_seconds",
     "request_interval_seconds",
@@ -84,38 +98,65 @@ _FLOATS = {
 _INTS = {"concurrency"}
 
 
-def load_config(path: Path | None = None) -> AkashaConfig:
-    config_path = path or DEFAULT_CONFIG_PATH
-    values: dict[str, Any] = {}
+def _cast(name: str, raw: Any) -> Any:
+    if name in _FLOATS:
+        return float(raw)
+    if name in _INTS:
+        return int(raw)
+    return str(raw)
 
-    if config_path.is_file():
-        raw = load_json(config_path)
-        if not isinstance(raw, dict):
-            raise ValueError(f"{config_path}: expected a JSON object")
-        known = {f for f in AkashaConfig.__dataclass_fields__ if f != "extra"}
-        values = {k: v for k, v in raw.items() if k in known}
-        unknown = {k: v for k, v in raw.items() if k not in known}
-        if unknown:
-            values["extra"] = unknown
-    elif path is not None:
-        # 显式指定了配置文件却不存在，属于用户输入错误，不该静默用默认值。
-        raise FileNotFoundError(f"config file not found: {config_path}")
 
-    config = AkashaConfig(**values)
+def from_row(row: Any) -> AkashaConfig:
+    """把 ``connection`` 那一行转成 :class:`AkashaConfig`。"""
+    return AkashaConfig(**{name: row[name] for name in FIELD_NAMES if name in row.keys()})
 
-    # 环境变量覆盖文件，这样 CI 可以只注入密钥而不落地配置文件。
-    overrides: dict[str, Any] = {}
-    for name in AkashaConfig.__dataclass_fields__:
-        if name == "extra":
+
+def load_config(connection: sqlite3.Connection | None = None) -> AkashaConfig:
+    """那一份连接配置。
+
+    ``connection`` 为 None 时返回默认值 —— 报错留给
+    :meth:`AkashaConfig.require_credentials`，那里的提示能指向缺的具体是哪一项。
+    """
+    if connection is None:
+        return AkashaConfig()
+
+    from .store import repo
+
+    row = repo.get_connection_row(connection)
+    return from_row(row) if row is not None else AkashaConfig()
+
+
+def load_config_from_db_path(db_path: Path | str | None = None) -> AkashaConfig:
+    """按库路径开一个只读连接读配置。"""
+    from .store.db import DEFAULT_DB_PATH, connect
+
+    target = Path(db_path) if db_path else DEFAULT_DB_PATH
+    if not target.is_file():
+        return AkashaConfig()
+    connection = connect(target, read_only=True)
+    try:
+        return load_config(connection)
+    finally:
+        connection.close()
+
+
+def sanitize_updates(payload: dict[str, Any]) -> dict[str, Any]:
+    """把配置表单提交的内容整成可写库的形状。
+
+    两条规则：只认已知字段（未知键丢掉，不让它们进表变成噪音）；
+    **密钥字段的空串表示「不改」**。后者是因为 UI 拿不到明文密钥，
+    表单里那一格提交上来必然是空的 —— 当成「清空」会让每次改 base_url
+    都顺手把密码删掉。
+    """
+    cleaned: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key not in FIELD_NAMES:
             continue
-        raw_value = os.environ.get(f"{ENV_PREFIX}{name.upper()}")
-        if raw_value is None:
+        if key in SECRET_FIELDS and (value is None or value == ""):
             continue
-        if name in _FLOATS:
-            overrides[name] = float(raw_value)
-        elif name in _INTS:
-            overrides[name] = int(raw_value)
-        else:
-            overrides[name] = raw_value
-
-    return replace(config, **overrides) if overrides else config
+        try:
+            cleaned[key] = _cast(key, value)
+        except (TypeError, ValueError) as exc:
+            kind = "number" if key in _FLOATS | _INTS else "string"
+            raise ValueError(f"{key}: expected a {kind}, got {value!r}") from exc
+    return cleaned

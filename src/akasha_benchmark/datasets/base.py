@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
 from .corpus import CorpusIndex
-from .models import Capability, CanonicalSample
+from .models import CanonicalSample, DataDependency
 
 
 class DatasetAdapter(ABC):
@@ -22,11 +22,12 @@ class DatasetAdapter(ABC):
     aliases: ClassVar[tuple[str, ...]] = ()
     qa_filename: ClassVar[str]
     corpus_filename: ClassVar[str]
-    capabilities: ClassVar[frozenset[Capability]]
+    # 这个数据集**拥有**哪些标注。指标声明需要什么，闸门做集合比对（§12.4）。
+    provides: ClassVar[frozenset[DataDependency]]
     version: ClassVar[str] = "1"
 
-    def supports(self, capability: Capability) -> bool:
-        return capability in self.capabilities
+    def has(self, dependency: DataDependency) -> bool:
+        return dependency in self.provides
 
     @abstractmethod
     def parse_row(
