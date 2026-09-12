@@ -23,11 +23,13 @@ export function Evaluate({
   onSelectLayer,
   onOpenReport,
   onOpenSettings,
+  onOpenTasks,
 }: {
   activeLayer: number | null
   onSelectLayer: (id: number) => void
   onOpenReport: (evalLayerId: number) => void
   onOpenSettings: () => void
+  onOpenTasks: () => void
 }) {
   const layers = useAsync(() => api.layers(), [])
   const definitions = useAsync(() => api.metricDefinitions(), [])
@@ -47,6 +49,8 @@ export function Evaluate({
         一轮评测 = 一批编译好的数据 + 一组勾选的指标 + 问答模型（+ judge 模型）。
         answer 模型改了不需要重编译，所以它在这一层而不是编译层。
       </p>
+
+      <QuickCheck onOpenTasks={onOpenTasks} />
 
       {all.length === 0 ? (
         <Empty>还没有编译层。先到「编译层」建一层并导入。</Empty>
@@ -578,6 +582,54 @@ function ResponseBody({
           没有审计记录。要它得跑一次「审计归因」，且需要只读 Postgres 连接。
         </p>
       )}
+    </div>
+  )
+}
+
+
+function QuickCheck({ onOpenTasks }: { onOpenTasks: () => void }) {
+  const datasets = useAsync(() => api.datasets(), [])
+  const [dataset, setDataset] = useState('')
+  const [samples, setSamples] = useState(3)
+  const start = useAction<{ id: number }>()
+  const available = (datasets.data ?? []).filter((d) =>
+    ['hotpotqa', '2wikimultihopqa', 'musique'].includes(d.name),
+  )
+  const selected = dataset || available[0]?.name || ''
+
+  return (
+    <div className="panel">
+      <h3 style={{ marginTop: 0 }}>小样本验证</h3>
+      <p className="small muted">
+        自动抽样、入库编译、查询并生成报告，检查响应结构、来源映射与断点续跑。
+        会调用模型；每篇 gold 配一篇干扰文档，最多导入 50 篇。独立创建的编译层与远端 Space 会保留，便于复查。
+      </p>
+      <div className="row">
+        <label className="field">
+          数据集
+          <select value={selected} onChange={(event) => setDataset(event.target.value)}>
+            {available.map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
+          </select>
+        </label>
+        <label className="field">
+          样本数（1–5）
+          <input type="number" min={1} max={5} value={samples}
+            onChange={(event) => setSamples(Number(event.target.value))} />
+        </label>
+        <button className="action primary"
+          disabled={start.busy || !!start.result || !selected || !Number.isInteger(samples) || samples < 1 || samples > 5}
+          onClick={() => start.run(() => api.startTask('verify', { dataset: selected, samples }))}>
+          {start.busy ? '启动中…' : '开始验证'}
+        </button>
+      </div>
+      {datasets.error && <Failed error={datasets.error} />}
+      {!datasets.loading && !datasets.error && available.length === 0 &&
+        <p className="muted">请先在归一化页面准备带 gold 文档的数据集。</p>}
+      {start.error && <div className="note bad">{start.error}</div>}
+      {start.result && <div className="note">
+        验证任务 #{start.result.id} 已启动。完成后可在报告层查看结果。
+        <button className="action small" onClick={onOpenTasks}>查看进度与检查结果</button>
+      </div>}
     </div>
   )
 }

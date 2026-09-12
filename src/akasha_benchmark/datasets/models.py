@@ -4,16 +4,9 @@
 
 * ``extra="forbid"`` 加 ``frozen=True`` —— 上游改字段名时在构造处直接报错，
   而不是静默归一成空值；校验通过后任何下游代码都改不动它。
-* **数据集声明自己「拥有」什么数据，不声明「支持」什么指标**（PLAN.md §12.4
-  决策 10）。narrativeqa 没有 gold 文档标注，所以它不声明
+* **数据集声明自己「拥有」什么数据，不声明「支持」什么指标**。narrativeqa 没有 gold 文档标注，所以它不声明
   :attr:`DataDependency.GOLD_DOCS`；对它请求依赖 gold 的指标会抛
   :class:`DependencyError`，而不是把一个假的 0.0 混进汇总。
-
-这个方向此前是反的：两个枚举成员的名字取的是指标名（``EVIDENCE_RECALL`` /
-``ANSWER_F1``），而**值**表达的已经是数据依赖。反转之后好处是具体的 ——
-judge 类指标（faithfulness、answer relevancy）不需要任何标注，对四组都成立，
-用指标名根本没法声明它们；而 narrativeqa 现在整组检索指标省略，
-judge 恰好能填上这个洞。
 
 新增指标不再需要碰这个枚举：指标在 ``metrics/registry.py`` 里声明自己的
 ``requires``，闸门做集合比对。
@@ -27,7 +20,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 # doc_id / sample_id 的口径收在这里一处，避免预处理与评测两侧各写一份而漂移。
-# PLAN.md 0.1 定稿的各数据集 corpus 行身份：
+# 各数据集 corpus 行身份：
 #   hotpotqa     用原生 "idx"（int）转 str
 #   2wiki        用 corpus 数组行号转 str
 #   musique      用 corpus 数组行号转 str，title 有歧义时用 (title, text) 消歧
@@ -64,7 +57,7 @@ class DataDependency(StrEnum):
     """
 
     # 有 gold 文档标注：检索、引用归因、多跳指标都依赖它。
-    # 2wiki 的 evidences 是关系三元组而不是 gold 文档，不算（§4）。
+    # 2wiki 的 evidences 是关系三元组而不是 gold 文档，不算。
     GOLD_DOCS = "gold_docs"
     # 有参考答案：EM / F1 依赖它。标的是「可以打分」，与报几个指标无关。
     REFERENCE_ANSWERS = "reference_answers"

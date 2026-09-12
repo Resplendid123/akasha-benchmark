@@ -12,10 +12,9 @@ def test_query_hash_carries_the_server_prefix():
     text = "who directed the film?"
     expected = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
     assert query_hash(text) == expected
-    assert query_hash(text).startswith("sha256:")
 
 
-def teststage_attribution_splits_the_three_losses():
+def test_stage_attribution_splits_the_three_losses():
     """候选 50 -> 排序后 20 -> 授权丢 5，三段损失要各自算清。"""
     metadata = {
         "candidateChunkCount": 50,

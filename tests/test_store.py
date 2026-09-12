@@ -1,9 +1,4 @@
-"""数据层：迁移、身份哈希、以及几条「错了不报错」的性质。
-
-这里的每个用例都对着一个具体的失效方式，不是为了覆盖率：库成了事实来源之后，
-PLAN.md §12.2 列的那四条完整性保证全部落在「错了不报错、只给出看着合理的
-假结果」的地带，所以判据必须是可执行的，不能只写在注释里。
-"""
+"""数据层：迁移、身份哈希、以及几条「错了不报错」的性质。"""
 
 from __future__ import annotations
 
@@ -119,11 +114,7 @@ def _subset(connection: sqlite3.Connection, layer_id: int, dataset: str, doc_ids
 
 
 def test_first_migration_does_not_leave_an_empty_backup(tmp_path: Path):
-    """空库上跑首个迁移不该留下 ``.pre-001``。
-
-    留下的话那是一份看起来像备份、实际什么都没有的文件 —— 备份最不该有的失效
-    方式就是「以为有」。
-    """
+    """空库上跑首个迁移不该留下 ``.pre-001``。"""
     path = tmp_path / "fresh.db"
     migrate(path, verbose=False)
     assert not list(tmp_path.glob("*.pre-*"))
@@ -145,7 +136,7 @@ def test_migration_refuses_to_run_when_an_applied_file_was_edited(tmp_path: Path
 
 
 def test_migration_runs_on_a_populated_database_and_backs_it_up(tmp_path: Path):
-    """§12.7：迁移必须能在**有数据**的库上跑，不能只在空库验证过。"""
+    """迁移必须能在**有数据**的库上跑，不能只在空库验证过。"""
     migrations = tmp_path / "m"
     migrations.mkdir()
     source = Path(__file__).resolve().parents[1] / "migrations" / "001_initial.sql"
@@ -171,7 +162,7 @@ def test_migration_runs_on_a_populated_database_and_backs_it_up(tmp_path: Path):
     connection.commit()
     connection.close()
 
-    # SQLite 不能删列改类型，所以复杂改动走「建新表 -> 拷数据 -> 换名」。
+    # 已有数据的库应用后续结构变更时需要备份。
     (migrations / "002_probe.sql").write_text(
         "ALTER TABLE index_layer ADD COLUMN probe TEXT;", encoding="utf-8"
     )
@@ -188,13 +179,7 @@ def test_migration_runs_on_a_populated_database_and_backs_it_up(tmp_path: Path):
 
 
 def test_renormalizing_does_not_empty_existing_layers(db: sqlite3.Connection):
-    """重跑归一化不能清空已有索引层的 QA 归属。
-
-    ``subset_sample.sample_id`` 对 ``sample`` 是 ON DELETE CASCADE，所以
-    「先 DELETE 全部再 INSERT」会把每个已有层的样本归属一刀切掉 —— 而且不报错：
-    ``subset_doc`` 与 ``page_map`` 都还在，层看起来完好，直到跑查询才报
-    「no subset samples」。实测踩过：run002 剩 400 篇语料、0 条样本。
-    """
+    """重跑归一化不能清空已有索引层的 QA 归属。"""
     _dataset(db, "hotpotqa", ["gold_docs"])
     rows = [
         {
@@ -235,10 +220,7 @@ def test_renormalizing_does_not_empty_existing_layers(db: sqlite3.Connection):
 
 
 def test_samples_dropped_upstream_do_cascade(db: sqlite3.Connection):
-    """反面：上游真的删掉一条样本时，cascade **应该**发生。
-
-    否则层里会留一条指向不存在样本的归属行，而那种孤儿行是查不出来的。
-    """
+    """反面：上游真的删掉一条样本时，cascade **应该**发生。"""
     _dataset(db, "hotpotqa", ["gold_docs"])
     rows = [
         {
@@ -280,12 +262,7 @@ def test_foreign_keys_are_enforced_on_every_connection(db: sqlite3.Connection):
 
 
 def test_pending_imports_keeps_colliding_doc_ids_of_two_datasets_apart(db: sqlite3.Connection):
-    """doc_id 跨数据集会撞，续跑必须按 (层, 数据集, doc_id) 三项判。
-
-    真实规模：run001 子集上 hotpotqa×2wiki 撞 15 个、hotpotqa×musique 17 个、
-    2wiki×musique 28 个，共 60 个。少了 dataset 这一维，后导入的组会盖掉前一组,
-    于是前一组这些 doc 被误判成已导入而永远缺篇。
-    """
+    """doc_id 跨数据集会撞，续跑必须按 (层, 数据集, doc_id) 三项判。"""
     _dataset(db, "hotpotqa", ["gold_docs"])
     _dataset(db, "musique", ["gold_docs"])
     layer_id = _layer(db)
@@ -382,11 +359,7 @@ def test_completed_sample_ids_includes_failures_so_reruns_do_not_burn_llm_calls(
 
 
 def test_retrying_failures_requires_deleting_them_first(db: sqlite3.Connection):
-    """§10.1 的失败行恢复策略：只能显式删除后重跑，删了多少行是可见的。
-
-    主键是 ``(query_layer_id, sample_id)``，所以「简单追加」会直接违反约束,
-    不可能悄悄造出重复 sample_id —— 那是原来基于追加 JSONL 的实现会出的问题。
-    """
+    """失败行恢复策略：只能显式删除后重跑，删了多少行是可见的。"""
     _dataset(db, "hotpotqa", ["gold_docs"])
     layer_id = _layer(db)
     qid = _query_layer(db, layer_id)
@@ -404,11 +377,7 @@ def test_retrying_failures_requires_deleting_them_first(db: sqlite3.Connection):
 
 
 def test_request_window_covers_all_accumulated_sessions(db: sqlite3.Connection):
-    """时间窗从行里现算，覆盖累积的全部会话。
-
-    §10.1 记的问题是：窗口存进 manifest，续跑时被本次统计覆盖，
-    审计于是漏掉早期请求。从 requested_at 的 min/max 现算就不会。
-    """
+    """时间窗从行里现算，覆盖累积的全部会话。"""
     _dataset(db, "hotpotqa", ["gold_docs"])
     layer_id = _layer(db)
     qid = _query_layer(db, layer_id)
@@ -491,11 +460,7 @@ def _swap(feature: str, model: str) -> dict[str, Any]:
 
 
 def test_index_layer_hash_changes_with_embedding_but_not_with_answer_model():
-    """索引层只吃实际文档集 + compiler + embedding。
-
-    answer 改了不必重编译（§12.3），所以它不进这个哈希 —— 否则换个 answer 模型
-    就会显示成「另一个索引层」，而那两批 chunk 其实完全一样。
-    """
+    """索引层只吃实际文档集 + compiler + embedding。"""
     base = identity.index_layer_hash(subset_hash="docs-abc", model_configs=MODEL_CONFIGS)
 
     assert identity.index_layer_hash(subset_hash="docs-abc", model_configs=_swap("answer", "x")) == base
@@ -512,12 +477,7 @@ def test_index_layer_hash_changes_with_embedding_but_not_with_answer_model():
 
 
 def test_subset_hash_is_content_addressed_over_the_actual_documents(db: sqlite3.Connection):
-    """``subset_hash`` 必须由实际文档算出，不是由抽样配置算出。
-
-    配置寻址有两条独立的说谎路径：抽样的随机源里有配置之外的东西，
-    或者产物是 reindex 导进来的历史数据。两种情况下 UI 都会照着哈希把两个
-    不同的子集并列做对照，而那种对照的结论是错的。
-    """
+    """``subset_hash`` 必须由实际文档算出，不是由抽样配置算出。"""
     _dataset(db, "hotpotqa", ["gold_docs"])
     left = _layer(db, "L1")
     right = _layer(db, "L2")
@@ -548,11 +508,7 @@ def test_query_layer_hash_ignores_concurrency_but_tracks_score_threshold():
 
 
 def test_judge_hash_never_depends_on_the_api_key():
-    """§12.5：judge 的身份只吃 base_url + model，绝不吃 api_key。
-
-    密钥进哈希等于让它随每个引用这个哈希的地方一起扩散，而它对
-    「两次运行是否可比」没有任何贡献。
-    """
+    """：judge 的身份只吃 base_url + model，绝不吃 api_key。"""
     left = identity.judge_hash(base_url="https://x/v1", model="m")
     right = identity.judge_hash(base_url="https://x/v1", model="m", params={})
     assert left == right
@@ -561,7 +517,7 @@ def test_judge_hash_never_depends_on_the_api_key():
 
 
 def test_embedding_drift_is_detectable(db: sqlite3.Connection):
-    """embedding 漂移必须可判定：它是唯一会静默失效的那个（§12.3）。"""
+    """embedding 漂移必须可判定：它是唯一会静默失效的那个。"""
     other = {
         "configs": [
             {**c, "model": "changed"} if c["feature"] == "embedding" else c
@@ -578,10 +534,7 @@ def test_embedding_drift_is_detectable(db: sqlite3.Connection):
 
 
 def test_reindex_never_lists_unrebuildable_tables_as_rebuildable():
-    """标注与 judge 判决没有上游可重算，一个粗心的 DELETE 就没了（§12.7）。
-
-    判据是两个集合不相交，写在代码里而不是注释里。
-    """
+    """标注与 judge 判决没有上游可重算，一个粗心的 DELETE 就没了（）。"""
     assert not REBUILDABLE_TABLES & set(PROTECTED_TABLES)
     for table in PROTECTED_TABLES:
         assert table not in REBUILDABLE_TABLES
@@ -627,3 +580,28 @@ def test_clearing_eval_results_keeps_judge_verdicts_and_annotations(db: sqlite3.
     assert repo.sample_metrics_of(db, eid, "hotpotqa:s1") == {}
     assert len(repo.judge_verdicts(db, eid, "faithfulness")) == 1
     assert len(repo.annotations_for(db, "sample", "hotpotqa:s1")) == 1
+
+
+@pytest.mark.parametrize("change", ["schema", "ledger"])
+def test_baseline_rejects_incomplete_or_changed_legacy_database(tmp_path: Path, change: str):
+    from akasha_benchmark.store.migrate import LEGACY_CHECKSUMS
+
+    path = tmp_path / "legacy.db"
+    migrate(path, verbose=False)
+    connection = connect(path)
+    connection.execute("DELETE FROM schema_migration")
+    connection.executemany(
+        "INSERT INTO schema_migration VALUES (?, '2026-01-01T00:00:00Z', ?)",
+        LEGACY_CHECKSUMS.items(),
+    )
+    if change == "schema":
+        connection.execute("ALTER TABLE connection ADD COLUMN unexpected TEXT")
+    else:
+        connection.execute("DELETE FROM schema_migration WHERE version='006_drop_slug_prefix'")
+    connection.commit()
+    before = list(connection.execute("SELECT * FROM schema_migration"))
+    with pytest.raises(RuntimeError, match="differs|first be upgraded"):
+        migrate(path, verbose=False)
+    assert list(connection.execute("SELECT * FROM schema_migration")) == before
+    assert not list(tmp_path.glob("*.pre-*"))
+    connection.close()

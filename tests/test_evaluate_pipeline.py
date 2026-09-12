@@ -1,11 +1,4 @@
-"""End-to-end evaluate on synthetic responses, driven off the database.
-
-Ingest and query need a live Akasha, so this fabricates their outputs — a page_map
-and response rows shaped like a real ``/api/llm-wiki/query`` body — writes them into
-the store, and drives the evaluator over them. That covers the plumbing they feed
-into: page_id -> doc_id translation, the question-text cross-check, the answerMode
-split, dependency-driven omission, and report rendering.
-"""
+"""End-to-end evaluate on synthetic responses, driven off the database."""
 
 from __future__ import annotations
 
@@ -17,7 +10,6 @@ import pytest
 from akasha_benchmark.evaluate import (
     ensure_eval_layer,
     evaluate_dataset,
-    export_report,
     reports_dir,
     run,
 )
@@ -365,10 +357,7 @@ def test_stratification_splits_by_question_type(workspace):
 
 
 def test_question_text_mismatch_is_fatal(workspace):
-    """ID 对得上但 question 变了，说明子集被原地重建过，必须报错。
-
-    外键保证了样本归属，抓不到这一种 —— 所以文本比对不能因为有外键就省掉。
-    """
+    """ID 对得上但 question 变了，说明子集被原地重建过，必须报错。"""
     connection = workspace.connection
     eval_id, query_id, index_id = _ids(connection)
     connection.execute(
@@ -382,11 +371,7 @@ def test_question_text_mismatch_is_fatal(workspace):
 
 
 def test_duplicate_sample_id_is_impossible_by_construction(workspace):
-    """一个 sample_id 只能有一行 —— 主键保证，不靠运行时检查。
-
-    原来是追加 JSONL，重复行只能靠 evaluate 里的 seen 集合拦；现在
-    ``(query_layer_id, sample_id)`` 是主键，重复插入直接违反约束。
-    """
+    """一个 sample_id 只能有一行 —— 主键保证，不靠运行时检查。"""
     connection = workspace.connection
     query_layer = repo.query_layer_by_label(connection, QUERY_LAYER)
     with pytest.raises(sqlite3.IntegrityError):
@@ -443,13 +428,13 @@ def test_run_writes_metrics_to_the_database_and_exports_on_request(workspace):
 
     report = (out / "report.md").read_text(encoding="utf-8")
     # 那条架构说明必须出现在每份报告里，不能只写在计划文档里。
-    assert "无效的" in report
+    assert "需对齐语料" in report
     assert "仅 knowledge" in report
-    # EM 报出来了，但「为什么预期是 0」必须同时在报告里 ——
+    # EM 报出来了，但「如何解读 EM」必须同时在报告里 ——
     # 否则熟悉 hotpotqa 的读者看到 0.0000 会判断系统坏了。
     assert "answer EM：" in report
-    assert "Exact Match 预期就是 0.0000" in report
-    assert "答案**形状**的探针" in report
+    assert "Exact Match 要求归一化后的答案整串相等" in report
+    assert "但并非必然为零" in report
 
     metrics = load_json(out / "metrics.json")
     assert metrics["datasets"][0]["dataset"] == DATASET
@@ -469,12 +454,7 @@ def test_rerunning_evaluate_does_not_double_count(workspace):
 
 
 def test_only_selected_metrics_reach_the_database(workspace):
-    """勾了的才写进 ``sample_metric`` —— 报告页的列以勾选为准。
-
-    过滤在**写库之前**做而不是计算之前：逐样本的检索族指标是一次算出来的一组,
-    拆开单算不会更快。而 ``detail`` 保留全部明细 —— 那是归因要读的原始链路，
-    与「这一轮报哪些指标」是两件事。
-    """
+    """勾了的才写进 ``sample_metric`` —— 报告页的列以勾选为准。"""
     connection = workspace.connection
     assert (
         run(QUERY_LAYER, [DATASET], workspace.db_path, (2, 5), metrics=["recall", "f1"]) == 0
@@ -501,11 +481,7 @@ def test_only_selected_metrics_reach_the_database(workspace):
 
 
 def test_deselected_metrics_are_reported_separately_from_undefined_ones(workspace):
-    """两种「没有值」分开陈述。
-
-    缺依赖是「这个数据集永远算不了」，没勾选是「这一轮没要」。混成一句话的话,
-    读者会把后者当成前者，进而以为其他组也缺 gold 标注。
-    """
+    """两种「没有值」分开陈述。"""
     connection = workspace.connection
     assert run(QUERY_LAYER, [DATASET], workspace.db_path, (2,), metrics=["f1"]) == 0
     eval_id = int(repo.eval_layer_by_label(connection, f"{QUERY_LAYER}-eval")["id"])
@@ -534,11 +510,7 @@ def test_selecting_nothing_still_means_everything(workspace):
 
 
 def test_report_tables_have_matching_column_counts(workspace):
-    """每张表的表头、分隔行与数据行列数必须一致。
-
-    删掉某一列时只改表头不改数据行（或反之）不会报错，只会让 Markdown 表格错行，
-    而错行的表格照样是「一份报告」—— 看起来正常，读出来的数却对错了列。
-    """
+    """每张表的表头、分隔行与数据行列数必须一致。"""
     assert (
         run(QUERY_LAYER, [DATASET], workspace.db_path, (2, 5), export=True,
             data_dir=workspace.data_dir)

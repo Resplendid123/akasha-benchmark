@@ -1,14 +1,4 @@
-"""SQLite 连接与短事务。
-
-库是事实来源（PLAN.md §12 决策 2）。选 SQLite 而不是复用 Akasha 那个 Postgres,
-主要理由是 ``normalize`` / ``subset`` / ``evaluate`` 必须继续完全不依赖 Akasha
-在线（§12.2），而这三个阶段现在读写的就是这个库。
-
-方向是单向的：**SQLite 可写权威，Akasha 的 PG 只读外来**（决策 3）。
-
-一条贯穿全程的约束：**写事务必须短、逐批提交**。否则 Web 端在 ingest 的
-15 小时里读不到进度，决策 1 要的观测就废了。:func:`batched` 就是为这件事存在的。
-"""
+"""SQLite 连接与短事务。WAL 支持平台并发读取进度，批量写入分批提交。"""
 
 from __future__ import annotations
 
@@ -16,7 +6,6 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = REPO_ROOT / "akasha_bench.db"
@@ -49,19 +38,14 @@ def connect(path: Path | None = None, *, read_only: bool = False) -> sqlite3.Con
     connection.execute("PRAGMA foreign_keys = ON")
     if not read_only:
         connection.execute("PRAGMA journal_mode = WAL")
-        # NORMAL 而不是 FULL：这些产物都能从上游重算，拿一次断电风险换写入吞吐
-        # 是值得的。annotation 与 judge_verdict 不能重算，但它们是交互式写入的
-        # 单行，不在批量路径上。
+        # NORMAL 模式可能在断电时丢失最近提交的事务，包括人工标注。
         connection.execute("PRAGMA synchronous = NORMAL")
     return connection
 
 
 @contextmanager
 def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """一个显式事务。异常时回滚。
-
-    Python 的 sqlite3 在 DDL 前会隐式提交，所以迁移不要走这里。
-    """
+    """成功时提交，异常时回滚当前事务。"""
     try:
         yield connection
     except BaseException:
@@ -104,16 +88,3 @@ def batched(connection: sqlite3.Connection, size: int = DEFAULT_BATCH) -> Iterat
         connection.rollback()
         raise
     batcher.flush()
-
-
-def query_all(connection: sqlite3.Connection, sql: str, params: Any = ()) -> list[sqlite3.Row]:
-    return connection.execute(sql, params).fetchall()
-
-
-def query_one(connection: sqlite3.Connection, sql: str, params: Any = ()) -> sqlite3.Row | None:
-    return connection.execute(sql, params).fetchone()
-
-
-def scalar(connection: sqlite3.Connection, sql: str, params: Any = ()) -> Any:
-    row = connection.execute(sql, params).fetchone()
-    return row[0] if row is not None else None

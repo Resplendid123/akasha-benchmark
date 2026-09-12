@@ -1,15 +1,7 @@
-"""数据层：SQLite 是评测端的事实来源（PLAN.md §12 决策 2、3）。
-
-方向单向：**SQLite 可写权威，Akasha 的 Postgres 只读外来**。
-
-    from akasha_benchmark.store import connect, repo
-
-    with connect() as connection:
-        layers = repo.list_index_layers(connection)
-"""
+"""评测数据层：SQLite 存储实验事实，Akasha PostgreSQL 仅用于只读诊断。"""
 
 from . import identity, repo
-from .db import DEFAULT_DB_PATH, Batcher, batched, connect, query_all, query_one, scalar, transaction
+from .db import DEFAULT_DB_PATH, Batcher, batched, connect, transaction
 
 # migrate 与 reindex 刻意不在这里导入：两者都是 ``python -m`` 的入口，
 # 在包 __init__ 里先导入一遍会让 runpy 报「found in sys.modules after import of
@@ -21,9 +13,6 @@ __all__ = [
     "batched",
     "connect",
     "identity",
-    "query_all",
-    "query_one",
     "repo",
-    "scalar",
     "transaction",
 ]

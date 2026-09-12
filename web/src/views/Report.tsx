@@ -91,12 +91,11 @@ function ReportBody({
     <>
       <div className="note plain">
         <strong>这些数字该怎么读。</strong> Akasha 的召回跑在<strong>编译产物</strong>上而不是
-        原文，所以 Recall@k 被系统性压低，且这种压低不是调参能补回来的 ——
-        把它直接与公开 baseline 对比是无效的，唯一有意义的对照是原文基线。
+        原文。编译可能改写或遗漏信息；与公开 baseline 比较前需对齐语料、样本、
+        检索单位和答案格式。原文基线可帮助隔离编译影响。
         <div className="small" style={{ marginTop: 6 }}>
-          Exact Match <strong>预期就是 0</strong>：EM 要求整段答案与参考答案完全相等，
-          而这套系统用解释性散文作答、参考答案是短跨度。把 EM 当答案
-          <em>形态</em>的探针读，不当质量指标读。
+          Exact Match 要求归一化后的整段答案与参考答案相等。解释性长答案通常得分较低，
+          但并非必然为零；请结合 F1、引用证据和人工抽查解读。
         </div>
       </div>
 

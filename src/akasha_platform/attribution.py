@@ -143,7 +143,7 @@ def classify(sample: dict[str, Any], lineage: dict[str, Any] | None) -> dict[str
         return {"root_cause": CAUSE_GRAPH_EDGE_MISSING, "labels": labels, "evidence": evidence}
 
     # 检索与引用都没问题，答案却不对：先怀疑标注与评分口径。
-    # 注意 EM 在这套架构上预期恒为 0，所以只看 F1。
+    # 规则以 F1 判断答案词面重叠，避免 EM 对长答案的整串匹配限制。
     f1 = metrics.get("f1")
     if coverage == 1.0 and f1 is not None and f1 < 0.3:
         labels.append("low-f1")
@@ -269,7 +269,7 @@ def analyze(
         prompt_version=prompt_version,
     )
     # 同时进 annotation：judge-human 一致率靠 author_kind 分组，
-    # 归因结论不进那张表的话就没法与人工判断比对（§12.5）。
+    # 归因结论不进那张表的话就没法与人工判断比对。
     repo.add_annotation(
         connection,
         level="sample",

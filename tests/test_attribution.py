@@ -1,9 +1,4 @@
-"""归因：规则分类的优先级，以及模型不可用时的降级。
-
-**最要紧的一条是优先级**：``generation_fallback`` 必须最先判。run001 上四条
-``recall@5 < 1.0`` 里三条是 ``answerMode: general`` —— 生成端无条件清空了
-``retrievedSources``，那 0 分不是检索失败。判错顺序会把 1 条检索问题读成 4 条。
-"""
+"""归因：规则分类的优先级，以及模型不可用时的降级。"""
 
 from __future__ import annotations
 
@@ -44,11 +39,7 @@ def _lineage(lost: list[str]):
 
 @pytest.mark.parametrize("mode", ["general", "no_match"])
 def test_generation_fallback_wins_over_every_retrieval_signal(mode: str):
-    """生成端回落必须最先判，哪怕检索信号看起来也很糟。
-
-    这两种模式无条件返回空 retrievedSources，所以它们的检索得分按定义为 0。
-    先判检索的话，这条会被归成 retrieval_miss —— 然后你会去调一堆调不动的参数。
-    """
+    """生成端回落必须最先判，哪怕检索信号看起来也很糟。"""
     ruling = attribution.classify(
         _sample(answer_mode=mode, metrics={"hit@5": 0.0, "recall@5": 0.0, "f1": 0.0}),
         _lineage(["grammy"]),
@@ -58,11 +49,7 @@ def test_generation_fallback_wins_over_every_retrieval_signal(mode: str):
 
 
 def test_compiled_away_wins_over_retrieval_miss():
-    """编译丢词优先于「没召回到」：后者是前者的表现，不是另一个原因。
-
-    这个区别决定了处置：compiled_away 调参救不了（词已经不在索引文本里），
-    retrieval_miss 可以调。
-    """
+    """编译丢词优先于「没召回到」：后者是前者的表现，不是另一个原因。"""
     ruling = attribution.classify(
         _sample(metrics={"hit@5": 0.0, "recall@5": 0.0}), _lineage(["grammy", "emmy"])
     )
@@ -105,11 +92,7 @@ def test_graph_edge_missing_when_coverage_is_partial_without_graph_help():
 
 
 def test_gold_suspect_when_retrieval_is_perfect_but_the_answer_scores_low():
-    """检索与引用都对，答案仍判错：先怀疑参考答案或评分口径，而不是系统。
-
-    这一条存在的理由是 F1 在这套架构上被解释性 token 稀释 —— 低 F1 不一定
-    意味着答错了。
-    """
+    """检索与引用都对，答案仍判错：先怀疑参考答案或评分口径，而不是系统。"""
     ruling = attribution.classify(
         _sample(metrics={"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}), _lineage([])
     )
@@ -117,11 +100,7 @@ def test_gold_suspect_when_retrieval_is_perfect_but_the_answer_scores_low():
 
 
 def test_hit_missing_is_not_treated_as_zero():
-    """没有 ``hit@k`` 这一项（比如 narrativeqa 无 gold）不等于 hit=0。
-
-    当成 0 会把整组无 gold 的数据集全判成 retrieval_miss，而那些组的检索
-    指标本来就是省略的。
-    """
+    """没有 ``hit@k`` 这一项（比如 narrativeqa 无 gold）不等于 hit=0。"""
     ruling = attribution.classify(
         _sample(metrics={"f1": 0.6}, gold_count=0), _lineage([])
     )
@@ -197,10 +176,7 @@ def seeded(tmp_path: Path):
 
 
 def test_rule_only_analysis_is_a_valid_result(seeded):
-    """没配分析模型时只写规则结论 —— 那仍然是一条有效归因，不是失败。
-
-    这一点决定了归因层在零配置下也能用：规则判据全部来自已有指标与链路。
-    """
+    """没配分析模型时只写规则结论 —— 那仍然是一条有效归因，不是失败。"""
     connection, eval_id = seeded
     result = attribution.analyze(
         connection, eval_id, _sample(answer_mode="general"), None, use_model=False
@@ -215,10 +191,7 @@ def test_rule_only_analysis_is_a_valid_result(seeded):
 
 
 def test_a_missing_analysis_provider_degrades_instead_of_failing(seeded):
-    """要模型但没配好：规则结论照样写，失败原因记进证据。
-
-    丢掉规则结论等于「因为叙述失败而放弃了分类」，而分类是这里真正有用的部分。
-    """
+    """要模型但没配好：规则结论照样写，失败原因记进证据。"""
     connection, eval_id = seeded
     result = attribution.analyze(connection, eval_id, _sample(), None, use_model=True)
     assert result["rule_based"] is True
@@ -229,7 +202,7 @@ def test_a_missing_analysis_provider_degrades_instead_of_failing(seeded):
 
 
 def test_analysis_also_lands_in_annotations_for_agreement(seeded):
-    """归因结论要进 annotation，否则 judge-human 一致率算不了（§12.5）。"""
+    """归因结论要进 annotation，否则 judge-human 一致率算不了。"""
     connection, eval_id = seeded
     attribution.analyze(connection, eval_id, _sample(answer_mode="general"), None, use_model=False)
 

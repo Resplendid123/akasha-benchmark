@@ -1,23 +1,4 @@
-"""血缘：从语料文档一路走到编译产物、chunk、图边与原文。**只读 Postgres。**
-
-这条链路是 PLAN.md §12.9 在 run001 的真实库上逐跳走通的，表名列名均已核对 ——
-不是照 Akasha 文档抄的。两处与先前假设不符，已在那里纠正：
-
-* ``knowledge_chunks`` 的外键是 ``knowledge_page_id``，**不是** ``source_page_id``
-* ``knowledge_page_sources`` **直接带** ``source_page_id``，不必经
-  ``knowledge_sources`` 中转
-
-```
-pages.id                      ← page_map 里的 page_id（导入接口返回）
-  ↓ knowledge_page_sources.source_page_id
-knowledge_pages.id            ← 编译产出的 artifact，不是原始 page
-  ↓ knowledge_chunks.knowledge_page_id          参与召回的文本
-  ↓ knowledge_graph_edges.from/to_knowledge_page_id   图边
-knowledge_source_chunks.source_page_id          原文，不参与召回
-```
-
-**方向单向**：这个库我们从不写。所有连接都以只读事务打开。
-"""
+"""通过只读 PostgreSQL 查询追踪原文、编译产物、检索块和图关系。"""
 
 from __future__ import annotations
 
@@ -69,7 +50,7 @@ ORDER BY e.relation
 """
 
 # snippets[].id 是裸 UUID 不带类型前缀，且 snippet 里没有 kind，所以光看响应
-# 分不出这条来自原文块还是编译产物。用 knowledge_chunks.id 反查补上（§12.10）。
+# 分不出这条来自原文块还是编译产物。用 knowledge_chunks.id 反查补上。
 CHUNK_KINDS = """
 SELECT kc.id, kc.chunk_role, kc.retrieval_channel, kp.page_type, kp.title
 FROM knowledge_chunks kc
@@ -142,7 +123,7 @@ class LineageReader:
     def lineage(self, page_id: str, *, chunk_chars: int = 2000) -> dict[str, Any]:
         """一条完整链路：artifact -> chunk -> 图边 -> 原文。
 
-        这是「必须一屏走完」的那个视图（§12.9）—— 跨五张表六跳，
+        这是「必须一屏走完」的那个视图—— 跨五张表六跳，
         否则归因就得像那次一样手写 SQL。
         """
         page_id = self._check_page_id(page_id)
@@ -173,7 +154,7 @@ class LineageReader:
             "artifacts": artifacts,
             # 参与召回的文本。
             "chunks": chunks,
-            # 原文，不参与召回 —— 这个区别是 §0.3 那条架构论断的全部依据。
+            # 原文块，仅用于证据追溯。
             "source_chunks": source_chunks,
             "edges": edges,
             "counts": {

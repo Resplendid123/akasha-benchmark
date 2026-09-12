@@ -1,10 +1,10 @@
 """OpenAI 兼容的 judge 客户端。**平台第一次持有 LLM 密钥。**
 
-``apiKeySet`` 只是布尔量，Akasha 不回传 key（§12.8），所以即便 judge 用同一个
+``apiKeySet`` 只是布尔量，Akasha 不回传 key，所以即便 judge 用同一个
 端点同一个模型，平台也得自己配一份凭据。
 
 密钥存库（``model_provider.api_key``），在配置层里填。**不进哈希、不进日志** ——
-后两条仍然是硬规则（§12.5）：``judge_hash`` 只吃 base_url + model，
+后两条仍然是硬规则：``judge_hash`` 只吃 base_url + model，
 ``redacted()`` 白名单式只报是否有值。
 
 重试直接复用 :mod:`..akasha_client` 那套语义（429/502/503/504、5 次指数退避带
@@ -29,7 +29,7 @@ from ..akasha_client import (
     RETRYABLE_STATUSES,
 )
 
-# judge 失败分四类，处置完全不同（§12.5）：
+# judge 失败分四类，处置完全不同：
 #   rate_limit   —— 退避后重试，或降并发；不是质量问题
 #   timeout      —— 同上，但可能是 prompt 太长
 #   parse_error  —— 模型没按 schema 输出，要改 prompt 或加 few-shot
@@ -53,7 +53,7 @@ class JudgeProvider:
     有两个来源时，「填了但没生效」查不出来。
 
     Akasha 的 ``/model-configs`` 只回传 ``apiKeySet`` 布尔量、从不回传 key
-    本身（§12.8），所以即便 judge 用同一个端点同一个模型，平台也得自己配一份。
+    本身，所以即便 judge 用同一个端点同一个模型，平台也得自己配一份。
     """
 
     base_url: str
@@ -76,7 +76,7 @@ class JudgeProvider:
     def redacted(self) -> dict[str, Any]:
         """可以安全落库/记日志的视图。
 
-        **白名单式**，不是黑名单（§12.5）：黑名单漏写一个字段就泄露密钥，
+        **白名单式**，不是黑名单：黑名单漏写一个字段就泄露密钥，
         而这里新增字段的默认行为是「不输出」。``api_key`` 只报是否有值。
         """
         return {

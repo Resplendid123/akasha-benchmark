@@ -1,18 +1,4 @@
-"""三层的 ``config_hash``：内容寻址的那一半身份。
-
-自增 ID 负责「在 UI 里能念出来」，这里的哈希负责「两个层是不是同一个配置」。
-两者都要 —— 只有 ID 则复用只能靠人记，只有哈希则界面里全是十六进制。
-
-**哈希吃什么、不吃什么，是这个模块唯一重要的事：**
-
-* 吃：决定结果的配置。seed、qa_limit、negatives_ratio、compiler/embedding 模型、
-  scoreThreshold、k、指标集、judge 的 base_url + model。
-* 不吃：时间戳、label、并发度与请求间隔（只影响快慢不影响结果）、
-  以及**任何密钥**。
-
-api_key 进哈希会把密钥的存在与取值泄进一个到处传播的短字符串里，
-而它对「两次运行是否可比」没有任何贡献。§12.5 明确写了这条。
-"""
+"""实验配置的稳定哈希，排除标签、时间戳、速率和密钥。"""
 
 from __future__ import annotations
 
@@ -80,7 +66,7 @@ def index_layer_hash(*, subset_hash: str, model_configs: Any) -> str:
     并列做对照。
 
     只吃 compiler 与 embedding 两项模型配置，因为只有它们改了才必须重编译
-    （§12.3）。answer 模型改了不用重编译，所以它属于查询层。
+    。answer 模型改了不用重编译，所以它属于查询层。
 
     这个值只有在入库时才算得出来（那时才有模型配置），所以库里的
     ``index_layer.config_hash`` 在入库前是 NULL。
@@ -146,7 +132,7 @@ def judge_hash(*, base_url: str, model: str, params: dict[str, Any] | None = Non
 def embedding_matches(left: Any, right: Any) -> bool:
     """两份模型配置的 embedding 是否一致。
 
-    这是唯一必须**拒绝执行**的漂移（§12.3）：换模型后旧 chunk 的
+    这是唯一必须**拒绝执行**的漂移：换模型后旧 chunk 的
     ``embedding_profile`` 对不上，那些 chunk 永远召回不到，而评测会照常算出
     一份「recall 低、拒答率高」的报告 —— 看起来像配置差，实际是索引与
     embedding 错配。这种失败不会报错，只会给出一个看着合理的坏结果。

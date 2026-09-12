@@ -8,13 +8,13 @@ uv run python -m akasha_benchmark.normalize                      # 四组全做
 uv run python -m akasha_benchmark.normalize --dataset hotpotqa   # 只做一组
 ```
 
-产物落在 `data/normalized/{dataset}/`，每组三个文件：
+归一化默认写入数据库。加 `--export` 才会在 `data/normalized/{dataset}/` 导出三个文件：
 
 | 文件 | 内容 |
 | --- | --- |
 | `samples.jsonl` | 每行一个 `CanonicalSample`，即一道题 |
 | `corpus.jsonl` | 每行一个 `CorpusDoc`，即一篇待检索文档 |
-| `manifest.json` | 源文件 sha256、条数、身份规则、capability、实测分布 |
+| `manifest.json` | 源文件 sha256、条数、身份规则、provides、实测分布 |
 
 体积实测：
 
@@ -210,62 +210,28 @@ manifest 的 `corpus_dedup_stats` 记着去重前后的数，`dedup_applied` 恒
 `<html><head>` 的整页，含导航栏和 meta 标签，块里只有正文。体积因此对不上，
 
 corpus 的 `text` 只用于
-`(title, text)` 身份去重和 `to_markdown()` 渲染导入，没有拿它跟别的文本做字符串比对；narrativeqa 只算答案 F1，比的是模型答案和 QA 文件里的参考答案，两边都不碰 corpus。
+`(title, text)` 身份去重和 `to_markdown()` 渲染导入，没有拿它跟别的文本做字符串比对；narrativeqa 的确定性答案指标包括 EM 和 F1，比的是模型答案和 QA 文件里的参考答案，两边都不碰 corpus。
 
 
 ## manifest.json
 
-一份 2wiki 的实际内容：
-
-```json
-{
-  "stage": "normalize",
-  "dataset": "2wikimultihopqa",
-  "adapter": "TwoWikiMultihopQAAdapter",
-  "adapter_version": "1",
-  "generated_at": "2026-09-08T11:13:21Z",
-  "capabilities": ["answer_f1", "evidence_recall"],
-  "identity_rules": { "sample_id": "native__id", "corpus_doc_id": "row_index" },
-  "sources": {
-    "qa":     { "path": "dataset/2wikimultihopqa.json",        "sha256": "895cba…", "rows": 1000 },
-    "corpus": { "path": "dataset/2wikimultihopqa_corpus.json", "sha256": "9d6e35…", "rows": 6119 }
-  },
-  "outputs": {
-    "samples": { "rows": 1000, "sha256": "49eb82…" },
-    "corpus":  { "rows": 6119, "sha256": "321c4e…" }
-  },
-  "corpus_dedup_stats": { "rows": 6119, "unique_titles": 6119, "unique_title_text_pairs": 6119, "rows_in_duplicate_title_groups": 0 },
-  "dedup_applied": false,
-  "gold_count_distribution": { "2": 765, "4": 235 },
-  "unique_question_texts": 1000
-}
-```
+导出清单记录数据来源与标注能力，字段由 `normalize.export_dataset` 生成：
 
 | 字段 | 作用 |
 | --- | --- |
-| `stage` | 产出阶段，恒为 `normalize` |
-| `adapter` / `adapter_version` | 哪个适配器、什么版本生成的。适配器逻辑改了要升版本 |
-| `generated_at` | UTC 时刻 |
-| `capabilities` | 该数据集**支持**的指标，见下 |
-| `identity_rules` | 本次实际用的身份规则，与 `CORPUS_ID_RULES` / `SAMPLE_ID_RULES` 一致 |
-| `sources` | 输入文件的路径、sha256、行数。换了数据版本 sha256 就变。路径相对仓库根、分隔符恒为 `/`，换机器换平台都不变 |
-| `outputs` | 产出文件的行数和 sha256。抽子集读之前可以比对 |
-| `corpus_dedup_stats` / `dedup_applied` | 去重统计，只报告不执行 |
-| `gold_count_distribution` | **去重后**的 gold 篇数分布 |
+| `stage` / `dataset` / `note` | 阶段、数据集和导出说明 |
+| `adapter` / `adapter_version` | 适配器及版本 |
+| `exported_at` | 导出时刻，UTC |
+| `provides` | 已有标注：`reference_answers`，以及有 gold 时的 `gold_docs` |
+| `identity_rules` | 样本和语料 ID 规则 |
+| `sources` | QA、corpus 的源路径、sha256 和行数 |
+| `corpus_dedup_stats` / `dedup_applied` | 去重统计；不执行去重 |
+| `gold_count_distribution` | 去重后的 gold 篇数分布 |
 | `unique_question_texts` | 不重复的问题文本数 |
 
-### capability 是声明的，不是推断的
-
-| 数据集 | capabilities |
-| --- | --- |
-| hotpotqa | `answer_f1`, `evidence_recall` |
-| 2wikimultihopqa | `answer_f1`, `evidence_recall` |
-| musique | `answer_f1`, `evidence_recall` |
-| narrativeqa | `answer_f1` |
-
-narrativeqa **故意不声明** `evidence_recall`：它没有 gold 文档，检索指标在它上面
-是无定义的。对它请求检索指标会抛 `CapabilityError`，而不是返回 0.0 ——
-一个假的零会被平均进汇总。
+前三组数据提供参考答案和 gold 文档；narrativeqa 只提供参考答案。
+指标在 registry 中声明 `requires`，评测对缺少依赖的数据集省略相应指标，
+并在 `omitted_metrics` 中记录原因。底层显式依赖校验失败时抛 `DependencyError`。
 
 ### unique_question_texts 为什么要记
 
@@ -280,12 +246,12 @@ uv run python scripts/validate_datasets.py       # 逐行过全量
 ```
 
 校验是**逐行过全量数据**的，不是只看 row 0：每行能否通过适配器、
-`dataset_sample_id` 有无缺失或重复、gold 条数分布、声明了 `evidence_recall`
+`dataset_sample_id` 有无缺失或重复、gold 条数分布、声明了 `gold_docs`
 却抽不出 gold 的行、gold doc_id 是否都在 corpus 里、重复 question 计数、
 corpus `(title, text)` 唯一性。四组应全部通过，gold 解析率 100%，无重复 ID。
 
 它**刻意不复用** `normalize.py` 的结果，而是从原始文件重新推导一遍再逐行比对，
-并重算 manifest 里的 sha256 与磁盘对账。这样写入侧的 bug 会表现为「对不上」，
+并重算源文件 sha256 与数据库记录对账。这样写入侧的 bug 会表现为「对不上」，
 而不是被自己的输出确认为正确。
 
 写文件走「临时文件 + `os.replace`」原子替换，中断不会留下截断的 jsonl。

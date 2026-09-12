@@ -1,9 +1,4 @@
-"""judge：失败分类、该条排除、失败率闸门、以及密钥绝不外泄。
-
-这些用例对着的失效方式很具体：把限流记成 0 分会让一次 429 风暴看起来像
-「模型突然变笨」，而把 api_key 掺进 provider 哈希会让密钥随那个短字符串
-到处扩散。两者都不会报错。
-"""
+"""judge：失败分类、该条排除、失败率闸门、以及密钥绝不外泄。"""
 
 from __future__ import annotations
 
@@ -56,11 +51,7 @@ def _chat(content: str, **choice: object) -> httpx.Response:
 
 
 def test_missing_api_key_is_a_clear_error():
-    """Akasha 的 apiKeySet 只是布尔量，不回传 key，所以平台必须自己配一份。
-
-    密钥只有一条来路（库里的 model_provider.api_key）—— 环境变量那条旁路
-    删掉了，因为同一份密钥有两个来源时「填了但没生效」查不出来。
-    """
+    """Akasha 的 apiKeySet 只是布尔量，不回传 key，所以平台必须自己配一份。"""
     with pytest.raises(JudgeConfigError, match="no api key configured"):
         JudgeProvider(base_url="https://judge.test/v1", model="m1").resolve_key()
 
@@ -70,7 +61,7 @@ def test_a_stored_key_is_used_as_is():
 
 
 def test_redacted_is_a_whitelist_and_never_leaks_the_key():
-    """§12.5：``redacted()`` 要白名单式。黑名单漏写一个字段就泄露密钥。"""
+    """``redacted()`` 要白名单式。黑名单漏写一个字段就泄露密钥。"""
     view = PROVIDER.redacted()
     assert view["api_key_set"] is True
     assert "sk-secret-value" not in json.dumps(view)
@@ -196,10 +187,7 @@ def test_score_is_the_supported_share():
 
 
 def test_an_answer_with_no_claims_scores_none_not_zero_or_one():
-    """拒答既不忠实也不不忠实 —— 这个指标在它上面无定义。
-
-    记 0 会把「没找到资料」算成「胡说」，记 1 会算成「完美」，两者都是错的。
-    """
+    """拒答既不忠实也不不忠实 —— 这个指标在它上面无定义。"""
     assert faithfulness.score_claims([]) is None
 
 
@@ -288,10 +276,7 @@ def _eval_layer(connection: sqlite3.Connection) -> int:
 
 
 def test_failures_are_excluded_from_the_mean_rather_than_scored_zero(db: sqlite3.Connection):
-    """决策 13：失败该条排除，另叠失败率闸门。
-
-    两条 0.8 加一条限流失败，均值必须是 0.8（分母 2），不是 0.533（分母 3）。
-    """
+    """决策 13：失败该条排除，另叠失败率闸门。"""
     eval_id = _eval_layer(db)
     for sample_id, score, failure in (
         ("s1", 0.8, None),
@@ -352,7 +337,7 @@ def test_resume_reruns_failures_but_not_successes(db: sqlite3.Connection):
 
 
 def test_faithfulness_requires_no_annotations_so_it_covers_narrativeqa():
-    """§12.4 的具体收获：judge 能填上 narrativeqa 那个洞。"""
+    """具体收获：judge 能填上 narrativeqa 那个洞。"""
     from akasha_benchmark.datasets import DataDependency, get_adapter
     from akasha_benchmark.metrics import registry
 

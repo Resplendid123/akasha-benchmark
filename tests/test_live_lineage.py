@@ -1,13 +1,7 @@
-"""在线：血缘与原文/编译 diff 必须能独立复现出 §12.9 那次归因。
+"""在线血缘回归：核对已保存案例的逐跳证据。
 
-默认 skip。需要只读数据库（``AKASHA_DATABASE_URL``）、一个装好 run001 的库,
-以及 ``AKASHA_LIVE=1``：
-
-    AKASHA_LIVE=1 uv run pytest tests/test_live_lineage.py -v
-
-存在的理由：§12.9 那条根因当初是手写六跳 SQL 找出来的，而平台的全部价值就在于
-「不必再手写」。所以判据不是「接口返回 200」，而是**平台给出的结论与当初手查的
-结论逐条相同**。这一条挂了，说明血缘视图在悄悄给出别的答案。
+运行：AKASHA_LIVE=1 uv run pytest tests/test_live_lineage.py -v
+需要评测库中配置只读 database_url，并已有包含 CASE_SAMPLE 的评测结果。
 """
 
 from __future__ import annotations
@@ -22,7 +16,7 @@ from akasha_benchmark.store import DEFAULT_DB_PATH, connect, repo
 from akasha_platform.main import create_app
 from akasha_platform.settings import load_settings
 
-# §12.9 的案例：bridge / hard，gold 2 篇，recall@5 = 0.5。
+# 已保存的案例：bridge / hard，gold 2 篇，recall@5 = 0.5。
 CASE_SAMPLE = "hotpotqa:5ae4f2595542990ba0bbb1a8"
 GOLD_MISSED = "6365"  # Dee Does Broadway —— 到 k=20 都没出现
 GOLD_HIT = "6369"  # Cyndi Lauper —— 召回第 1 名
@@ -56,18 +50,14 @@ def eval_layer_id() -> int:
 
 
 def test_malformed_page_id_is_rejected_before_reaching_postgres(client: TestClient):
-    """非 UUID 的 page_id 要回 400。
-
-    不挡的话 Postgres 会抛 ``invalid input syntax for type uuid``，而那条错误
-    文本里带着参数值 —— 直接透给调用方就是一个信息泄露面。
-    """
+    """非 UUID 的 page_id 要回 400。"""
     response = client.get("/api/lineage/not-a-uuid")
     assert response.status_code == 400
     assert "not a valid page id" in response.json()["detail"]
 
 
 def test_lineage_reproduces_the_case_study(client: TestClient, eval_layer_id: int):
-    """六跳链路给出的结论必须与 §12.9 手查的结论一致。"""
+    """六跳链路给出的结论必须与 案例手查的结论一致。"""
     response = client.get(
         f"/api/layers/eval/{eval_layer_id}/samples/{CASE_SAMPLE}/lineage"
     )
@@ -85,7 +75,7 @@ def test_lineage_reproduces_the_case_study(client: TestClient, eval_layer_id: in
     missed = by_doc[GOLD_MISSED]
     assert missed["page_id"], "gold 6365 必须在 page_map 里"
 
-    # §12.9：6365 编成 3 个 artifact（Dee Does Broadway / Dee Snider /
+    # 6365 编成 3 个 artifact（Dee Does Broadway / Dee Snider /
     # Source Summary: …）。artifact 数变了说明编译行为变了，那时这条案例的
     # 全部结论都要重新核。
     titles = {a["title"] for a in missed["lineage"]["artifacts"]}
@@ -103,16 +93,7 @@ def test_lineage_reproduces_the_case_study(client: TestClient, eval_layer_id: in
 def test_diff_shows_the_compiler_dropped_the_query_terms(
     client: TestClient, eval_layer_id: int
 ):
-    """**这一条是整个平台存在的理由。**
-
-    §12.9 的根因：编译把查询需要的短语删了 —— 原文有
-    "the Grammy and Emmy award winning Cyndi Lauper"，编译产物写成
-    "guest artists including Cyndi Lauper"，而问题问的正是
-    *"who won Grammy and Emmy award"*。于是三条召回路径同时断：词法（词已不在
-    索引文本里）、稠密（主题漂了）、图扩展（那条边不存在）。
-
-    当初这是手写六跳 SQL 找出来的。平台必须能自己指出同一件事。
-    """
+    """**这一条是整个平台存在的理由。"""
     body = client.get(
         f"/api/layers/eval/{eval_layer_id}/samples/{CASE_SAMPLE}/lineage"
     ).json()
@@ -127,7 +108,7 @@ def test_diff_shows_the_compiler_dropped_the_query_terms(
     assert "Grammy" in diff["source"]["text"]
     assert "Grammy" not in diff["compiled"]["text"]
 
-    # §12.9 跨全库验证：编译**不是压缩而是扩写**（中位 2.19 倍，仅 2.7% 净压缩）。
+    # 跨全库验证：编译**不是压缩而是扩写**（中位 2.19 倍，仅 2.7% 净压缩）。
     # 所以丢修饰语是改写策略，不是空间不足 —— 这个比值让读者自己看到这一点。
     assert diff["diff"]["expansion_ratio"] > 1.0
 
@@ -135,15 +116,7 @@ def test_diff_shows_the_compiler_dropped_the_query_terms(
 
 
 def test_the_bridging_graph_edge_does_not_exist(client: TestClient, eval_layer_id: int):
-    """桥接关系没升格成图边 —— 这是那条案例里第三条召回路径断掉的原因。
-
-    §12.9：6365 的全部图边只有 4 条，都在 Dee Snider ↔ Dee Does Broadway 之间，
-    到 ``canonical_key = cyndi_lauper`` 的边 **0 条**。嘉宾关系没建立成边，
-    所以图扩展也到不了另一篇 gold。
-
-    这一条也顺带更正了 §0.3 的预判：那里担心「多跳可能偏高，因为实体跨文档
-    合并」，实测方向反而是「桥接关系没建立、多跳靠图走不通」。
-    """
+    """桥接关系没升格成图边 —— 这是那条案例里第三条召回路径断掉的原因。"""
     body = client.get(
         f"/api/layers/eval/{eval_layer_id}/samples/{CASE_SAMPLE}/lineage"
     ).json()

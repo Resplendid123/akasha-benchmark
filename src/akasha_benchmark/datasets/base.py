@@ -22,7 +22,7 @@ class DatasetAdapter(ABC):
     aliases: ClassVar[tuple[str, ...]] = ()
     qa_filename: ClassVar[str]
     corpus_filename: ClassVar[str]
-    # 这个数据集**拥有**哪些标注。指标声明需要什么，闸门做集合比对（§12.4）。
+    # 这个数据集**拥有**哪些标注。指标声明需要什么，闸门做集合比对。
     provides: ClassVar[frozenset[DataDependency]]
     version: ClassVar[str] = "1"
 

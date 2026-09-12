@@ -16,10 +16,7 @@ wheels/
 # Evaluation artifacts (normalized data, responses, reports).
 /data/
 
-# 评测库。**这是事实来源**（docs/PLAN.md §12 决策 2），不是缓存 ——
-# 所以它不在清理范围里，要删得显式来。
-# 它同时是**凭据文件**：app_config 表存明文 Akasha 密码与 model_provider 的
-# api_key（配置要能在 UI 里填改，环境变量做不到）。
+# 评测库包含 connection 和 model_provider 的明文凭据。
 /akasha_bench.db
 /akasha_bench.db-wal
 /akasha_bench.db-shm
@@ -40,3 +37,5 @@ wheels/
 *.log
 .tmptest/
 CLAUDE.md
+.DS_Store
+*.tsbuildinfo

@@ -1,12 +1,4 @@
-"""连接配置、provider 与任务清理。
-
-配置从 ``akasha.config.json`` 搬进库、去掉环境变量旁路、再收成单例的取舍是
-明确的：配置要能在 UI 里填改，而只有一份就不会有「哪一份是真的」这个问题。
-代价是 ``akasha_bench.db`` 成为凭据文件 —— 所以这一组里相当一部分测的是
-「密钥不会从 API 漏出去」。
-
-连接与层的绑定、workspace 闸门另见 ``test_connections.py``。
-"""
+"""连接配置、provider 与任务清理。"""
 
 from __future__ import annotations
 
@@ -25,7 +17,7 @@ from akasha_platform.settings import Settings
 def client(tmp_path: Path):
     db = tmp_path / "t.db"
     migrate(db, verbose=False)
-    api = TestClient(create_app(Settings(db_path=db, web_dist=tmp_path / "none")))
+    api = TestClient(create_app(Settings(db_path=db)))
     yield api, db
 
 
@@ -39,25 +31,20 @@ def test_connection_round_trips_through_the_api(client):
         json={"base_url": "http://akasha:3000", "email": "eval@example.com", "password": "pw"},
     )
     assert response.status_code == 200
-    # **取值不回传。**
-    assert "pw" not in response.text
-    assert response.json()["connection"]["password_set"] is True
+    # password 与 email / base_url 同路：明文存、明文回。
+    assert response.json()["connection"]["password"] == "pw"
 
     current = api.get("/api/connection").json()
     assert current["base_url"] == "http://akasha:3000"
-    assert "password" not in current
-    assert "database_url" not in current
+    assert current["password"] == "pw"
+    assert "password_set" not in current
 
 
 def test_a_partial_update_does_not_wipe_the_password(client):
-    """只改 base_url 不该把密码清掉。
-
-    UI 拿不到明文，表单里那一格提交上来必然是空的 —— 当成清空的话，
-    每次改地址都会顺手删掉密码，而那个失效要等到下次 ingest 登录失败才发现。
-    """
+    """只改 base_url 不该把密码清掉 —— 不带 password 字段就是不改它。"""
     api, db = client
     api.put("/api/connection", json={"base_url": "http://a", "password": "pw"})
-    api.put("/api/connection", json={"base_url": "http://b", "password": ""})
+    api.put("/api/connection", json={"base_url": "http://b"})
 
     connection = connect(db, read_only=True)
     row = repo.get_connection_row(connection)
@@ -66,10 +53,11 @@ def test_a_partial_update_does_not_wipe_the_password(client):
     assert row["password"] == "pw"
 
 
-def test_clearing_a_secret_has_to_be_explicit(client):
+def test_empty_password_clears_it(client):
+    """password 走 email 同款语义：显式空串 = 清空。"""
     api, db = client
     api.put("/api/connection", json={"password": "pw"})
-    api.put("/api/connection", json={"clear": ["password"]})
+    api.put("/api/connection", json={"password": ""})
 
     connection = connect(db, read_only=True)
     assert repo.get_connection_row(connection)["password"] == ""
@@ -89,18 +77,12 @@ def test_bad_types_are_rejected_with_422(client):
     assert api.put("/api/connection", json={"concurrency": "many"}).status_code == 422
 
 
-def test_test_endpoint_refuses_without_credentials(client):
-    """没填凭据就点「测试连接」，要给一句能指向缺什么的话。"""
+@pytest.mark.parametrize("method,path", [("post", "/api/connection/test"), ("get", "/api/model-configs")])
+def test_endpoints_require_credentials(client, method, path):
     api, _ = client
-    response = api.post("/api/connection/test")
+    response = api.request(method, path)
     assert response.status_code == 422
     assert "password" in response.json()["detail"]
-
-
-def test_model_configs_refuse_without_credentials(client):
-    """Akasha 那边的模型配置也在配置层里，同样要先能连上。"""
-    api, _ = client
-    assert api.get("/api/model-configs").status_code == 422
 
 
 # --- provider ----------------------------------------------------------------
@@ -143,11 +125,7 @@ def test_provider_role_is_validated(client):
 
 
 def test_resolve_provider_needs_a_stored_key(client):
-    """密钥只有一条来路：库里那份。
-
-    曾经支持「存一个环境变量名、运行时从那里读」，删了 —— 同一份密钥有两个
-    来源时，「填了但没生效」查不出来。
-    """
+    """密钥只有一条来路：库里那份。"""
     from akasha_benchmark.judge.client import JudgeConfigError
     from akasha_benchmark.judge.run import resolve_provider
 
@@ -185,10 +163,7 @@ def test_resolve_provider_reports_a_missing_configuration(client):
 
 
 def test_running_tasks_cannot_be_cleaned_up(client):
-    """清理的语义是「这条记录不用看了」，不是「停掉它」。
-
-    删一个在跑的任务会留下一个没人认领的子进程，而它还在往库里写。
-    """
+    """清理的语义是「这条记录不用看了」，不是「停掉它」。"""
     api, db = client
     connection = connect(db)
     task_id = repo.create_task(connection, stage="ingest", argv=["x"])

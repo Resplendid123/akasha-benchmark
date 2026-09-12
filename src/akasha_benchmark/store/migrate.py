@@ -1,20 +1,9 @@
-"""迁移运行器：按文件名顺序跑 ``migrations/*.sql``，跑之前自动备份。
-
-三条来自 PLAN.md §12.7 的硬性要求：
-
-1. **迁移前自动备份**。20 行代码换掉一整类事故。
-2. **迁移必须能在有数据的库上跑**，不能只在空库验证过。SQLite 的 ``ALTER TABLE``
-   不能删列改类型，复杂改动走「建新表 → 拷数据 → 换名」。
-3. 每个版本只跑一次，已跑过的记进 ``schema_migration`` 并校验 checksum ——
-   迁移文件被改过就报错，否则两台机器的 schema 会悄悄分叉。
-
-    uv run python -m akasha_benchmark.store.migrate
-    uv run python -m akasha_benchmark.store.migrate --status
-"""
+"""Apply SQL migrations with checksum validation and a SQLite backup before changes."""
 
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -23,6 +12,65 @@ from ..io_utils import sha256_text, utc_now
 from .db import DEFAULT_DB_PATH, connect
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
+
+# Checksums identify databases already upgraded to the former six-file schema.
+LEGACY_CHECKSUMS = {
+    "001_initial": "b5563074335487afebfb828451b80bcc9c5fe6c3fd05a195b108c2633527d1bf",
+    "002_platform": "5cb435e1024d16c11162a6d9b00f0cb026001d60ff024037f13e15a6d1340e0b",
+    "003_connections": "2e0eac85c1366569cbc09528de03edd600656ff85f32561fc948f12b7b076fa3",
+    "004_workspace_from_server": "f1b95af261b0e4a5e80823486e2a6997512f4c3a842bc632f52aa810529ccd2d",
+    "005_single_connection": "e1e9b8d1a4edba4ddfaf358cf774ea392ac6357f78b558d2c75f905983bdd9ca",
+    "006_drop_slug_prefix": "1307dd186b6c9899bb3e46f5f6dc8b72ce92fd6bb392ddf835936f167ae471a4",
+}
+
+
+def _schema(connection: sqlite3.Connection) -> dict[str, str]:
+    return {
+        name: " ".join(re.sub(r"--[^\n]*", "", sql).split())
+        for name, sql in connection.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+            "AND name != 'schema_migration'"
+        )
+    }
+
+
+def _adopt_baseline(
+    connection: sqlite3.Connection,
+    path: Path,
+    files: list[Path],
+    applied: dict[str, str],
+) -> bool:
+    if not applied or applied.get("001_initial") != LEGACY_CHECKSUMS["001_initial"]:
+        return False
+    baseline = next((file for file in files if file.stem == "001_initial"), None)
+    if baseline is None:
+        return False
+    sql = baseline.read_text(encoding="utf-8")
+    if sha256_text(sql) == LEGACY_CHECKSUMS["001_initial"]:
+        return False
+    if applied != LEGACY_CHECKSUMS:
+        raise RuntimeError(
+            "Legacy database must first be upgraded through 006_drop_slug_prefix "
+            "using the previous revision."
+        )
+    expected = sqlite3.connect(":memory:")
+    try:
+        expected.executescript(sql)
+        if _schema(connection) != _schema(expected):
+            raise RuntimeError(
+                "Database schema differs from the final baseline; no changes made."
+            )
+    finally:
+        expected.close()
+    backup(path, "baseline")
+    with connection:
+        connection.execute("DELETE FROM schema_migration")
+        connection.execute(
+            "INSERT INTO schema_migration VALUES (?, ?, ?)",
+            (baseline.stem, utc_now(), sha256_text(sql)),
+        )
+    return True
 
 
 def discover(migrations_dir: Path | None = None) -> list[Path]:
@@ -34,12 +82,7 @@ def discover(migrations_dir: Path | None = None) -> list[Path]:
 
 
 def _ensure_bookkeeping(connection: sqlite3.Connection) -> None:
-    """建 ``schema_migration`` 表。
-
-    这张表是**运行器自己的账本**，不是某个迁移的产物。放在 001 里的话，
-    任何一份新建的迁移目录都会在写账本时炸掉，而且报的是
-    「no such table: schema_migration」—— 一句完全指错方向的错误。
-    """
+    """Create the migration ledger independently of application tables."""
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migration (
@@ -61,12 +104,7 @@ def _applied(connection: sqlite3.Connection) -> dict[str, str]:
 
 
 def backup(db_path: Path, version: str) -> Path | None:
-    """把当前库备份成 ``{db}.pre-{version}``。库还不存在时跳过。
-
-    用 SQLite 的 backup API 而不是文件拷贝：WAL 模式下 ``.db`` 的最新内容
-    有一部分还在 ``-wal`` 里，单独 ``cp`` 那个 ``.db`` 会得到一份少了尾部
-    提交的副本 —— 那种备份在真要用的时候才发现不完整，正是备份最不该有的失效方式。
-    """
+    """Back up committed data, including WAL contents, using the SQLite backup API."""
     if not db_path.is_file():
         return None
     target = db_path.with_name(f"{db_path.name}.pre-{version}")
@@ -83,7 +121,10 @@ def backup(db_path: Path, version: str) -> Path | None:
 
 
 def migrate(
-    db_path: Path | None = None, migrations_dir: Path | None = None, *, verbose: bool = True
+    db_path: Path | None = None,
+    migrations_dir: Path | None = None,
+    *,
+    verbose: bool = True,
 ) -> list[str]:
     """跑掉所有未应用的迁移，返回本次应用的版本列表。"""
     path = db_path or DEFAULT_DB_PATH
@@ -96,6 +137,9 @@ def migrate(
     try:
         _ensure_bookkeeping(connection)
         applied = _applied(connection)
+        adopted = _adopt_baseline(connection, path, files, applied)
+        if adopted:
+            applied = _applied(connection)
 
         # 先校验已应用的迁移没被改过。改过就停：让 schema 与记录对不上地继续跑,
         # 后面每一个「字段不存在」的报错都会指向错误的方向。
@@ -114,14 +158,16 @@ def migrate(
         pending = [f for f in files if f.stem not in applied]
         if not pending:
             if verbose:
-                print(f"schema up to date at {path} ({len(applied)} migration(s) applied)")
-            return []
+                print(
+                    f"schema up to date at {path} ({len(applied)} migration(s) applied)"
+                )
+            return ["001_initial"] if adopted else []
 
         saved = backup(path, pending[0].stem) if existed else None
         if saved and verbose:
             print(f"backed up to {saved.name}")
 
-        done: list[str] = []
+        done: list[str] = ["001_initial"] if adopted else []
         for file in pending:
             version = file.stem
             sql = file.read_text(encoding="utf-8")
@@ -155,7 +201,14 @@ def status(db_path: Path | None = None, migrations_dir: Path | None = None) -> i
     finally:
         connection.close()
     for file in discover(migrations_dir):
-        mark = "applied" if file.stem in applied else "PENDING"
+        if applied == LEGACY_CHECKSUMS and file.stem == "001_initial":
+            mark = "LEGACY"
+        elif file.stem not in applied:
+            mark = "PENDING"
+        elif sha256_text(file.read_text(encoding="utf-8")) != applied[file.stem]:
+            mark = "CHANGED"
+        else:
+            mark = "applied"
         print(f"{mark:>8}  {file.stem}")
     return 0
 

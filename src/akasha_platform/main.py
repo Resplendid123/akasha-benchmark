@@ -1,7 +1,7 @@
 """FastAPI 应用与 ``akasha-platform`` 入口。
 
-开发时两个进程：Vite dev server + 这个后端。生产 ``npm run build`` 出静态文件,
-由这里挂 ``StaticFiles``，单进程单端口（§12.7）。
+只挂 API。前端在 dev 时由 Vite dev server 起在 :5173，把 ``/api/*`` 代理到
+这里的 :8848；本地浏览器访问 http://127.0.0.1:5173 即可。
 
 **安全**：默认只绑 ``127.0.0.1``。绑非回环地址且没设访问令牌时**拒绝启动** ——
 这个服务持有 Akasha 管理员凭据、只读数据库连接、以及启动长任务的能力。
@@ -16,12 +16,10 @@ import argparse
 import secrets
 import sys
 from pathlib import Path
-from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from .api import router
 from .settings import Settings, generate_token, load_settings
@@ -36,7 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = resolved
 
-    # 开发时前端在 Vite dev server 上，需要 CORS；生产同源，用不到。
+    # 开发时前端在 Vite dev server 上，需要 CORS；同源部署时也安全。
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(resolved.dev_origins),
@@ -56,35 +54,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await call_next(request)
 
     app.include_router(router)
-
-    dist = resolved.web_dist
-    if dist.is_dir():
-        # assets 走 StaticFiles，其余路径回落到 index.html（前端是 SPA）。
-        assets = dist / "assets"
-        if assets.is_dir():
-            app.mount("/assets", StaticFiles(directory=assets), name="assets")
-
-        @app.get("/{path:path}")
-        async def spa(path: str) -> Any:  # type: ignore[no-untyped-def]
-            candidate = dist / path
-            if path and candidate.is_file():
-                return FileResponse(candidate)
-            index = dist / "index.html"
-            if not index.is_file():
-                raise HTTPException(404, "web/dist/index.html missing; run `npm run build`")
-            return FileResponse(index)
-    else:
-
-        @app.get("/")
-        async def no_frontend() -> dict[str, Any]:  # type: ignore[no-untyped-def]
-            return {
-                "detail": (
-                    "frontend not built. Run `npm --prefix web install && "
-                    "npm --prefix web run build`, or use the Vite dev server on :5173."
-                ),
-                "api": "/api/health",
-            }
-
     return app
 
 
@@ -104,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     settings = load_settings()
-    overrides: dict[str, Any] = {}
+    overrides: dict[str, object] = {}
     if args.host:
         overrides["host"] = args.host
     if args.port:
@@ -132,7 +101,8 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
-    print(f"serving on http://{settings.host}:{settings.port}  db={settings.db_path}")
+    print(f"API on http://{settings.host}:{settings.port}  db={settings.db_path}")
+    print(f"前端 dev: npm --prefix web run dev  → http://127.0.0.1:5173")
     if not settings.auth_token:
         print("no auth token set — bound to loopback only")
     uvicorn.run(

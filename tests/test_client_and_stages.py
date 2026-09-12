@@ -1,9 +1,4 @@
-"""入库与查询跑在 mock 的 Akasha 上，覆盖请求形状与断点续跑。
-
-真正跑一遍仍然需要在线的 Akasha；这里锁住的是那些容易悄悄搞错的地方 ——
-multipart 的字段名、OWNER 闸门、质量闸门、续跑时的跳过逻辑，
-以及失败必须落盘而不是被丢掉。
-"""
+"""入库与查询跑在 mock 的 Akasha 上，覆盖请求形状与断点续跑。"""
 
 from __future__ import annotations
 
@@ -43,26 +38,12 @@ MOCK_MODEL_CONFIGS = {
 
 
 def enveloped(payload: Any, status: int = 200) -> httpx.Response:
-    """按真实服务端的形状包一层 ``{data, success, status}``。
-
-    ``main.ts:160`` 给所有路由挂了 ``TransformHttpResponseInterceptor``，只有
-    ``@SkipTransform()`` 的 handler 例外（mcp / health / robots.txt，本评测都不用）。
-    替身**必须**照这个形状返回：早先它返回裸响应，于是这里 73 个测试全绿，
-    而真实服务上每个阶段都在静默读空 —— 最坏的一处是质量闸门四项计数全取到
-    ``None``，``all(value == 0)`` 假通过。替身照我们的理解写，理解错了它也照样绿，
-    所以这一层是拿在线冒烟换回来的，别再把它改回裸响应。
-    """
+    """按真实服务端的形状包一层 ``{data, success, status}``。"""
     return httpx.Response(status, json={"data": payload, "success": True, "status": status})
 
 
 class FakeAkasha:
-    """入库与查询用到的那几个端点的最小替身。
-
-    ``role`` 和 ``quality_clean`` 用来构造两种失败场景，
-    ``fail_import_for`` / ``fail_query_for`` 用来指定哪些条目要失败。
-
-    响应一律经 :func:`enveloped` 套信封，与真实服务端一致。
-    """
+    """入库与查询用到的那几个端点的最小替身。"""
 
     def __init__(self, *, role: str = "owner", quality_clean: bool = True) -> None:
         self.role = role
@@ -227,13 +208,7 @@ def test_unwrap_envelope_leaves_everything_else_alone(body: Any):
 
 
 def test_client_unwraps_envelopes_end_to_end(config: AkashaConfig):
-    """经 :class:`AkashaClient` 出来的响应已经剥好，调用方不必自己判断。
-
-    这条是拿在线冒烟换回来的：客户端早先不剥信封，于是 ``users/me`` 取不到
-    role（OWNER 闸门永远拒绝执行）、导入取不到 id（每篇记成失败）、质量诊断
-    取不到 summary（四项闸门全 ``None``，``all(value == 0)`` **假通过**）。
-    这些都不报错，只是静默读空。
-    """
+    """经 :class:`AkashaClient` 出来的响应已经剥好，调用方不必自己判断。"""
     fake = FakeAkasha()
     with client_for(fake, config) as client:
         client.login()
@@ -277,11 +252,7 @@ def test_login_without_cookie_is_an_error(config: AkashaConfig):
 
 
 def test_query_records_non_2xx_without_raising(config: AkashaConfig, no_sleep: None):
-    """查询的非 2xx 不抛异常，交给调用方落盘。
-
-    替身返回的 503 属于可重试状态，所以这里走完整的重试再返回 —— 断言的是
-    「重试用尽后仍是 503 且不抛」。用 ``no_sleep`` 跳过退避，否则要真等 5 次。
-    """
+    """查询的非 2xx 不抛异常，交给调用方落盘。"""
     fake = FakeAkasha()
     fake.fail_query_for.add("bad question")
     with client_for(fake, config) as client:
@@ -318,13 +289,7 @@ def _counting_handler(
 def test_transient_status_is_retried_then_succeeds(
     config: AkashaConfig, no_sleep: None, status: int
 ):
-    """瞬时 5xx/429 要重试而不是让整个阶段退出。
-
-    这条是拿一次真实事故换回来的：编译 400 页要轮询上千次，dev server
-    （``nest start --watch``）偶发重启会返回 502，客户端不重试就让 ingest
-    进程直接退出 —— 而服务端的编译还在 BullMQ 里继续跑，于是没人接管进度、
-    manifest 也写不出来。
-    """
+    """瞬时 5xx/429 要重试而不是让整个阶段退出。"""
     handler, seen = _counting_handler([status])
     client = AkashaClient(config)
     client._client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -377,15 +342,7 @@ def test_retries_are_bounded_and_then_raise(config: AkashaConfig, no_sleep: None
 def test_multipart_retry_resends_the_whole_file(
     tmp_path: Path, config: AkashaConfig, no_sleep: None
 ):
-    """重试 multipart 前必须把文件句柄拨回开头。
-
-    不 rewind 的话第一次尝试已经把句柄读到末尾，重发的 body 是空的 ——
-    服务端会收下一个空文件并返回 200，于是「导入成功」但内容为空，
-    这种缺陷不报错，只会让后续召回莫名其妙地找不到东西。
-
-    导入本身是 ``retry=False``（见下一条），所以这里直接调 ``request``
-    把重试打开，锁住 rewind 这个通用行为。
-    """
+    """重试 multipart 前必须把文件句柄拨回开头。"""
     md = tmp_path / "42.md"
     md.write_text("# Title\n\nBody line\n", encoding="utf-8")
     bodies: list[bytes] = []
@@ -418,11 +375,7 @@ def test_multipart_retry_resends_the_whole_file(
 def test_import_page_does_not_retry_ambiguous_failures(
     tmp_path: Path, config: AkashaConfig, no_sleep: None
 ):
-    """导入遇到 5xx 不重试 —— 服务端可能已建好 page，重试会建出第二个。
-
-    重复 page 不在 ``page_map`` 里，续跑发现不了，只会悄悄抬高语料规模。
-    缺篇相反是可发现、可续跑补齐的，所以这里宁可失败也不重试。
-    """
+    """导入遇到 5xx 不重试 —— 服务端可能已建好 page，重试会建出第二个。"""
     md = tmp_path / "42.md"
     md.write_text("# Title\n\nBody\n", encoding="utf-8")
     handler, seen = _counting_handler([502] * 10)
@@ -644,11 +597,7 @@ def test_ingest_fails_the_quality_gate(
 def test_skip_compile_is_not_an_accepted_ingest(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """``--skip-compile`` 是调试入口，**必须非零退出**。
-
-    §10.1 记的缺口：它原来可以返回成功，于是「跳过编译」看起来像「验收通过」，
-    而那之后跑出来的指标全部偏低且不报错。
-    """
+    """``--skip-compile`` 是调试入口，**必须非零退出**。"""
     fake = FakeAkasha()
     _patch_client(monkeypatch, ingest_mod, fake, config)
     assert ingest_mod.run(LABEL, [DATASET], staged.db_path, skip_compile=True) == 1
@@ -685,16 +634,7 @@ def test_ingest_resumes_and_skips_imported_docs(
 def test_ingest_refuses_when_the_server_resolves_another_workspace(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """入库前拿**登录后解析出的** workspace 比对，不符拒绝执行。
-
-    不拦的话：``list_spaces`` 按 workspace 过滤，找不到同 slug 的 space,
-    于是建一个新的并覆盖库里的 space_id —— 而 page_map 里的 page_id 还指向旧
-    workspace 的页。之后查询照常跑完，每条都召回不到，看起来像
-    「这批语料检索效果差」。
-
-    判据刻意不来自配置：workspace 由服务端决定（自建部署走
-    ``workspaceRepo.findFirst()``），客户端选不了，让用户填只会带来填错时的误报。
-    """
+    """入库前拿**登录后解析出的** workspace 比对，不符拒绝执行。"""
     fake = FakeAkasha()
     _patch_client(monkeypatch, ingest_mod, fake, config)
     assert ingest_mod.run(LABEL, [DATASET], staged.db_path) == 0
@@ -717,11 +657,7 @@ def test_ingest_refuses_when_the_server_resolves_another_workspace(
 def test_run_queries_refuses_when_the_server_resolves_another_workspace(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """查询同样要判：这一层的 space_id 只在它入库时那个 workspace 里解析得到。
-
-    换个地方跑，每条 query 都会打到一个空 space —— 而那不报错，只会给出一份
-    「recall 全 0」的报告。
-    """
+    """查询同样要判：这一层的 space_id 只在它入库时那个 workspace 里解析得到。"""
     fake = FakeAkasha()
     _patch_client(monkeypatch, ingest_mod, fake, config)
     assert ingest_mod.run(LABEL, [DATASET], staged.db_path) == 0
@@ -741,12 +677,7 @@ OTHER_DATASET = "2wikimultihopqa"
 def test_ingest_keeps_colliding_doc_ids_of_two_datasets_apart(
     tmp_path: Path, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """两组撞 doc_id 时，page_map 必须按 (层, 数据集, doc_id) 分别记全。
-
-    doc_id 是各数据集内部的裸 ID，跨组会撞（锁定的 run001 子集里
-    hotpotqa×2wiki 撞 15 个）。少了 dataset 这一维，后一组会覆盖前一组的行，
-    前一组这些 doc 就被当成已导入而跳过。
-    """
+    """两组撞 doc_id 时，page_map 必须按 (层, 数据集, doc_id) 分别记全。"""
     path = tmp_path / "t.db"
     migrate(path, verbose=False)
     connection = connect(path)
@@ -832,12 +763,7 @@ def test_ingest_detects_a_corrupt_subset_row(
 def test_ingest_detects_upstream_normalized_data_changing(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """§12.2 第 1 条：上游 sha256 链断了就报错。
-
-    含义是「normalize 换过数据快照，而这一层的子集是照旧快照抽的」。带着这种
-    状态导入，page_map 记的身份与库里的语料对不上，之后每个指标都失去可追溯性 ——
-    而这种失效不会报错，只会给出一份看着正常的报告。
-    """
+    """第 1 条：上游 sha256 链断了就报错。"""
     staged.connection.execute(
         "UPDATE dataset SET corpus_sha256 = ? WHERE name = ?", ("9" * 64, DATASET)
     )
@@ -853,11 +779,7 @@ def test_ingest_detects_upstream_normalized_data_changing(
 
 
 def _prepare_query_stage(staged) -> None:
-    """让索引层通过前置闸门：page_map 齐、质量四项全 0、编译已终态。
-
-    这三项是查询阶段的**不可跳过**闸门（§10.1）。测试里必须显式把它们置成
-    通过态，否则 run() 会（正确地）拒绝开跑。
-    """
+    """让索引层通过前置闸门：page_map 齐、质量四项全 0、编译已终态。"""
     connection = staged.connection
     repo.set_space(
         connection, staged.layer_id, DATASET, space_id="space-1", space_slug="sp", space_reused=False
@@ -918,11 +840,7 @@ def _responses(staged) -> list[dict]:
 def test_run_queries_refuses_a_layer_that_failed_the_quality_gate(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """前置闸门：质量没过就一条 query 都不准发（§10.1）。
-
-    这一道以前只在 Makefile 里，Python 侧没有 —— 于是从平台或直接调 run()
-    都能绕过去，拿半成品索引跑出一份看着像「配置差」的报告。
-    """
+    """前置闸门：质量没过就一条 query 都不准发（）。"""
     _prepare_query_stage(staged)
     repo.update_index_layer(staged.connection, staged.layer_id, quality_passed=0)
     staged.connection.execute(
@@ -966,7 +884,7 @@ def test_run_queries_writes_one_row_per_sample(
     rows = _responses(staged)
     assert {r["sample_id"] for r in rows} == {f"{DATASET}:s1", f"{DATASET}:s2"}
     assert all(r["http_status"] == 200 for r in rows)
-    # 存的是**完整响应体**，不是当下用得到的那几个字段（§7.2）。
+    # 存的是**完整响应体**，不是当下用得到的那几个字段。
     assert all(r["response"]["answerMode"] == "knowledge" for r in rows)
     # answerMode 抽成列，UI 的默认切分靠它，不必每次解析 JSON。
     assert all(r["answer_mode"] == "knowledge" for r in rows)
@@ -975,11 +893,7 @@ def test_run_queries_writes_one_row_per_sample(
 def test_run_queries_honours_concurrency(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """并发 > 1 时每个 worker 各持一个客户端，所以登录次数等于并发度。
-
-    共用一个实例的话限流器的 _last_request_at 会互相踩，request_interval
-    退化成「一起睡、一起发」。行序变成完成顺序，因此按集合断言。
-    """
+    """并发 > 1 时每个 worker 各持一个客户端，所以登录次数等于并发度。"""
     _prepare_query_stage(staged)
     config = replace(config, concurrency=3)
     fake = FakeAkasha()
@@ -1019,10 +933,7 @@ def test_run_queries_concurrent_resume_skips_completed_rows(
 def test_run_queries_records_failures_as_rows(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch, no_sleep: None
 ):
-    """失败也占一行。静默跳过失败会把后面所有均值算高。
-
-    替身的 503 会先走完重试，``no_sleep`` 让这里不必真等退避。
-    """
+    """失败也占一行。"""
     _prepare_query_stage(staged)
     fake = FakeAkasha()
     fake.fail_query_for.add("second question")
@@ -1037,14 +948,7 @@ def test_run_queries_records_failures_as_rows(
 def test_run_queries_records_transport_errors_instead_of_crashing(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch, no_sleep: None
 ):
-    """断连/超时**重试用尽后**要落库成失败行，并且不能中断后面的样本。
-
-    ``httpx.RequestError`` 不是 ``OSError`` 的子类，漏掉它的话跑到一半
-    网络抖一下整个阶段就带 traceback 崩掉，那一行也不会落库。
-
-    这里断言的错误串仍以 ``ConnectError:`` 开头 —— 客户端重试用尽后原样抛出
-    传输层异常，不包成 ``AkashaError``，否则上面那条捕获通路就断了。
-    """
+    """断连/超时**重试用尽后**要落库成失败行，并且不能中断后面的样本。"""
     _prepare_query_stage(staged)
     fake = FakeAkasha()
     fake.raise_transport_for.add("first question")
@@ -1065,11 +969,7 @@ def test_run_queries_records_transport_errors_instead_of_crashing(
 def test_retrying_failed_rows_needs_an_explicit_flag(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch, no_sleep: None
 ):
-    """§10.1 的失败行恢复策略：默认跳过失败行，``--retry-failed`` 才重试。
-
-    默认跳过是对的（重跑要烧 LLM 调用），但原实现没有任何重试入口，
-    而追加 JSONL 又会造出重复 sample_id。现在主键拦住重复，重试走显式删除。
-    """
+    """失败行恢复策略：默认跳过失败行，``--retry-failed`` 才重试。"""
     _prepare_query_stage(staged)
     fake = FakeAkasha()
     fake.fail_query_for.add("second question")
@@ -1112,11 +1012,7 @@ def test_run_queries_resumes_from_existing_rows(
 def test_run_queries_stops_on_model_config_drift(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """模型配置与入库时不一致时终止，除非显式允许。
-
-    这里漂的是 answer 模型：它改了不必重编译，所以属于「不可比」而非
-    「静默失效」，可以用 --allow-config-drift 覆盖。
-    """
+    """模型配置与入库时不一致时终止，除非显式允许。"""
     _prepare_query_stage(staged)
     drifted = {
         "configs": [
@@ -1142,12 +1038,7 @@ def test_run_queries_stops_on_model_config_drift(
 def test_run_queries_never_overrides_an_embedding_change(
     staged, config: AkashaConfig, monkeypatch: pytest.MonkeyPatch
 ):
-    """embedding 漂移**拒绝执行**，--allow-config-drift 也不放行（§12.3）。
-
-    换 embedding 后旧 chunk 的 ``embedding_profile`` 对不上，那些 chunk 永远
-    召回不到，而评测会照常算出一份「recall 低、拒答率高」的报告 —— 看起来像
-    配置差，实际是索引与 embedding 错配。这是唯一会静默失效的那一项。
-    """
+    """embedding 漂移**拒绝执行**，--allow-config-drift 也不放行（）。"""
     _prepare_query_stage(staged)
     drifted = {
         "configs": [

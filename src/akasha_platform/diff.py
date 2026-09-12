@@ -1,25 +1,4 @@
-"""原文 vs 编译产物的逐样本 diff。**一等视图，不是附属功能。**
-
-理由在 PLAN.md §12.9：那次 recall@5 = 0.5 的根因只有把两者并排才看得见 ——
-
-```
-原文（knowledge_source_chunks，不参与召回）：
-  "Guests in the album include the Grammy and Emmy award winning Cyndi Lauper, …"
-编译（knowledge_chunks，参与召回）：
-  "…featuring vocal contributions from guest artists including Cyndi Lauper, …"
-```
-
-问题问的正是 *"who won Grammy and Emmy award"*，而编译产物里这两个词已经没了。
-于是三条召回路径同时断：词法（词不在索引文本里）、稠密（主题漂了）、
-图扩展（那条边不存在）。
-
-§9 的原文基线从整体上量这个效应；**逐样本 diff 能直接指出丢了哪个词** ——
-对调参无用（改不了编译器），对「这个数字该怎么读」有决定性作用。
-
-跨全库验证得到的三条编译器行为（§12.9，400+ 篇非单例）：
-编译**不是压缩而是扩写**（中位 2.19 倍，仅 2.7% 净压缩），所以丢修饰语是
-改写策略而非空间不足；图边极稀疏；relation 自由生成。
-"""
+"""比较原文与编译产物的词汇，返回遗漏词、新增词和查询词覆盖情况。"""
 
 from __future__ import annotations
 

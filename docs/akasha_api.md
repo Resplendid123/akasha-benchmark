@@ -1,6 +1,6 @@
 # Akasha 接口样例
 
-基准只用两个接口：入库导入语料，查询跑问题。客户端在
+核心流程是导入语料和查询问题，还会调用登录、Space 管理、编译、质量诊断及模型配置接口。客户端在
 [akasha_client.py](../src/akasha_benchmark/akasha_client.py)。
 
 | 阶段 | 接口 | 用途 |
@@ -309,7 +309,7 @@ controller 只给 `citations` 做图片富化（`llm-wiki.controller.ts:234-244`
 
 ## 三、`GET /api/llm-wiki/admin/model-configs`
 
-入库与查询各拉一次做快照比对（PLAN.md 7.3）。剥掉信封后是：
+入库与查询各拉一次做快照比对。剥掉信封后是：
 
 ```json
 {
@@ -344,22 +344,19 @@ controller 只给 `citations` 做图片富化（`llm-wiki.controller.ts:234-244`
 "Knowledge compiler provider request failed."，看不出是路径问题。
 判据是耗时：几百毫秒就失败是 404，真实推理是几十秒。
 
-## 落盘格式
+## 查询记录
 
-查询每条 query 写一行，HTTP 响应体整个塞进 `response`
-（[run_queries.py:97-112](../src/akasha_benchmark/run_queries.py#L97-L112)）：
+每个 `(query_layer_id, sample_id)` 在 SQLite 的 `query_response` 中保存一行：
+样本、问题、请求时间、耗时、HTTP 状态、错误及完整业务响应（`response_json`）。
+响应信封由客户端剥除后保存。
 
-```json
-{"sample_id": "hotpotqa_5a7a0693...", "dataset": "hotpotqa", "question": "Which film whose director...", "requested_at": "2026-09-09T02:31:07Z", "latency_ms": 4213, "http_status": 200, "error": null, "response": { "answer": "...", "answerMode": "knowledge" }}
-```
+失败同样入库：连接错误记 `http_status=0`，HTTP 错误保留真实状态码。
+常规续跑跳过已有记录；需要重试失败样本时使用查询阶段的 `--retry-failed`。
 
-失败也写行，不跳过：连接层失败记 `http_status: 0`、`response: null`、
-`error: "ConnectError: ..."`；非 2xx 记真实状态码。评测把这些行按 F1 = 0
-计入统计，因为失败率本身是结果的一部分。
+## 平台验证与开发回归
 
-同 `sample_id` 已有行时不再重发（断点续跑），所以中断后重跑不会产生重复请求。
-
-## 自动验一条
+日常验证从「评测层 → 小样本验证」启动，检查结果和失败原因进入任务日志，指标进入报告。
+下面的 pytest 命令仅用于开发者核对服务端契约与离线重放。
 
 本文写下的每条字段约定都由 [tests/test_live_akasha.py](../tests/test_live_akasha.py)
 在真实 Akasha 上核对 —— 响应里没有 `retrievalDiagnostics`、`citationEvidence`
@@ -368,7 +365,7 @@ controller 只给 `citations` 做图片富化（`llm-wiki.controller.ts:234-244`
 评测算出来的数就是错的，而且不会有任何报错，所以它们需要断言而不是只写在文档里。
 
 ```bash
-make smoke      # 默认 skip；这个目标显式开 AKASHA_LIVE=1
+AKASHA_LIVE=1 uv run pytest tests/test_live_akasha.py -v  # 开发者接口回归
 ```
 
 跑完的完整往返写进 `data/smoke/<ts>-roundtrip.json`，可以离线重放：

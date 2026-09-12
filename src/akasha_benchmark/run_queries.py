@@ -8,7 +8,7 @@
 失败也照样写一行 —— 失败率本身就是一项结果，静默跳过失败会把后面
 所有的平均值都算高。
 
-开跑之前有一道**不可跳过的前置闸门**（§10.1）：索引层的质量闸门必须通过、
+开跑之前有一道**不可跳过的前置闸门**：索引层的质量闸门必须通过、
 导入必须完整、编译不能超时。少了它，一个半成品索引会产出一份「recall 低、
 拒答率高」的报告，而那看起来像配置问题，不像索引问题。
 
@@ -229,7 +229,7 @@ def run(
         config.require_credentials()
         print(f"akasha: {config.base_url} as {config.email}")
 
-        # 不可跳过的前置闸门（§10.1）。这一道以前只在 Makefile 里，
+        # 不可跳过的前置闸门。这一道以前只在 Makefile 里，
         # 而平台的执行控制不走 make。
         readiness = repo.index_layer_readiness(connection, index_layer_id)
         if not readiness["ready"]:
@@ -269,7 +269,7 @@ def run(
             drift = current_configs != indexed_configs
 
             if not embedding_ok:
-                # 这一项**拒绝执行**，--allow-config-drift 也不放行（§12.3）。
+                # 这一项**拒绝执行**，--allow-config-drift 也不放行。
                 print(
                     "ERROR the embedding model changed since this index layer was built. "
                     "Existing chunks carry the old embedding_profile and can never be "

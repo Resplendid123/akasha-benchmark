@@ -6,7 +6,7 @@
 
 **两条永不删的东西**：
 
-* ``akasha_bench.db`` —— 它是事实来源（docs/PLAN.md §12 决策 2），不是缓存。
+* ``akasha_bench.db`` —— 它是事实来源，不是缓存。
   删它要显式来，不能被一句 ``make distclean`` 顺手带走。
 * ``dataset/`` —— 重下要 137MB。
 
@@ -68,7 +68,7 @@ def clean_exports(label: str, eval_label: str) -> int:
             removed += 1
     if not removed:
         print(f"nothing to remove for label {label!r}")
-    print(f"kept akasha_bench.db and dataset/ — the database is the source of truth")
+    print("kept akasha_bench.db and dataset/ — the database is the source of truth")
     return 0
 
 

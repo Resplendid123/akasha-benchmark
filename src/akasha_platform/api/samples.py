@@ -1,6 +1,6 @@
 """样本列表与单条明细。
 
-**一条贯穿的口径：样本列表默认按 answerMode 切分**（§12.10 的红线）。
+**一条贯穿的口径：样本列表默认按 answerMode 切分**。
 
 run001 上四条 ``recall@5 < 1.0`` 里三条是 ``answerMode: general``（生成端回落,
 ``retrievedSources`` 被无条件清空），只有一条是真的漏 gold —— 而那一条答案还是

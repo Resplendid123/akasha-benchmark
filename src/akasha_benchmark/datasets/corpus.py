@@ -47,7 +47,7 @@ class CorpusIndex:
             else:
                 self.pair_to_id[key] = doc.doc_id
 
-        # PLAN.md 0.1：(title, text) 仍重复的话，就没有任何键能定位到行了，
+        # (title, text) 仍重复的话，就没有任何键能定位到行了，
         # 此时必须报错，不能静默挑一个。
         if collisions:
             title, text = collisions[0]

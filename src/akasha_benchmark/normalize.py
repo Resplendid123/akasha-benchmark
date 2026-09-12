@@ -1,10 +1,10 @@
 """归一化：把四组原始数据整成库里的 ``sample`` + ``corpus_doc``。
 
-**库是事实来源**（PLAN.md §12 决策 2）。这一步把原始文件读进库，之后所有阶段
+**库是事实来源**。这一步把原始文件读进库，之后所有阶段
 都从库里取样本与语料；``--export`` 可以另外落一份 jsonl，那是可选导出，
 不是任何阶段的输入。
 
-这一步不依赖 Akasha 在线，改造后仍然如此（§12.2 的硬性要求）。
+这一步不依赖 Akasha 在线，改造后仍然如此。
 
     uv run python -m akasha_benchmark.normalize
     uv run python -m akasha_benchmark.normalize --dataset hotpotqa --export
@@ -98,7 +98,7 @@ def normalize_dataset(
         corpus_rows=len(corpus.docs),
         # 只报告不执行去重：musique 的重复 title 是不同段落，去重会丢 gold。
         dedup_stats=corpus.dedup_stats(),
-        # 这是**去重后**的 gold 篇数分布（§0.2），与原始标注条数不同 ——
+        # 这是**去重后**的 gold 篇数分布，与原始标注条数不同 ——
         # hotpotqa 的 supporting_facts 是 (title, 句子下标) 对，同一篇会出现多次。
         gold_count_distribution={str(k): v for k, v in sorted(gold_dist.items())},
         # 审计归因按 sha256(query) join 审计表，重复 question 会让那一行没法连。

@@ -8,8 +8,7 @@
 历史记录不靠多行：``index_layer.connection_json`` 存了入库时那份配置的快照。
 
 **这个路由会把明文密钥写进库。** 那是明确的取舍：配置要能在 UI 里填改。
-代价是 ``akasha_bench.db`` 成为凭据文件（已 gitignore），所以读回时一律只报
-``*_set`` 布尔量，绝不回传取值。
+代价是 ``akasha_bench.db`` 成为凭据文件（已 gitignore）。
 """
 
 from __future__ import annotations
@@ -26,16 +25,13 @@ from ._common import config_of, db, strip_json, writable
 
 router = APIRouter(prefix="/api")
 
-# 库里存了但不该回传的列。密钥字段另有显式的 *_set。
-SECRET_COLUMNS = ("password", "database_url")
-
 
 # ------------------------------------------------------------ Akasha 连接
 
 
 @router.get("/connection")
 def get_connection(request: Request) -> dict[str, Any]:
-    """那一份连接配置，以及上次测连接的结果。密钥只报是否已设置。"""
+    """那一份连接配置，以及上次测连接的结果。"""
     with db(request) as connection:
         row = repo.get_connection_row(connection)
         layers = repo.ingested_layers(connection)
@@ -45,10 +41,8 @@ def get_connection(request: Request) -> dict[str, Any]:
         **{
             k: v
             for k, v in stored.items()
-            if k not in SECRET_COLUMNS and not k.endswith("_json")
+            if not k.endswith("_json")
         },
-        "password_set": bool((stored.get("password") or "").strip()),
-        "database_url_set": bool((stored.get("database_url") or "").strip()),
         # 上次测连接时那份 model_configs 的快照。
         "last_model_configs": repo.loads(stored.get("last_model_configs_json")),
         # 已入库的层，连同它们各自落在哪个 workspace。改 base_url / email 之前
@@ -59,57 +53,25 @@ def get_connection(request: Request) -> dict[str, Any]:
 
 @router.put("/connection")
 def put_connection(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """改连接配置。
+    """改连接配置。**只写** —— payload 里没出现的字段保持原值，显式传空串即清空。
+    password / database_url 与 email / base_url 同款语义。
 
-    密钥字段传空串表示**不改**，不是清空 —— UI 拿不到明文，表单里那一格提交
-    上来必然是空的，当成清空会让每次改 base_url 都顺手把密码删掉。
-    要清空得显式传 ``{"clear": ["password"]}``。
+    workspace 漂移这类副作用提示不在这里出 —— 改完之后 ingest / query 在登录时
+    会按相同的判据拦住，让那一步自己说话更直接。
     """
     try:
         fields = sanitize_updates(payload)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    for key in payload.get("clear") or []:
-        if key in SECRET_COLUMNS:
-            fields[key] = ""
-
     with writable(request) as connection:
-        warnings = _identity_change_impact(connection, fields)
         repo.update_connection(connection, **fields)
         connection.commit()
 
     return {
         "updated": sorted(fields),
         "connection": get_connection(request),
-        "warnings": warnings,
     }
-
-
-def _identity_change_impact(connection, fields: dict[str, Any]) -> list[str]:
-    """改 base_url / email 会不会让已入库的层跑不了。
-
-    这两项决定登录后落在哪个 workspace，而已入库的层的 page_map 只在原来那个
-    里有意义。不阻止（可能是在修一个填错的值），但必须说出来 —— 改完之后
-    ingest / query 会在 workspace 比对上拦住，不解释的话那看起来像个 bug。
-    """
-    watched = {k: v for k, v in fields.items() if k in {"base_url", "email"}}
-    if not watched:
-        return []
-    current = repo.get_connection_row(connection)
-    changed = [k for k, v in watched.items() if (current[k] or "") != (v or "")]
-    if not changed:
-        return []
-    layers = repo.ingested_layers(connection)
-    if not layers:
-        return []
-    names = ", ".join(f"#{row['id']} {row['label']}" for row in layers)
-    return [
-        f"changing {', '.join(changed)} may land you in a different workspace, which "
-        f"affects {len(layers)} already-ingested layer(s): {names}. Their page_map rows "
-        "only exist in the workspace they were ingested into, so ingest and query will "
-        "refuse to run until you change this back or discard their ingest."
-    ]
 
 
 @router.post("/connection/test")
@@ -224,18 +186,7 @@ def get_model_configs(request: Request) -> dict[str, Any]:
         "features": list(MODEL_FEATURES),
         "live": live,
         "index_layers": layers,
-        "note": (
-            "这是 Akasha 那边的设置，不是本平台的。我们核对过：/admin/model-configs "
-            "的请求与响应里都没有 workspaceId —— 所以它至少是跨账号共享的，"
-            "改它会影响同一个部署上的其他人。compiler / embedding 改了必须新建"
-            "索引层重编译；embedding 尤其 —— 旧 chunk 的 embedding_profile 会对不上，"
-            "那些 chunk 永远召回不到。"
-        ),
-        "shared_state_warning": (
-            "多人共用一个部署时这份配置是共享可变状态。唯一的保护是入库/查询前的"
-            "快照比对：embedding 漂移拒绝执行，compiler 漂移警告。"
-            "别人改了 compiler，你会在上面那张表里看到。"
-        ),
+
     }
 
 

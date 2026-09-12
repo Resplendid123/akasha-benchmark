@@ -224,3 +224,16 @@ pre.block.tall { max-height: 520px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 13px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
+
+/* 密码显隐按钮保持在输入框内，不占用文字区域。 */
+.secret-input { position: relative; display: flex; }
+.secret-input input { width: 100%; min-width: 0; padding-right: 38px; }
+.secret-toggle {
+  position: absolute; right: 2px; top: 2px; bottom: 2px;
+  display: flex; align-items: center; justify-content: center; width: 32px;
+  border: 0; border-radius: 4px; background: transparent;
+  color: var(--muted); cursor: pointer;
+}
+.secret-toggle:hover { color: var(--accent); background: var(--accent-soft); }
+.secret-toggle:focus-visible { outline: 2px solid var(--accent); }
+.secret-toggle:disabled { opacity: 0.45; cursor: not-allowed; }

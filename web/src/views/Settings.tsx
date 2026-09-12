@@ -1,7 +1,75 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
+import type { ComponentProps, FocusEvent } from 'react'
 import { api } from '../api'
 import type { AppConnection, ConnectionTest, ModelConfigsView, Provider } from '../types'
 import { Failed, Loading, Pass, useAction, useAsync } from '../ui'
+
+// 提示性 placeholder：聚焦时空字段不该用它们填充。
+const PROMPTY_PLACEHOLDERS = new Set(['必填', '填一次即可', '已设置', '••••••••'])
+
+// 聚焦时空字段用 placeholder 填充并全选；已有值时直接全选方便覆盖。
+// 直接操作 DOM，避免触发受控 input 的 onChange 闭包——但 input 是受控的，
+// 我们也手动同步触发 React 知道这件事。
+function selectOrFill(event: FocusEvent<HTMLInputElement | HTMLTextAreaElement>) {
+  const target = event.currentTarget
+  const current = target.value ?? ''
+  if (current) {
+    target.select()
+    return
+  }
+  const placeholder = target.placeholder.trim()
+  if (!placeholder || PROMPTY_PLACEHOLDERS.has(placeholder)) {
+    target.select()
+    return
+  }
+  // 用原生 setter 写值，绕过 React 的 input value tracker，
+  // 这样下一次 onChange 能正常触发（用户接着输入会替换）。
+  const nativeSetter = Object.getOwnPropertyDescriptor(
+    target.constructor.prototype,
+    'value',
+  )?.set
+  nativeSetter?.call(target, placeholder)
+  target.dispatchEvent(new Event('input', { bubbles: true }))
+  target.select()
+}
+
+function SecretInput({
+  secretLabel = '密码',
+  ...props
+}: Omit<ComponentProps<'input'>, 'type'> & { secretLabel?: string }) {
+  const [visible, setVisible] = useState(false)
+  const generatedId = useId()
+  const id = props.id ?? generatedId
+  const action = `${visible ? '隐藏' : '显示'}${secretLabel}`
+
+  useEffect(() => {
+    if (!props.value) setVisible(false)
+  }, [props.value])
+
+  return (
+    <span className="secret-input">
+      <input {...props} id={id} type={visible ? 'text' : 'password'} />
+      <button
+        type="button"
+        className="secret-toggle"
+        aria-label={action}
+        aria-controls={id}
+        aria-pressed={visible}
+        title={action}
+        disabled={props.disabled}
+        onClick={() => setVisible((current) => !current)}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+          aria-hidden="true">
+          <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+          <circle cx="12" cy="12" r="3" />
+          {!visible && <path d="m3 3 18 18" />}
+        </svg>
+      </button>
+    </span>
+  )
+}
 
 /** 配置层：四组配置，一处改完。
  *
@@ -20,26 +88,20 @@ export function Settings() {
   return (
     <>
       <h2>配置</h2>
-      <p className="lede">
-        跑一轮要用到的全部配置都在这里：连 Akasha 的凭据、Akasha 那边编译与回答用的
-        模型、以及本平台自己要调的两个模型（judge 与归因分析）。
-      </p>
       <div className="note warn">
-        <strong>这些配置连同密钥存在 akasha_bench.db 里（明文）。</strong>
-        那个库文件因此是凭据文件 —— 它已在 .gitignore 中，但备份、拷贝、分享它
-        等于分享凭据。
+        <strong>当前配置连同密钥明文存储，只供测试环境使用。</strong>
       </div>
       <Connection />
       <AkashaModels />
       <ProviderPanel
         role="judge"
-        title="judge 模型"
-        hint="算 faithfulness 用。Akasha 只回传 apiKeySet 布尔量、从不回传 key，所以这份凭据要单独配。"
+        title="评估模型"
+        hint="LLM as a judge。Akasha 只回传 apiKeySet 布尔量、不回传 key，密钥在Akasha端配置。"
       />
       <ProviderPanel
         role="analysis"
         title="归因分析模型"
-        hint="给 badcase 归因补因果叙述。不配也能用 —— 规则归因不需要模型。"
+        hint="用于 badcase 归因。"
       />
     </>
   )
@@ -49,7 +111,7 @@ export function Settings() {
 function Connection() {
   const { data, error, loading, reload } = useAsync(() => api.connection(), [])
   const [form, setForm] = useState<Record<string, unknown>>({})
-  const save = useAction<{ warnings: string[] }>()
+  const save = useAction()
   const test = useAction<ConnectionTest>()
 
   useEffect(() => setForm({}), [data?.updated_at])
@@ -92,6 +154,8 @@ function Connection() {
           base_url
           <input
             value={value('base_url') as string}
+            placeholder="http://localhost:3000"
+            onFocus={selectOrFill}
             onChange={(event) => set('base_url', event.target.value)}
           />
         </label>
@@ -99,48 +163,42 @@ function Connection() {
           email（必须是 OWNER 账号）
           <input
             value={value('email') as string}
+            placeholder="test@example.com"
+            onFocus={selectOrFill}
             onChange={(event) => set('email', event.target.value)}
           />
         </label>
         <label className="field">
-          password{' '}
-          {data.password_set ? (
-            <span className="tag ok">已设置</span>
-          ) : (
-            <span className="tag bad">未设置</span>
-          )}
+          password
           <input
-            type="password"
-            placeholder={data.password_set ? '留空表示不改' : '必填'}
-            value={(form.password as string) ?? ''}
+            type="text"
+            placeholder="12345678"
+            value={value('password') as string}
+            onFocus={selectOrFill}
             onChange={(event) => set('password', event.target.value)}
           />
         </label>
         <label className="field">
           database_url（只读 PG）
-          {data.database_url_set ? (
-            <span className="tag ok">已设置</span>
-          ) : (
-            <span className="tag warn">未设置 → 看不到编译产物与血缘</span>
-          )}
           <input
-            type="password"
-            placeholder={data.database_url_set ? '留空表示不改' : 'postgres://…'}
-            value={(form.database_url as string) ?? ''}
+            type="text"
+            placeholder="postgres://akasha:STRONG_DB_PASSWORD@localhost:5432/akasha"
+            value={value('database_url') as string}
+            onFocus={selectOrFill}
             onChange={(event) => set('database_url', event.target.value)}
           />
         </label>
       </div>
 
-      <h4>速率与超时（只影响跑多快，不影响跑出什么）</h4>
+      <h4>查询与编译参数</h4>
       <div className="row">
         {(
           [
-            ['concurrency', '并发'],
-            ['request_interval_seconds', '请求间隔（秒）'],
-            ['timeout_seconds', '超时（秒）'],
-            ['poll_interval_seconds', '编译轮询间隔（秒）'],
-            ['poll_timeout_seconds', '编译轮询上限（秒）'],
+            ['concurrency', '查询并发数'],
+            ['request_interval_seconds', '请求最小间隔（秒）'],
+            ['timeout_seconds', '单次 HTTP 超时（秒）'],
+            ['poll_interval_seconds', '编译状态轮询间隔（秒）'],
+            ['poll_timeout_seconds', '编译等待上限（秒）'],
           ] as const
         ).map(([name, label]) => (
           <label key={name} className="field">
@@ -150,6 +208,7 @@ function Connection() {
               step="any"
               style={{ minWidth: 110 }}
               value={String(value(name))}
+              onFocus={selectOrFill}
               onChange={(event) => set(name, Number(event.target.value))}
             />
           </label>
@@ -166,11 +225,6 @@ function Connection() {
       )}
 
       {save.error && <div className="note bad">{save.error}</div>}
-      {save.result?.warnings?.map((warning) => (
-        <div key={warning} className="note warn">
-          {warning}
-        </div>
-      ))}
       {test.error && <div className="note bad">连接失败：{test.error}</div>}
       {test.result && <TestResult result={test.result} />}
       {!test.result && data.last_checked_at && (
@@ -258,7 +312,7 @@ function AkashaModels() {
             <th>provider</th>
             <th>模型</th>
             <th>baseUrl</th>
-            <th>改了要重编译吗</th>
+            <th>影响</th>
             <th />
           </tr>
         </thead>
@@ -274,9 +328,9 @@ function AkashaModels() {
                 <td className="small mono muted truncate">{entry?.baseUrl ?? '—'}</td>
                 <td className="small">
                   {rebuild ? (
-                    <span className="tag warn">要新建一层重编译</span>
+                    <span className="tag warn">需重编译</span>
                   ) : (
-                    <span className="tag">不用</span>
+                    <span className="tag">无影响</span>
                   )}
                 </td>
                 <td>
@@ -296,11 +350,6 @@ function AkashaModels() {
       </table>
 
       <DriftTable layers={data.index_layers} />
-
-      <p className="small muted">{data.note}</p>
-      <div className="note plain small" style={{ marginBottom: 0 }}>
-        {data.shared_state_warning}
-      </div>
 
       {pending && (
         <ConfirmModelChange
@@ -495,13 +544,17 @@ function ProviderPanel({
           标签
           <input
             value={form.label}
+            placeholder="default"
+            onFocus={selectOrFill}
             onChange={(event) => setForm({ ...form, label: event.target.value })}
           />
         </label>
         <label className="field">
-          base_url（OpenAI 兼容端点，如 https://x/v1）
+          base_url
           <input
             value={form.base_url}
+            placeholder="https://api.openai.com/v1"
+            onFocus={selectOrFill}
             onChange={(event) => setForm({ ...form, base_url: event.target.value })}
           />
         </label>
@@ -509,15 +562,18 @@ function ProviderPanel({
           模型
           <input
             value={form.model}
+            placeholder="gpt-4o-mini"
+            onFocus={selectOrFill}
             onChange={(event) => setForm({ ...form, model: event.target.value })}
           />
         </label>
         <label className="field">
-          api_key（留空表示不改）
-          <input
-            type="password"
+          api_key
+          <SecretInput
+            secretLabel="API Key"
             value={form.api_key}
-            placeholder={data?.[0]?.api_key_set ? '已设置' : '填一次即可'}
+            placeholder="必填"
+            onFocus={selectOrFill}
             onChange={(event) => setForm({ ...form, api_key: event.target.value })}
           />
         </label>

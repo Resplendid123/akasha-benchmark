@@ -1,14 +1,4 @@
-"""阶段参数：从库里的 ``run_config`` 读，而不是从命令行拼。
-
-平台起任务时先写一行 ``run_config``，argv 里只剩
-``python -m <module> --db <path> --run-config <id>``。
-
-这么改的直接理由是 argv 不再随参数个数增长。原先 14 个参数在 ``tasks.py``
-里逐项映射成命令行标志，每加一个旋钮要同时改那张映射表和阶段的 argparse ——
-两处漂了就会出现「UI 上改了但跑的还是默认值」，而那不报错。
-
-命令行入口保留，本地调试还用得上；``--run-config`` 存在时它的值覆盖命令行。
-"""
+"""合并命令行与 run_config 阶段参数；库中显式提供的值优先。"""
 
 from __future__ import annotations
 

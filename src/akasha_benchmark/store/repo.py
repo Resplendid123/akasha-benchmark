@@ -177,7 +177,7 @@ def replace_corpus(
 ) -> int:
     """重写一个数据集的全部语料。
 
-    **不去重**：musique 有重复 title 但它们是不同段落，去重会丢 gold（§3.6）。
+    **不去重**：musique 有重复 title 但它们是不同段落，去重会丢 gold。
     主键是 ``(dataset, doc_id)``，所以同名不同段落各占一行。
     """
     connection.execute("DELETE FROM corpus_doc WHERE dataset = ?", (dataset,))
@@ -405,7 +405,7 @@ def set_space(
     space_reused: bool,
 ) -> None:
     """记下这一层这个数据集用的 Space。每个数据集独立 Space，避免跨数据集
-    实体合并污染结果（§6.1）。"""
+    实体合并污染结果。"""
     connection.execute(
         "UPDATE index_layer_dataset SET space_id = ?, space_slug = ?, space_reused = ?"
         " WHERE index_layer_id = ? AND dataset = ?",
@@ -514,7 +514,7 @@ def recompute_subset_hash(connection: sqlite3.Connection, layer_id: int) -> str:
     两种情况下 UI 都会照着哈希把两个不同的子集当成「同一个」并列出来做对照,
     而那种对照的结论是错的。改成对 ``(dataset, doc_id, md_sha256)`` 排序后取哈希,
     它就只能表达一件事：**这两层装的是不是同一批文档**。而这正是
-    「同子集、换 embedding」那个对照实验需要判定的东西（§12.3）。
+    「同子集、换 embedding」那个对照实验需要判定的东西。
 
     抽样配置本身没有丢，它在 ``seed`` / ``qa_limit`` / ``negatives_ratio`` 三列里。
     """
@@ -532,15 +532,9 @@ def recompute_subset_hash(connection: sqlite3.Connection, layer_id: int) -> str:
 
 
 def stale_upstream(connection: sqlite3.Connection, layer_id: int) -> list[dict[str, Any]]:
-    """上游哈希链断了的数据集：归一化产物在这一层建好之后又变过。
+    """返回归一化源文件哈希与索引层快照不一致的数据集。
 
-    这是 §12.2 第 1 条（manifest 的 sha256 链）在库里的落点，而且比原来更早、
-    更便宜：原实现是在导入时逐篇重算 1722 个 md 的 sha256，而这里两个字符串
-    比对就能判出「normalize 换了数据快照，这一层的子集已经过期」。
-
-    逐篇的完整性另有 :func:`corrupt_subset_docs` 负责 —— 两者查的不是一件事：
-    这个查「上游变了没」，那个查「这一行自己坏了没」。
-    """
+    子集正文的完整性由 corrupt_subset_docs 单独检查。"""
     return [
         dict(row)
         for row in connection.execute(
@@ -721,7 +715,7 @@ def record_quality_gate(
     四项计数分开存列而不是塞进 JSON：这样「字段缺失」是 NULL、「跑了且为 0」是 0,
     两者在 SQL 里就能区分。原实现里字段取不到时每一项都是 None，
     而 ``all(value == 0)`` 对空值集合返回 True —— 闸门假通过，
-    然后拿一个半成品库跑出一堆没意义的指标（§6.4）。
+    然后拿一个半成品库跑出一堆没意义的指标。
     """
     values = [
         gates.get("missingChunkPageCount"),
@@ -744,18 +738,7 @@ def record_quality_gate(
 
 
 def index_layer_readiness(connection: sqlite3.Connection, layer_id: int) -> dict[str, Any]:
-    """这一层能不能开始跑查询。返回逐项判据与一个总的 ``ready``。
-
-    §10.1 记的缺口是：查询阶段只要求入库 manifest 存在，没检查 ``quality_passed``、
-    导入完整性和 ``runs.timed_out``（Makefile 拦了一道，Python 侧没有）。
-    三项各自对应一种「不报错但指标偏低」的失效：
-
-    * 质量闸门未过 —— 索引是半成品，recall 低但不是检索的问题
-    * 导入不完整 —— 有 gold 根本不在库里，那些样本的 recall 天然为 0
-    * 编译超时 —— 一部分页还在 BullMQ 里排队，chunk 还没生成
-
-    把判据放在库里而不是 Makefile 里，是因为平台的执行控制不走 make。
-    """
+    """检查质量闸门、导入完整性与编译状态，返回逐项判据和 ready。"""
     layer = get_index_layer(connection, layer_id)
     if layer is None:
         return {"ready": False, "reasons": [f"index layer #{layer_id} does not exist"]}
@@ -1009,13 +992,7 @@ def completed_sample_ids(
 def delete_failed_responses(
     connection: sqlite3.Connection, query_layer_id: int, dataset: str | None = None
 ) -> int:
-    """删掉非 2xx 的响应行，让下一次运行重试它们。
-
-    这是 §10.1「失败行恢复策略」的落点：原实现里失败行会被续跑无条件跳过,
-    而简单追加又会造成重复 sample_id。现在主键是
-    ``(query_layer_id, sample_id)``，重复插入直接违反约束 ——
-    所以重试的唯一正道是先显式删除，删了多少行是可见的。
-    """
+    """删除非 2xx 响应，让下次续跑重试；返回删除条数。"""
     sql = (
         "DELETE FROM query_response WHERE query_layer_id = ?"
         " AND (http_status < 200 OR http_status >= 300)"
@@ -1040,7 +1017,7 @@ def record_response(
     error: str | None,
     response: Any,
 ) -> None:
-    """落一条响应。**存完整响应体**，不是当下用得到的那几个字段（§7.2）。
+    """落一条响应。**存完整响应体**，不是当下用得到的那几个字段。
 
     ``answer_mode`` 顺手抽成列：它是「检索指标」与「生成端拒答」的分界,
     每次筛选都去解析 JSON 太贵。抽取失败不影响落盘 —— 原始 JSON 仍是权威。
@@ -1120,7 +1097,7 @@ def request_window(connection: sqlite3.Connection, query_layer_id: int) -> tuple
     """这一层实际请求的时间窗，从行里现算。
 
     **不存快照**是有意的：原实现把窗口存进 manifest，而续跑时 manifest 会被本次
-    请求的统计覆盖，于是审计只看到最后一段，早期请求全部漏掉（§10.1）。
+    请求的统计覆盖，于是审计只看到最后一段，早期请求全部漏掉。
     从 ``requested_at`` 的 min/max 现算，天然覆盖累积的全部会话。
     """
     row = connection.execute(
@@ -1219,7 +1196,7 @@ def clear_eval_results(connection: sqlite3.Connection, eval_layer_id: int) -> No
     """清掉一个评测层的确定性结果，供重跑。
 
     **刻意不动 judge_verdict 与 annotation**：judge 判决要花钱重算，标注根本
-    无法重算。重跑确定性指标不该顺手把它们清掉（§12.7）。
+    无法重算。重跑确定性指标不该顺手把它们清掉。
     """
     for table in ("sample_metric", "sample_eval", "metric_summary", "dataset_eval"):
         connection.execute(f"DELETE FROM {table} WHERE eval_layer_id = ?", (eval_layer_id,))
@@ -1297,7 +1274,7 @@ def record_metric_summary(
 
     两份口径必须都存：``no_match`` 与 ``general`` 无条件返回空 retrievedSources,
     所以 ``overall`` 把「生成端拒答」也算进了检索指标，两份的差值就是这个效应
-    的规模（§8）。
+    的规模。
     """
     connection.executemany(
         "INSERT INTO metric_summary (eval_layer_id, dataset, scope, metric, value,"
@@ -1327,7 +1304,7 @@ def record_dataset_eval(
     """数据集级的评测记录。
 
     ``omitted_metrics`` 与 ``omission_reason`` 必须成对写：narrativeqa 没有 gold,
-    检索指标一律省略并写明原因，**不伪造 0 分**（§8）。少一列的话报告里就只剩
+    检索指标一律省略并写明原因，**不伪造 0 分**。少一列的话报告里就只剩
     一个空白，读者会自己填上「大概是 0」这个错误结论。
     """
     connection.execute(
@@ -1396,7 +1373,7 @@ def sample_evals(
     按 answerMode 过滤是默认视图的基础，不是可选筛选器：run001 上四条
     ``recall@5 < 1.0`` 里三条是 ``answerMode: general``（生成端回落，
     retrievedSources 被无条件清空），只有一条是真的漏 gold。混在一起看会把
-    1 条检索问题读成 4 条（§12.10）。
+    1 条检索问题读成 4 条。
     """
     sql = "SELECT * FROM sample_eval WHERE eval_layer_id = ?"
     params: list[Any] = [eval_layer_id]
@@ -1694,7 +1671,7 @@ def add_annotation(
     刻意不加外键：删掉一个评测层不该带走样本层的标注。
 
     ``author_kind`` 只有 human / model 两种，同表只差这一列 —— 于是
-    judge-human 一致率是一个 GROUP BY 就能算出来的免费产物（§12.5）。
+    judge-human 一致率是一个 GROUP BY 就能算出来的免费产物。
     """
     cursor = connection.execute(
         """
@@ -1737,7 +1714,7 @@ def label_agreement(connection: sqlite3.Connection, level: str = "sample") -> li
     """同一目标上 human 与 model 标注的一致情况。
 
     这是把两者放进同一张表换来的免费产物，而它是判断「这个 LLM 归因能不能信」
-    的唯一办法（§12.5）。只统计两边都标过的目标 —— 单边标注无从比较。
+    的唯一办法。只统计两边都标过的目标 —— 单边标注无从比较。
     """
     return [
         dict(r)
@@ -2033,43 +2010,6 @@ def discard_ingest(connection: sqlite3.Connection, layer_id: int) -> dict[str, i
     return counts
 
 
-# ------------------------------------------------------------------ 应用配置
-#
-# 现在只剩一个键：default_connection_id。连接本身在 connection 表里。
-
-
-def get_app_config(connection: sqlite3.Connection) -> dict[str, Any]:
-    """读全部配置项。空表返回空字典，由 config 层套默认值。"""
-    return {
-        row["key"]: loads(row["value_json"])
-        for row in connection.execute("SELECT key, value_json FROM app_config")
-    }
-
-
-def set_app_config(connection: sqlite3.Connection, values: dict[str, Any]) -> int:
-    """逐项写入。**只写传进来的键**，没传的保持原值。
-
-    整体替换会让「只改一个 base_url」的请求把密码清空 —— 而那个失效要等到
-    下一次 ingest 登录失败才会发现。
-    """
-    now = utc_now()
-    for key, value in values.items():
-        connection.execute(
-            """
-            INSERT INTO app_config (key, value_json, updated_at) VALUES (?,?,?)
-            ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,
-                                           updated_at=excluded.updated_at
-            """,
-            (key, dumps(value), now),
-        )
-    return len(values)
-
-
-def delete_app_config(connection: sqlite3.Connection, key: str) -> int:
-    cursor = connection.execute("DELETE FROM app_config WHERE key = ?", (key,))
-    return cursor.rowcount
-
-
 # -------------------------------------------------------------- 模型 provider
 
 
@@ -2083,11 +2023,7 @@ def upsert_model_provider(
     api_key: str = "",
     params: dict[str, Any] | None = None,
 ) -> int:
-    """存一个 judge / analysis 端点。同 (role, label) 覆盖。
-
-    密钥只有这一条来路。曾经还支持「存环境变量名、运行时从那里读」，删了 ——
-    同一份密钥有两个来源时，「填了但没生效」查不出来。
-    """
+    """保存 judge 或 analysis 端点；同角色、同标签覆盖，密钥存库。"""
     now = utc_now()
     connection.execute(
         """

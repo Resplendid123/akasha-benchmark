@@ -47,9 +47,9 @@ export interface AppConnection {
   poll_interval_seconds: number
   poll_timeout_seconds: number
   updated_at: string
-  /** 密钥只报是否已设置，**取值不回传**。 */
-  password_set: boolean
-  database_url_set: boolean
+  /** 库中明文存储，UI 直接读写，与 base_url / email 同路。 */
+  password: string
+  database_url: string
   last_checked_at: string | null
   last_check_ok: number | null
   last_check_role: string | null
@@ -97,9 +97,6 @@ export interface ModelConfigsView {
     embedding_matches: boolean
     compiler_matches: boolean
   }>
-  note: string
-  /** 多人共用一个部署时这份配置是共享可变状态。 */
-  shared_state_warning: string
 }
 
 export interface Provider {

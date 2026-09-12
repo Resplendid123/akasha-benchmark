@@ -4,11 +4,11 @@
 评估编排在 [evaluate.py](../src/akasha_benchmark/evaluate.py)。
 
 ```bash
-uv run python -m akasha_benchmark.evaluate --run-id run001
-uv run python -m akasha_benchmark.evaluate --run-id run001 --k 5 --k 20   # 自定义 k
+uv run python -m akasha_benchmark.evaluate --query-label run001-query
+uv run python -m akasha_benchmark.evaluate --query-label run001-query --k 5 --k 20   # 自定义 k
 ```
 
-离线产出三个文件：
+确定性评测默认写入数据库；加 `--export` 可在 `data/reports/{eval_label}/` 导出：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -25,17 +25,11 @@ uv run python -m akasha_benchmark.evaluate --run-id run001 --k 5 --k 20   # 自�
 | 引用归因 | [attribution.py](../src/akasha_benchmark/metrics/attribution.py) | 找到了的有没有真的用上 |
 | 多跳专项 | [multihop.py](../src/akasha_benchmark/metrics/multihop.py) | 图扩展有没有净贡献 |
 
-## 先读这一节：数字不能直接跟公开 baseline 比
+## 比较前先对齐口径
 
-Akasha 的稠密与词法召回跑在**编译器生成的文本**上（`knowledge_chunks` 索引的是
-`artifact.markdown`），不是原始文档。原文在 `knowledge_source_chunks` 里，不参与召回，只在引用解析阶段提供证据窗口。会导致两个问题：
-
-- Recall@k 被系统性压低。
-- 多跳成绩可能被抬高，因为编译器会把跨文档的同一实体合并成一个 artifact，
-  两个 hop 可能被直接连成一条 graph edge，而不是靠两次独立检索各自找到。
-
-所以拿这些数跟 HippoRAG 2 之类的公开结果比是**无效的**。唯一有意义的对照是
-原文基线。
+Akasha 检索编译产物，编译可能遗漏或改写原文，也可能改变跨文档实体关系。
+指标同时受编译、检索和答案形态影响；不能仅凭单个案例断言整体偏高或偏低。
+与公开结果比较前需对齐语料、样本、检索单位和输出格式。原文检索基线可用于隔离编译的影响。
 
 ## 答案质量 QA
 
@@ -81,26 +75,14 @@ musique 数据集中的别名在归一化时已并入 `answers`，narrativeqa �
 `answer_mode_distribution` 报各 `answerMode` 的占比，缺失值单独归到 `missing`
 而不是并进别的桶。`no_match` 率和 `general` 兜底率是「检索没喂够料」的直接信号。
 
-### 为什么 EM 预期恒为 0
+### EM 与答案长度
 
-**EM = 0 是这套架构的正常读数，不是系统坏了。** EM 要求整串归一化后完全相等，
-而 Akasha 返回解释性散文，hotpotqa / 2wiki / musique 的参考答案是短跨度，
-两者不可能相等。
-
-2026-09-09 的在线冒烟（hotpotqa 3 条）实测：三条答案**全部实质正确**、
-gold 全部召回（`recall@10` 与 `full_coverage@10` 均为 1.000），EM 仍是 0.000。
-
-所以 EM **只能当形态探针读**：它变成非 0 意味着生成端开始输出短跨度答案
-（换了 answer prompt 或换了模型），而不是意味着答案变对了。判断答案对不对，
-看 F1 配合 `citation_precision` / `evidence_verifiable_rate` 和人工抽查。
-
-报出来而不是藏起来，是因为「一列 0」加一段解释比「读者发现少了一列」更好 ——
-熟悉 hotpotqa 的人会主动去找这一列。`report.md` 因此在表格上方直接写明预期为 0，
-`test_evaluate_pipeline.py` 与 `test_live_akasha.py` 各有一条断言钉住这段说明必须在。
+EM 要求归一化后的整段答案完全相等。解释性长答案即使包含正确答案也可能得零，
+但输出与参考一致时仍得 1。结合 F1、引用证据和人工抽查解读，不能将 EM 零分直接等同于语义错误。
 
 ### 为什么 F1 也低：precision 塌了
 
-F1 受同一效应影响但**仍然是变化的**，所以它是这组里唯一可读的数。同一批冒烟
+F1 受同一效应影响但**仍然是变化的**，可用于观察词面重叠。同一批冒烟
 逐 token 分解（用 `tokenize` 重算，mean F1 = 0.0946，与报告一致）：
 
 | sample | \|pred\| | \|gold\| | shared | P | R | F1 |
@@ -170,13 +152,13 @@ liver[q] damage[q]
 
 - 只在**同配置之间**比较（比如调 `scoreThreshold` 前后），不与公开 baseline 比
 - 判断答案对不对，看 `citation_precision` / `evidence_verifiable_rate` 配合人工抽查
-- §9 的原文基线是唯一有意义的对照 —— 它跑在同一个生成端上、啰嗦程度相当，
+- 原文基线有助于隔离编译影响 —— 它跑在同一个生成端上、啰嗦程度相当，
   所以两者的 F1 差值仍然可读
 
 想让绝对值本身可读，需要加「答案是否包含参考答案」的宽松指标（containment）。
 **目前没有实现**，因为它同样有偏 —— 散文越长越容易蒙中，且上面那两条全名样本
 它同样判 0（整串包含不成立，实测 3 条只命中 1 条）。加不加取决于要回答什么问题，
-见 PLAN.md §10.3。
+
 
 ### narrativeqa 的答案分数有个措辞造成的上限
 
@@ -257,11 +239,8 @@ nDCG@k = DCG@k / IDCG@k          IDCG 为 0 时返回 0
 ### 没有 gold 就拒绝计算
 
 `recall_at_k` 和 `ndcg_at_k` 在 gold 为空时**抛 ValueError**，分母无定义。
-数据集级别则由 `require_evidence_capability` 挡在更前面：narrativeqa 没声明
-`EVIDENCE_RECALL`，请求检索指标会抛 `CapabilityError`。
-
-`evaluate.py` 对它直接**跳过整组检索指标**，并在汇总里写一条 `retrieval_note`
-说明原因。返回 0.0 会被平均进汇总，然后看起来像检索效果差，而不是像一个 bug。
+数据集依赖由 `DataDependency` 和指标 registry 校验。narrativeqa 没有 `gold_docs`，
+`evaluate.py` 省略相应指标，并记录 `omitted_metrics` 和 `omission_reason`，避免把未定义值记为零分。
 
 ## 引用归因
 
@@ -391,7 +370,7 @@ HTTP 失败的行**不跳过**，F1 记 0 照样参与统计，因为失败率�
 只有走审计表这一条路：
 
 ```bash
-uv run python -m akasha_benchmark.audit_join --run-id run001
+uv run python -m akasha_benchmark.audit_join --query-label run001-query
 ```
 
 逐样本三个原始计数直接取自 `metadata`，缺失按 0：

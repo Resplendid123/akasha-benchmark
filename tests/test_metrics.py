@@ -1,8 +1,4 @@
-"""指标算法：拿手算的值对，外加 capability 闸门。
-
-这些数字都是能手算验证的，不是「跑一遍看着差不多」——
-指标算错了不会报错，只会给出一个看着合理的假结果。
-"""
+"""指标算法：拿手算的值对，外加 数据依赖校验。"""
 
 from __future__ import annotations
 
@@ -90,56 +86,25 @@ def test_normalize_answer_is_the_standard_recipe():
     assert qa.normalize_answer("An apple, an orange.") == "apple orange"
 
 
-def test_f1_takes_max_over_references():
-    """多参考取 max。"""
-    scored = qa.score_answer("the beatles", ["The Beatles", "Beatles band"])
-    assert scored["f1"] == 1.0
-
-    partial = qa.score_answer("John Lennon", ["Lennon"])
-    # 共有 1 个词；precision 1/2、recall 1/1，F1 = 2/3。
-    assert partial["f1"] == pytest.approx(2 / 3)
-
-
-def test_score_answer_reports_both_em_and_f1():
-    """两个指标都报，各自独立对多参考取 max。"""
-    scored = qa.score_answer("the beatles", ["The Beatles"])
-    assert set(scored) == {"em", "f1"}, f"expected em and f1, got {sorted(scored)}"
-    assert scored["em"] == 1.0
-    assert scored["f1"] == 1.0
+@pytest.mark.parametrize(
+    "prediction,references,expected",
+    [
+        pytest.param("the beatles", ["The Beatles", "Beatles band"], {"em": 1, "f1": 1}, id="first-reference"),
+        pytest.param("beatles", ["beatles band", "The Beatles"], {"em": 1, "f1": 1}, id="best-reference"),
+        pytest.param("John Lennon", ["Lennon"], {"em": 0, "f1": 2 / 3}, id="partial"),
+        pytest.param("The genus is Flavivirus", ["Flavivirus"], {"em": 0, "f1": 0.5}, id="prose"),
+    ],
+)
+def test_score_answer(prediction, references, expected):
+    assert qa.score_answer(prediction, references) == pytest.approx(expected)
 
 
 def test_exact_match_is_whole_string_after_normalization():
     """EM 比的是整串归一化结果，不是包含关系。"""
     assert qa.exact_match("The Beatles!", "beatles") == 1.0
-    # 多一个词就不算 —— 这正是散文答案恒为 0 的机制。
+    # 包含参考答案但多出词语时，EM 仍为零。
     assert qa.exact_match("the beatles band", "beatles") == 0.0
     assert qa.exact_match("Flavivirus", "flavivirus") == 1.0
-
-
-def test_em_and_f1_take_max_independently():
-    """两个指标各自取 max，不是先挑一条参考再算两个数。
-
-    ``em`` 在第二条参考上满分、``f1`` 在第一条上更高，所以「先选参考」的写法
-    会给出一个两边都不对的组合。
-    """
-    scored = qa.score_answer("beatles", ["beatles band", "The Beatles"])
-    assert scored["em"] == 1.0  # 对上第二条
-    assert scored["f1"] == 1.0  # 同样对上第二条，但取 max 后与选谁无关
-
-
-def test_verbose_answer_zeroes_em_but_not_f1():
-    """散文答案：EM 归 0，F1 仍是正数 —— 这就是两者要分开读的理由。
-
-    数字很低（这里约 0.13），所以 F1 的绝对值不可跨系统比较；
-    但它随答案质量变化，而 EM 在这种形态下恒为 0。
-    """
-    verbose = (
-        "The disease described is yellow fever, which is caused by the yellow fever "
-        "virus belonging to the genus Flavivirus."
-    )
-    scored = qa.score_answer(verbose, ["Flavivirus"])
-    assert scored["em"] == 0.0, "EM must be 0 for prose that merely contains the answer"
-    assert 0.0 < scored["f1"] < 0.3, scored
 
 
 def test_f1_empty_prediction():

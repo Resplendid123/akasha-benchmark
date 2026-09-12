@@ -111,7 +111,7 @@ def ensure_space(
 
 
 def verify_upstream(connection: sqlite3.Connection, layer_id: int) -> None:
-    """§12.2 第 1 条：上游 sha256 链。断了就抛错，不静默继续。
+    """校验上游 sha256 链。断了就抛错，不静默继续。
 
     断链的含义是「normalize 换过数据快照，而这一层的子集是照旧快照抽的」。
     带着这种状态导入，page_map 记的身份与库里的语料对不上，之后每个指标都
@@ -197,7 +197,7 @@ def import_corpus(
             md_sha256=actual,
         )
         # 逐条提交：Web 端要在这 15 小时里看到进度，憋到最后一次性提交
-        # 等于整个入库期间库里是空的（§12.2）。
+        # 等于整个入库期间库里是空的。
         connection.commit()
         imported += 1
         if position % 25 == 0 or position == len(todo):
@@ -219,7 +219,7 @@ def wait_for_runs(client: AkashaClient, space_ids: list[str], config: Any) -> di
     一部分页编译成功一部分没有，指标会因此偏低但不会报错。
 
     编译并发不在我们手里：真正在编译的是 Akasha 的 BullMQ worker，
-    观察到的约 40 秒/篇是那边的吞吐，客户端怎么调都改不了（§12.8）。
+    观察到的约 40 秒/篇是那边的吞吐，客户端怎么调都改不了。
     """
     deadline = time.monotonic() + config.poll_timeout_seconds
     last: dict[str, Any] = {}
@@ -243,7 +243,7 @@ def wait_for_runs(client: AkashaClient, space_ids: list[str], config: Any) -> di
 def check_quality(
     client: AkashaClient, connection: sqlite3.Connection, layer_id: int, space_ids: list[str]
 ) -> tuple[bool, dict[str, Any]]:
-    """§6.4 的入库完整性闸门，结果写进 ``quality_gate``。
+    """入库完整性闸门，结果写进 ``quality_gate``。
 
     字段名是 camelCase（``knowledge-quality.service.ts``）。取不到值时四项都是
     None，而 ``all(value == 0)`` 对空值集合返回 True —— 那正是信封没剥那次
@@ -421,7 +421,7 @@ def run(
         if incomplete:
             print(f"\nincomplete page_map for: {incomplete}", file=sys.stderr)
             return 1
-        # 超时独立触发失败退出：编译没跑完就去查询，指标偏低但不报错（§10.1）。
+        # 超时独立触发失败退出：编译没跑完就去查询，指标偏低但不报错。
         if timed_out:
             print(
                 "\ncompile runs timed out — do not proceed to the query stage. "
@@ -438,7 +438,7 @@ def run(
             )
             return 1
         if skip_compile:
-            # --skip-compile 是调试入口，不等于质量验收通过（§6.4）。
+            # --skip-compile 是调试入口，不等于质量验收通过。
             print(
                 "\n--skip-compile: the index is incomplete and the quality gate did not run. "
                 "This is NOT an accepted ingest; the query stage will refuse to start.",

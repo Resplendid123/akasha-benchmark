@@ -59,7 +59,7 @@ def stage_attribution(metadata: dict[str, Any], gold_hit: bool) -> dict[str, Any
     """把一条审计记录拆成三段损失。
 
     这些是**计数**，帮助定位损失发生在哪一段，不是逐 gold 的因果归因 ——
-    报告不能把计数差解释为已证明的逐文档归因（§8.5）。``gold_hit`` 来自离线
+    报告不能把计数差解释为已证明的逐文档归因。``gold_hit`` 来自离线
     ``hit@10``，不是候选集里的 gold 命中。
     """
     candidates = metadata.get("candidateChunkCount") or 0
@@ -148,7 +148,7 @@ def run(
             return 1
 
         # 时间窗从响应行的 min/max 现算，覆盖累积的全部会话 —— 存快照会在续跑时
-        # 被本次统计覆盖，审计于是漏掉早期请求（§10.1）。
+        # 被本次统计覆盖，审计于是漏掉早期请求。
         window = repo.request_window(connection, query_layer_id)
         if window is None:
             print(f"ERROR query layer {query_label!r} has no responses", file=sys.stderr)

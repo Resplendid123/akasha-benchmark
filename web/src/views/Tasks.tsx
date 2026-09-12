@@ -164,7 +164,7 @@ function TaskRow({
   return (
     <tr className={open ? 'selected' : ''}>
       <td className="mono">{task.id}</td>
-      <td>{task.stage}</td>
+      <td>{task.stage === 'verify' ? '小样本验证' : task.stage}</td>
       <td>
         <span className={STATUS_CLASS[task.status]}>{STATUS_TEXT[task.status]}</span>
       </td>
@@ -203,7 +203,7 @@ function TaskRow({
                   return result
                 })
               }
-              title="停止是可续跑的：重新起同一阶段会接着上次的进度"
+              title={task.stage === 'verify' ? '停止验证，保留已生成的层与远端 Space' : '停止是可续跑的：重新起同一阶段会接着上次的进度'}
             >
               停止
             </button>

@@ -43,7 +43,7 @@ function CurrentConnection({ onOpenSettings }: { onOpenSettings: () => void }) {
     <div className="clickable" onClick={onOpenSettings} title={`${data.email} @ ${data.base_url}`}>
       <span className="muted">akasha</span>{' '}
       <strong className="mono">{data.base_url.replace(/^https?:\/\//, '')}</strong>
-      {!data.password_set && (
+      {!data.password && (
         <span className="tag bad" style={{ marginLeft: 4 }}>
           未配密码
         </span>
@@ -133,6 +133,7 @@ export function App() {
             onSelectLayer={setActiveIndexLayer}
             onOpenReport={openReport}
             onOpenSettings={() => setView('settings')}
+            onOpenTasks={() => setView('tasks')}
           />
         )}
         {view === 'report' && (

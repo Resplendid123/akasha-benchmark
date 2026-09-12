@@ -121,6 +121,13 @@ def stages() -> list[dict[str, Any]]:
     """
     return [
         {
+            "stage": "verify",
+            "label": "小样本验证",
+            "args": sorted(tasks_mod.STAGE_ARGS["verify"]),
+            "cost": "1–5 条样本，自动入库编译、查询和评测；会调用模型，产物保留",
+            "needs_akasha": True,
+        },
+        {
             "stage": "normalize",
             "label": "归一化",
             "args": sorted(tasks_mod.STAGE_ARGS["normalize"]),

@@ -1,9 +1,4 @@
-"""平台设置。
-
-**安全红线**（§12.10）：这个服务持有 Akasha 管理员凭据、只读数据库连接、
-以及启动长任务的能力。默认只绑 ``127.0.0.1``；绑非回环地址时若没设访问令牌,
-:func:`Settings.validate_binding` 会**拒绝启动** —— 不是「以后再说」的项。
-"""
+"""平台启动设置；绑定非回环地址时必须配置访问令牌。"""
 
 from __future__ import annotations
 
@@ -15,7 +10,6 @@ from pathlib import Path
 from akasha_benchmark.store.db import DEFAULT_DB_PATH
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-WEB_DIST = REPO_ROOT / "web" / "dist"
 
 ENV_PREFIX = "AKASHA_PLATFORM_"
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
@@ -26,9 +20,6 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8848
     db_path: Path = DEFAULT_DB_PATH
-    # 前端构建产物。存在就挂 StaticFiles，单进程单端口；不存在就只提供 API,
-    # 开发时用 Vite dev server 代理过来。
-    web_dist: Path = WEB_DIST
     # 非空则要求所有请求带 X-Auth-Token。绑非回环地址时必须非空。
     auth_token: str = ""
     # 开发时 Vite dev server 的地址，用于 CORS。
@@ -59,21 +50,13 @@ class Settings:
             "host": self.host,
             "port": self.port,
             "db_path": str(self.db_path),
-            "web_dist_present": self.web_dist.is_dir(),
             "auth_required": bool(self.auth_token),
             "loopback_only": self.is_loopback(),
         }
 
 
 def load_settings() -> Settings:
-    """从环境变量读设置。``AKASHA_PLATFORM_*`` 前缀。
-
-    **这是唯一一组仍走环境变量的配置**，因为它是 bootstrap：库的位置本身就在
-    里面（``DB``），所以它不可能从库里读。它也从不与库里的值重复，
-    所以不属于「配置有两个来源」那个问题。
-
-    host / port / db 另有命令行参数（见 :func:`..main.main`）。
-    """
+    """读取 AKASHA_PLATFORM_*；host、port、db 还可由命令行覆盖。"""
 
     def env(name: str, default: str = "") -> str:
         return os.environ.get(f"{ENV_PREFIX}{name}", default)
@@ -86,7 +69,6 @@ def load_settings() -> Settings:
         host=host,
         port=int(env("PORT", "8848")),
         db_path=Path(env("DB", str(DEFAULT_DB_PATH))),
-        web_dist=Path(env("WEB_DIST", str(WEB_DIST))),
         auth_token=token,
     )
 

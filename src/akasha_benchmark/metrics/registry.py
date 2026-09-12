@@ -1,17 +1,4 @@
-"""指标 registry：**指标声明依赖，数据集声明拥有，闸门做集合比对**。
-
-这是 PLAN.md §12.4 决策 10 的落点。反转之前，判据是数据集「支持不支持某个指标」;
-反转之后，判据是数据集「有没有这个指标要的那种标注」。
-
-差别在新增指标时才看得出来。faithfulness 不需要任何标注，对四组都成立 ——
-旧口径下没法声明它（声明「narrativeqa 支持 faithfulness」是句废话，因为
-支持与否根本不取决于数据集），新口径下它的 ``requires`` 就是空集，
-闸门自然放行。
-
-**一个具体收获**：narrativeqa 现在整组检索指标省略（无 gold 文档），
-而 faithfulness / context precision 不需要 gold 就能算。它恰恰最需要 ——
-46% 的参考答案措辞在原文里根本不存在，F1 绝对值在这组上信息量最低。
-"""
+"""指标声明所需依赖，数据集声明已有标注；缺少依赖时省略指标。"""
 
 from __future__ import annotations
 
@@ -92,8 +79,7 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         "em",
         FAMILY_QA,
         _ANSWERS,
-        "Exact Match。**在这套架构上预期恒为 0**：Akasha 返回解释性散文，参考答案"
-        "是短跨度，整串相等不可能成立。当答案**形态**的探针读，不当质量指标读",
+        "Exact Match：归一化后的答案整串相等。解释性长答案通常得分较低，需结合 F1 和证据解读。",
     ),
     _definition(
         "f1",
@@ -113,7 +99,7 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         FAMILY_ATTRIBUTION,
         _GOLD,
         "被截断掉的 gold 篇数。标了 citation_dropped 的样本这一项应 > 0，"
-        "不一致说明判断或指标有一个错了（§12.5 的交叉验证）",
+        "不一致说明判断或指标有一个错了",
         higher_is_better=False,
     ),
     _definition(

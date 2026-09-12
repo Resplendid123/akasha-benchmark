@@ -91,7 +91,7 @@ export const api = {
   // --- 连接（只有一份）---
   connection: () => request<AppConnection>('/api/connection'),
   saveConnection: (payload: Record<string, unknown>) =>
-    request<{ updated: string[]; connection: AppConnection; warnings: string[] }>(
+    request<{ updated: string[]; connection: AppConnection }>(
       '/api/connection',
       { method: 'PUT', body: JSON.stringify(payload) },
     ),

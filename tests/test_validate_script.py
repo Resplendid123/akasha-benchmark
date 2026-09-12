@@ -1,13 +1,4 @@
-"""校验脚本：它现在核对的是**库里的产物**，不是磁盘上的 jsonl。
-
-这个文件存在的直接原因是一次真实的漏改：`normalize` 改成写库之后，
-`validate_datasets.py` 仍在读 `data/normalized/*/manifest.json`，于是
-`make validate`（以及依赖它的 `make subset` / `make offline`）整条链断掉，
-而 pytest 全绿 —— 没有任何用例覆盖这个脚本。
-
-所以这里锁住三件事：脚本能对着库跑通、上游哈希变了要报错、库不存在时
-给的是一句清楚的提示而不是深处冒出来的异常。
-"""
+"""校验脚本：它现在核对的是**库里的产物**，不是磁盘上的 jsonl。"""
 
 from __future__ import annotations
 
@@ -34,11 +25,7 @@ _spec.loader.exec_module(validate_datasets)
 
 
 def test_script_exposes_a_db_backed_signature():
-    """签名必须是 ``(dataset, dataset_dir, connection)``。
-
-    这一条直接锁住那次漏改的形态：函数体改成读库了，但签名还留着 ``data_dir``,
-    于是调用处传什么都能过类型检查，运行时才炸。
-    """
+    """签名必须是 ``(dataset, dataset_dir, connection)``。"""
     parameters = validate_datasets.validate.__code__.co_varnames[:3]
     assert parameters == ("dataset", "dataset_dir", "connection")
 
@@ -102,11 +89,7 @@ def test_missing_dataset_row_points_at_the_normalize_stage(db: Path):
 
 @needs_dataset
 def test_upstream_hash_drift_is_reported(db: Path):
-    """库里记的原始文件 sha256 与磁盘不一致时必须报错。
-
-    这是上游哈希链的起点。不一致意味着 normalize 之后原始数据又换过，
-    这一层的下游全部过期 —— 而这种失效本身不会报错，只会给出看着正常的数字。
-    """
+    """库里记的原始文件 sha256 与磁盘不一致时必须报错。"""
     connection = connect(db)
     try:
         _seed(connection, qa_sha256="9" * 64)
@@ -120,10 +103,7 @@ def test_upstream_hash_drift_is_reported(db: Path):
 
 @needs_dataset
 def test_a_real_normalize_then_validate_round_trip_passes(db: Path):
-    """归一化进库再校验，必须通过 —— 这是 `make offline` 那条链的核心一环。
-
-    顺带锁住那次漏改：只要 validate 又去读磁盘 manifest，这条就会失败。
-    """
+    """归一化进库再校验，必须通过 —— 这是 `make offline` 那条链的核心一环。"""
     from akasha_benchmark.normalize import normalize_dataset
 
     connection = connect(db)
@@ -135,7 +115,7 @@ def test_a_real_normalize_then_validate_round_trip_passes(db: Path):
         connection.close()
 
     assert report.ok, report.errors
-    # 那几条实测统计要在 notes 里，它们是人核对用的（§0.1、§0.2）。
+    # 那几条实测统计要在 notes 里，它们是人核对用的。
     assert any("gold_count_distribution={2: 1000}" in note for note in report.notes)
     assert any("provides=gold_docs,reference_answers" in note for note in report.notes)
 

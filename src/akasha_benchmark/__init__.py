@@ -29,4 +29,4 @@ def main() -> None:
     print("\nStages:")
     for module, description in STAGES:
         print(f"  python -m akasha_benchmark.{module:<12} {description}")
-    print("\n每个模块都支持 --help。详见 README.md 和 PLAN.md。")
+    print("\n每个模块都支持 --help。详见 README.md。")

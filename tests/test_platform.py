@@ -1,9 +1,4 @@
-"""平台后端：绑定安全、answerMode 默认切分、任务白名单、原文/编译 diff。
-
-这几条各自对着一个具体后果：绑 0.0.0.0 不设认证等于把 Akasha 管理员凭据交出去;
-样本列表不按 answerMode 切分会把 1 条检索问题读成 4 条；任务 argv 不走白名单
-等于装了个远程执行入口。
-"""
+"""平台后端：绑定安全、answerMode 默认切分、任务白名单、原文/编译 diff。"""
 
 from __future__ import annotations
 
@@ -26,7 +21,7 @@ DATASET = "hotpotqa"
 
 
 def test_refuses_to_bind_a_public_address_without_a_token():
-    """§12.10 的红线：这个服务持有 Akasha 管理员凭据、只读数据库连接、
+    """红线：这个服务持有 Akasha 管理员凭据、只读数据库连接、
     以及启动长任务的能力。暴露到 0.0.0.0 而不设认证等于把三样一起交出去。"""
     with pytest.raises(RuntimeError, match="refusing to bind"):
         Settings(host="0.0.0.0", auth_token="").validate_binding()
@@ -49,7 +44,7 @@ def test_settings_never_expose_the_token():
 def test_token_is_enforced_on_every_request(tmp_path: Path):
     db = tmp_path / "t.db"
     migrate(db, verbose=False)
-    app = create_app(Settings(db_path=db, auth_token="right-token", web_dist=tmp_path / "none"))
+    app = create_app(Settings(db_path=db, auth_token="right-token"))
     client = TestClient(app)
 
     assert client.get("/api/health").status_code == 401
@@ -61,12 +56,7 @@ def test_token_is_enforced_on_every_request(tmp_path: Path):
 
 
 def test_argv_is_built_from_a_whitelist(tmp_path: Path):
-    """argv 只从白名单取模块名，参数走库不走命令行。
-
-    argv 的长度因此固定，不随参数个数增长 —— 原先 14 个参数逐项映射成命令行
-    标志，每加一个旋钮要同时改映射表和阶段的 argparse，两处漂了就会出现
-    「界面上改了但跑的还是默认值」。
-    """
+    """argv 只从白名单取模块名，参数走库不走命令行。"""
     settings = Settings(db_path=tmp_path / "t.db")
     argv = _argv("ingest", 7, settings)
     assert argv[1:3] == ["-m", "akasha_benchmark.ingest"]
@@ -83,11 +73,7 @@ def test_unknown_stage_is_rejected(tmp_path: Path):
 
 
 def test_unmapped_arguments_never_reach_the_stage(tmp_path: Path):
-    """请求体里的未知键不会进 run_config，阶段代码也就读不到它们。
-
-    ``run_config.args_json`` 是通过 HTTP 写进来的，而阶段进程把它当参数读。
-    不过滤等于让请求体决定阶段代码看到什么 —— 那是个远程执行面。
-    """
+    """请求体里的未知键不会进 run_config，阶段代码也就读不到它们。"""
     cleaned = _clean_args("ingest", {"label": "x", "evil": "--dangerous", "extra_flag": True})
     assert cleaned == {"label": "x"}
 
@@ -142,21 +128,12 @@ def test_every_whitelisted_stage_maps_to_a_real_module():
 
 
 def test_every_stage_with_args_has_a_module_and_vice_versa():
-    """两张白名单必须对齐。
-
-    只在一张里出现的阶段是个静默的坑：有模块没参数表 -> 起任务时报「未知阶段」;
-    有参数表没模块 -> 拼 argv 时才报。
-    """
+    """两张白名单必须对齐。"""
     assert set(STAGE_ARGS) == set(STAGE_MODULES)
 
 
 def test_stage_arg_names_exist_on_the_stage_parsers():
-    """参数表里的键必须是阶段 argparse 真的认的属性。
-
-    这一条防的是最隐蔽的那种漂移：UI 传 ``qa_limit``、阶段声明的是
-    ``qa_limit``，改名之后 run_args.apply 会静默跳过它 —— 界面上改了，
-    跑的还是默认值，而没有任何地方报错。
-    """
+    """参数表里的键必须是阶段 argparse 真的认的属性。"""
     import importlib
 
     # datasets 走 dataset 的特例映射，provider_label 也是显式 dest。
@@ -170,10 +147,7 @@ def test_stage_arg_names_exist_on_the_stage_parsers():
 
 
 def _declared_dests(module) -> set[str]:
-    """跑一遍阶段的 main parser，收集它声明了哪些 dest。
-
-    直接构造 parser 而不是解析 ``--help`` 文本 —— 后者会随格式变化而碎。
-    """
+    """跑一遍阶段的 main parser，收集它声明了哪些 dest。"""
     import argparse
     from unittest.mock import patch
 
@@ -198,11 +172,7 @@ def _declared_dests(module) -> set[str]:
 
 
 def test_diff_reports_words_the_compiler_dropped():
-    """§12.9 的根因形态：编译把查询需要的短语删了。
-
-    原文有 Grammy / Emmy，编译产物没有，而问题问的正是这两个词 ——
-    于是词法召回在这条样本上必然断，且这不是调参能救的。
-    """
+    """根因形态：编译把查询需要的短语删了。"""
     source = (
         "Guests in the album include the Grammy and Emmy award winning Cyndi Lauper, "
         "along with other artists."
@@ -224,10 +194,7 @@ def test_diff_reports_words_the_compiler_dropped():
 
 
 def test_diff_expansion_ratio_shows_compilation_expands():
-    """编译**不是压缩而是扩写**（实测中位 2.19 倍）。
-
-    这个比值让读者自己看到「丢词是改写策略，不是空间不足」。
-    """
+    """编译**不是压缩而是扩写**（实测中位 2.19 倍）。"""
     result = diff.diff_vocabulary("short source", "a much longer compiled rendition " * 5)
     assert result["expansion_ratio"] > 1
 
@@ -243,15 +210,12 @@ def test_stopwords_do_not_count_as_dropped():
     assert result["dropped"] == []
 
 
-# --- answerMode 默认切分（§12.10 的红线）------------------------------------
+# --- answerMode 默认切分------------------------------------
 
 
 @pytest.fixture
 def seeded(tmp_path: Path):
-    """一个装好 4 条样本的评测层：3 条 general（检索得分按定义为 0）+ 1 条真漏 gold。
-
-    这正是 run001 上那四条 ``recall@5 < 1.0`` 的形态。
-    """
+    """一个装好 4 条样本的评测层：3 条 general（检索得分按定义为 0）+ 1 条真漏 gold。"""
     db = tmp_path / "t.db"
     migrate(db, verbose=False)
     from akasha_benchmark.store import connect
@@ -331,17 +295,13 @@ def seeded(tmp_path: Path):
             connection, eval_id, sample_id, DATASET, {"recall@5": recall}
         )
     connection.commit()
-    app = create_app(Settings(db_path=db, web_dist=tmp_path / "none"))
+    app = create_app(Settings(db_path=db))
     yield TestClient(app), eval_id, connection
     connection.close()
 
 
 def test_sample_list_groups_by_answer_mode_without_being_asked(seeded):
-    """按 answerMode 分组是**默认行为**，不是可选筛选器。
-
-    ``no_match`` / ``general`` 无条件返回空 retrievedSources，检索得分按定义为 0。
-    混在一起读会把生成端拒答误当成检索失败。
-    """
+    """按 answerMode 分组是**默认行为**，不是可选筛选器。"""
     client, eval_id, _ = seeded
     body = client.get(f"/api/layers/eval/{eval_id}/samples").json()
     assert set(body["by_answer_mode"]) == {"general", "knowledge"}
@@ -350,10 +310,7 @@ def test_sample_list_groups_by_answer_mode_without_being_asked(seeded):
 
 
 def test_worst_samples_expose_the_answer_mode_split(seeded):
-    """失败案例入口必须先给出按 answerMode 的计数。
-
-    否则「最差的 4 条」里 3 条是生成端回落，读者会把 1 条检索问题读成 4 条。
-    """
+    """失败案例入口必须先给出按 answerMode 的计数。"""
     client, eval_id, _ = seeded
     body = client.get(f"/api/layers/eval/{eval_id}/worst?metric=recall@5&limit=4").json()
     assert body["count_by_answer_mode"]["general"] == 3
@@ -379,26 +336,22 @@ def test_worst_respects_metric_direction(seeded):
 
 def test_metric_definitions_expose_requires_and_direction():
     """前端靠 requires 决定某列该不该显示，靠 higher_is_better 决定排序方向。"""
-    app = create_app(Settings(db_path=Path("nonexistent.db"), web_dist=Path("nope")))
+    app = create_app(Settings(db_path=Path("nonexistent.db")))
     client = TestClient(app)
     definitions = {d["name"]: d for d in client.get("/api/metrics/definitions").json()}
 
     assert definitions["recall"]["requires"] == ["gold_docs"]
-    # faithfulness 不需要任何标注，所以四组都成立 —— 这是 §12.4 的具体收获。
+    # faithfulness 不需要任何标注，所以四组都成立 —— 这是 具体收获。
     assert definitions["faithfulness"]["requires"] == []
     assert definitions["truncation_loss"]["higher_is_better"] is False
     assert definitions["recall"]["per_k"] is True
 
 
 def test_lineage_returns_503_without_a_readonly_database(tmp_path: Path):
-    """没配 database_url 时给一句明确的 503，其余视图照常工作。
-
-    不 patch 任何东西：空库里 app_config 就是空的，所以 database_url 为空 ——
-    这正是「刚建好库还没配」的真实状态。
-    """
+    """没配 database_url 时给一句明确的 503，其余视图照常工作。"""
     db = tmp_path / "t.db"
     migrate(db, verbose=False)
-    client = TestClient(create_app(Settings(db_path=db, web_dist=tmp_path / "none")))
+    client = TestClient(create_app(Settings(db_path=db)))
 
     response = client.get("/api/lineage/some-page-id")
     assert response.status_code == 503

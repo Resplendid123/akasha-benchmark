@@ -12,7 +12,7 @@ narrativeqa 走另一条路：它没有 gold 标注，而且 293 个问题只覆
 整篇整篇地取文档（连同该文档的全部 chunk），再取属于这些文档的问题。
 
 产出进库（``subset_sample`` / ``subset_doc``），**md 正文也进库** —— 入库阶段
-从库里取正文上传。这一步不依赖 Akasha 在线（§12.2 的硬性要求）。
+从库里取正文上传。这一步不依赖 Akasha 在线。
 
     uv run python -m akasha_benchmark.subset --label run002
     uv run python -m akasha_benchmark.subset --label run002 --dataset hotpotqa --qa-limit 100
@@ -134,7 +134,7 @@ def build_subset(
     # 两个层会拿到同样的哈希却是完全不同的子集（实测：同 seed 不同 label,
     # hotpotqa 400 篇里只重叠 30 篇）。那让 subset_hash 变成一个会说谎的字段。
     #
-    # 更要紧的是它会毁掉 §12.3 要的那个对照实验：「同子集、换 embedding」需要
+    # 更要紧的是它会毁掉 对照实验：「同子集、换 embedding」需要
     # 两个层拿到**同一批**文档，而 label 必须唯一，于是永远凑不出来。
     # 想换一批样本就换 seed —— 那本来就是 seed 的职责，不需要第二个旋钮。
     rng = random.Random(f"{adapter.name}:{seed}")

@@ -8,7 +8,7 @@
 * 库里存 pid 与退出码，后端重启后还能认出「这个任务还在跑」
 
 ingest 的进度条本质是「帮我盯着别人干活」—— 真正在编译的是 Akasha 的
-BullMQ worker，观察到的约 40 秒/篇是那边的吞吐（§12.8）。
+BullMQ worker，观察到的约 40 秒/篇是那边的吞吐。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from .settings import Settings
 
 # 阶段名 -> 模块。**白名单**：argv 由这里拼，不接受请求体里的任意命令。
 STAGE_MODULES = {
+    "verify": "akasha_platform.verify",
     "normalize": "akasha_benchmark.normalize",
     "subset": "akasha_benchmark.subset",
     "ingest": "akasha_benchmark.ingest",
@@ -54,6 +55,7 @@ class TaskRejected(RuntimeError):
 # 改成先写库、argv 只带一个 id 之后，映射表退化成「允许哪些键 + 什么类型」——
 # 少了「标志名」这一列，也就少了一处会与阶段 argparse 漂开的地方。
 STAGE_ARGS: dict[str, dict[str, type]] = {
+    "verify": {"dataset": str, "samples": int},
     "normalize": {"datasets": list, "export": bool},
     "subset": {
         "label": str,
@@ -183,17 +185,34 @@ def start(stage: str, args: dict[str, Any], settings: Settings) -> dict[str, Any
     """起一个阶段任务，立刻返回。返回库里那条 task 记录。"""
     connection = connect(settings.db_path)
     try:
-        # 同一阶段不允许并行：两个 ingest 同时往一个 Space 导会造出重复 page,
-        # 而 page_map 里只会有一条 —— 那种重复发现不了。
-        running = [t for t in repo.running_tasks(connection) if t["stage"] == stage]
+        # 小样本验证跨多个阶段，执行期间不允许其他阶段任务并行。
+        running = [
+            t for t in repo.running_tasks(connection)
+            if t["stage"] == stage or stage == "verify" or t["stage"] == "verify"
+        ]
         if running:
             raise TaskRejected(
-                f"a {stage} task is already running (task #{running[0]['id']}). "
-                "Running two of the same stage concurrently can create duplicate pages "
+                f"a {running[0]['stage']} task is already running (task #{running[0]['id']}). "
+                "Verification runs exclusively; overlapping stages can create duplicate pages "
                 "that no page_map row points at."
             )
 
-        run_config_id = repo.create_run_config(connection, stage, _clean_args(stage, args))
+        cleaned = _clean_args(stage, args)
+        if stage == "verify":
+            from .verify import DATASETS
+            from akasha_benchmark.config import load_config
+
+            if cleaned.get("dataset", "hotpotqa") not in DATASETS:
+                raise TaskRejected("小样本验证仅支持 hotpotqa、2wikimultihopqa、musique")
+            if not 1 <= cleaned.get("samples", 3) <= 5:
+                raise TaskRejected("验证样本数必须在 1–5 之间")
+            if repo.get_dataset(connection, cleaned.get("dataset", "hotpotqa")) is None:
+                raise TaskRejected("请先归一化所选数据集")
+            try:
+                load_config(connection).require_credentials()
+            except ValueError as exc:
+                raise TaskRejected(str(exc)) from exc
+        run_config_id = repo.create_run_config(connection, stage, cleaned)
         argv = _argv(stage, run_config_id, settings)
         task_id = repo.create_task(
             connection,

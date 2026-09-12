@@ -1,18 +1,4 @@
-"""连接配置（单例）与那两道防静默失效的闸门。
-
-**这一组的核心是一个不报错的失效**。把连接改到另一个 workspace 后重跑 ingest：
-
-1. ``_find_space`` 走 ``list_spaces``，那是按当前 workspace 过滤的
-2. 新 workspace 下找不到同 slug 的 space -> ``ensure_space`` 建一个新的
-3. ``set_space`` 覆盖库里的 space_id
-4. ``page_map`` 里的 page_id 还指向旧 workspace 的页
-
-之后查询照常跑，每条都召回不到 —— 看起来像「这批语料检索效果差」，
-而不像一个配置错误。所以这两道闸门必须**拒绝执行**，不是警告。
-
-连接只有一份（``CHECK (id = 1)``），只能改。历史记录靠
-``index_layer.connection_json`` 与 ``workspace_id`` —— 它们记的是入库时的值。
-"""
+"""连接配置（单例）与那两道防静默失效的闸门。"""
 
 from __future__ import annotations
 
@@ -102,7 +88,7 @@ def seeded(tmp_path: Path):
     )
     connection.commit()
 
-    api = TestClient(create_app(Settings(db_path=db, web_dist=tmp_path / "none")))
+    api = TestClient(create_app(Settings(db_path=db)))
     yield api, connection, layer_id
     connection.close()
 
@@ -111,11 +97,7 @@ def seeded(tmp_path: Path):
 
 
 def test_the_connection_is_a_singleton_enforced_by_the_schema(tmp_path: Path):
-    """只有一份配置，而且这一点写在 schema 里而不是只写在代码里。
-
-    只靠代码约束的话，任何一处漏判就能插进第二行，而那时「哪一行是真的」
-    就成了个没有答案的问题。
-    """
+    """只有一份配置，而且这一点写在 schema 里而不是只写在代码里。"""
     import sqlite3
 
     db = tmp_path / "t.db"
@@ -144,11 +126,7 @@ def test_there_is_no_way_to_add_or_remove_a_connection(seeded):
 
 
 def test_workspace_mismatch_uses_the_server_resolved_value(seeded):
-    """判据是**登录后 users/me 解析出的** workspace，不是任何配置项。
-
-    workspace 由服务端决定（自建部署走 ``workspaceRepo.findFirst()``），客户端
-    选不了。所以配置上没有这一项，比对的另一头是层入库时记下的值。
-    """
+    """判据是**登录后 users/me 解析出的** workspace，不是任何配置项。"""
     _, connection, layer_id = seeded
     # 登录到同一个 workspace：放行。
     assert repo.workspace_mismatch(connection, layer_id, "ws-a") is None
@@ -162,11 +140,7 @@ def test_workspace_mismatch_uses_the_server_resolved_value(seeded):
 
 
 def test_readiness_does_not_claim_to_check_the_workspace(seeded):
-    """``index_layer_readiness`` 是纯库函数，登不了 Akasha。
-
-    所以它**不做** workspace 比对 —— 只把层记下的那个值报出来，让调用方拿服务端
-    的值去判。假装在这里判过会让人以为离线就能发现问题。
-    """
+    """``index_layer_readiness`` 是纯库函数，登不了 Akasha。"""
     _, connection, layer_id = seeded
     readiness = repo.index_layer_readiness(connection, layer_id)
     assert readiness["workspace_recorded"] == "ws-a"
@@ -185,11 +159,7 @@ def test_a_layer_without_spaces_is_not_workspace_checked(seeded):
 
 
 def test_a_layer_without_a_recorded_workspace_is_not_compared(seeded):
-    """reindex 导进来的历史层可能没记 workspace_id，那时无从比较。
-
-    但 ``ensure_space`` 的 space 身份校验仍然拦得住 —— 那一道更强，
-    它比的是 space_id 而不是 workspace。
-    """
+    """reindex 导进来的历史层可能没记 workspace_id，那时无从比较。"""
     _, connection, layer_id = seeded
     repo.update_index_layer(connection, layer_id, workspace_id=None)
     connection.commit()
@@ -214,28 +184,20 @@ class _FakeClient:
         return {"id": f"new-{slug}", "slug": slug}
 
 
-def test_ensure_space_rejects_a_different_space_with_the_same_slug():
-    """**slug 相同不等于同一个 space。**
-
-    ``list_spaces`` 按当前 workspace 过滤，所以换了 workspace 之后同一个 slug 会
-    解析到另一个 space。照旧复用它就等于把语料导进了错的地方，
-    而库里记的 page_id 全部悬空。
-    """
+@pytest.mark.parametrize(
+    "spaces,message",
+    [
+        ([{"id": "space-OTHER", "slug": "benchhotpotqaL"}], "Same slug, different space"),
+        ([], "not visible under the current connection"),
+    ],
+    ids=["different-space", "missing-space"],
+)
+def test_ensure_space_rejects_invalid_recorded_identity(spaces, message):
     from akasha_benchmark.ingest import ensure_space
 
-    client = _FakeClient([{"id": "space-OTHER", "slug": "benchhotpotqaL"}])
-    with pytest.raises(RuntimeError, match="Same slug, different space"):
+    client = _FakeClient(spaces)
+    with pytest.raises(RuntimeError, match=message):
         ensure_space(client, DATASET, "L", "bench", "space-a")
-
-
-def test_ensure_space_rejects_a_missing_space_when_one_was_recorded():
-    """库里记了 space 但现在看不到它 —— 那意味着换了 workspace。"""
-    from akasha_benchmark.ingest import ensure_space
-
-    client = _FakeClient([])
-    with pytest.raises(RuntimeError, match="not visible under the current connection"):
-        ensure_space(client, DATASET, "L", "bench", "space-a")
-    # 不能悄悄建一个新的。
     assert client.created == []
 
 
@@ -273,11 +235,7 @@ def test_discarding_ingest_needs_an_explicit_confirmation(seeded):
 
 
 def test_discarding_ingest_keeps_the_subset_and_the_remote_spaces(seeded):
-    """清产物只清入库结果。
-
-    子集是离线抽的，与连接无关，所以留着 —— 否则要重抽，而重抽可能得到另一批
-    样本（seed 相同才不会）。远端的 space 也不删：我们不删别人的数据。
-    """
+    """清产物只清入库结果。"""
     api, connection, layer_id = seeded
     repo.replace_subset(
         connection, layer_id, DATASET, [],
@@ -299,11 +257,7 @@ def test_discarding_ingest_keeps_the_subset_and_the_remote_spaces(seeded):
 
 
 def test_discarding_clears_the_identity_that_no_longer_holds(seeded):
-    """config_hash、模型快照与入库身份也要清掉。
-
-    它们是「这一层在那个部署上编译出来的东西」的身份。留着会让下一次入库看起来
-    像是复用了一个已经封好的层，而那个身份已经不成立了。
-    """
+    """config_hash、模型快照与入库身份也要清掉。"""
     api, connection, layer_id = seeded
     repo.seal_index_layer(connection, layer_id, "hash-abc")
     repo.update_index_layer(connection, layer_id, model_configs_json='{"x":1}')
@@ -333,16 +287,7 @@ def test_discarding_a_layer_that_was_never_ingested_is_rejected(seeded):
 
 
 def test_resampling_an_ingested_layer_is_refused(seeded):
-    """已入库的层拒绝重抽子集。
-
-    ``replace_subset`` 删 ``subset_doc`` 但**不动 page_map**，所以重抽之后两者
-    指向不同的文档集 —— 而条数往往仍然相等（同一个 qa_limit 抽出来的语料规模
-    差不多），于是那种状态看起来是正常的。接下来查询打在装着旧文档的 Space 上、
-    指标按新 gold 算，每条检索数都是 0，看起来像检索烂到极点。
-
-    这一道是「编辑抽样参数」那个入口的前提：不拦住的话那就是一个会静默毁层的
-    按钮。
-    """
+    """已入库的层拒绝重抽子集。"""
     from akasha_benchmark.subset import LayerAlreadyIngested, ensure_layer
 
     _, connection, _ = seeded
@@ -376,11 +321,7 @@ def test_a_layer_that_was_never_ingested_can_be_resampled(seeded):
 
 
 def test_readiness_compares_document_sets_not_counts(seeded):
-    """兜底：假设重抽还是发生了，readiness 必须发现。
-
-    **按集合比，不按条数比。** 条数相等而集合不同是可能的，而那正是最危险的
-    形态 —— 它看起来完全正常。
-    """
+    """兜底：假设重抽还是发生了，readiness 必须发现。"""
     _, connection, layer_id = seeded
     repo.record_quality_gate(
         connection,
@@ -433,20 +374,18 @@ def test_readiness_compares_document_sets_not_counts(seeded):
 # --- 改配置的影响 -----------------------------------------------------------
 
 
-def test_changing_the_identity_warns_about_ingested_layers(seeded):
-    """改 base_url / email 可能落到另一个 workspace。
-
-    不阻止（可能是在修一个填错的值），但必须说出影响 —— 改完之后那些层在
-    ingest/query 时被拦住，不解释的话看起来像个 bug。
+def test_put_connection_is_a_pure_write(seeded):
+    """PUT /api/connection 只写,不附带副作用提示。
+    workspace 漂移的拦阻交回给 ingest / query 登录那一步。
     """
     api, _, _ = seeded
     body = api.put("/api/connection", json={"base_url": "http://elsewhere:3000"}).json()
-    assert body["warnings"]
-    assert "already-ingested" in body["warnings"][0]
+    assert "warnings" not in body
+    assert body["connection"]["base_url"] == "http://elsewhere:3000"
 
-    # 改速率不影响任何东西，不该报警。
+    # 改速率同样干净。
     quiet = api.put("/api/connection", json={"concurrency": 4}).json()
-    assert quiet["warnings"] == []
+    assert "warnings" not in quiet
 
 
 def test_the_connection_view_exposes_ingested_layers(seeded):
@@ -458,11 +397,7 @@ def test_the_connection_view_exposes_ingested_layers(seeded):
 
 
 def test_the_layer_view_reports_the_ingest_identity_not_the_current_config(seeded):
-    """层上显示的是**入库时**的身份，不是现在的配置。
-
-    配置改过之后这两者会不同，而层的 page_map 属于前者 —— 显示后者会让人以为
-    那一层跑在新配置上。
-    """
+    """层上显示的是**入库时**的身份，不是现在的配置。"""
     api, _, layer_id = seeded
     api.put("/api/connection", json={"base_url": "http://changed:3000"})
 
@@ -475,28 +410,12 @@ def test_the_layer_view_reports_the_ingest_identity_not_the_current_config(seede
 # --- 迁移 -------------------------------------------------------------------
 
 
-def test_the_migration_backfills_without_losing_ingest_products(tmp_path: Path):
-    """连接那几次迁移的验收标准：**已入库的产物一行都不能丢。**
-
-    真库里那 1722 行 page_map 是真实 Akasha 实例里的页，重挣一遍约 19 小时编译。
-    所以这条用例把「迁移前有数据」这个场景摆出来：先在 001+002 的 schema 上造出
-    一层已入库的数据与一份 app_config，再跑其余的，然后逐项核对。
-
-    只在空库上验证过的迁移，第一次真用就炸 —— 而这一类事故的代价是那 19 小时。
-    """
-    from akasha_benchmark.store.migrate import discover
+def test_baseline_preserves_populated_legacy_database(tmp_path: Path):
+    """Adopting the final schema must preserve credentials and ingest products."""
+    from akasha_benchmark.store.migrate import LEGACY_CHECKSUMS
 
     db = tmp_path / "t.db"
-    migrations = Path(__file__).resolve().parents[1] / "migrations"
-    # 先只跑到 002（连接那一组之前）。按序号切而不是按文件名硬编码。
-    early = tmp_path / "early"
-    early.mkdir()
-    for path in discover(migrations):
-        if int(path.stem.split("_", 1)[0]) > 2:
-            continue
-        (early / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    migrate(db, early, verbose=False)
-
+    migrate(db, verbose=False)
     connection = connect(db)
     repo.upsert_dataset(
         connection,
@@ -515,16 +434,15 @@ def test_the_migration_backfills_without_losing_ingest_products(tmp_path: Path):
         gold_count_distribution={},
         unique_question_texts=1,
     )
-    # 002 时代的配置形态：散在 app_config 的键值里。
-    repo.set_app_config(
-        connection,
-        {
-            "base_url": "http://legacy:3000",
-            "email": "legacy@example.com",
-            "password": "legacy-pw",
-            "concurrency": 3,
-            "request_interval_seconds": 1.5,
-        },
+    connection.execute("DELETE FROM schema_migration")
+    connection.executemany(
+        "INSERT INTO schema_migration VALUES (?, '2026-01-01T00:00:00Z', ?)",
+        LEGACY_CHECKSUMS.items(),
+    )
+    connection.execute(
+        "UPDATE connection SET base_url=?, email=?, password=?, concurrency=?, "
+        "request_interval_seconds=? WHERE id=1",
+        ("http://legacy:3000", "legacy@example.com", "legacy-pw", 3, 1.5),
     )
     ingested = repo.create_index_layer(
         connection, label="old", subset_hash="s1", seed=1, qa_limit=1,
@@ -553,8 +471,9 @@ def test_the_migration_backfills_without_losing_ingest_products(tmp_path: Path):
     connection.commit()
     connection.close()
 
-    # 现在跑其余的迁移。
-    migrate(db, migrations, verbose=False)
+    assert migrate(db, verbose=False) == ["001_initial"]
+    assert migrate(db, verbose=False) == []
+    assert db.with_name("t.db.pre-baseline").is_file()
 
     connection = connect(db)
     # 产物一行不丢。
@@ -562,7 +481,7 @@ def test_the_migration_backfills_without_losing_ingest_products(tmp_path: Path):
     assert repo.spaces_of(connection, ingested) == {DATASET: "space-legacy"}
     assert repo.get_query_layer(connection, query_layer_id) is not None
 
-    # app_config 的配置迁进了 connection，**含密钥与非默认的数值**。
+    # 保留密钥与非默认数值。
     row = repo.get_connection_row(connection)
     assert row["base_url"] == "http://legacy:3000"
     assert row["password"] == "legacy-pw"
@@ -580,6 +499,5 @@ def test_the_migration_backfills_without_losing_ingest_products(tmp_path: Path):
     query_columns = {r[1] for r in connection.execute("PRAGMA table_info(query_layer)")}
     assert "connection_id" not in query_columns
 
-    # app_config 清空了：配置全在 connection 里。
-    assert repo.get_app_config(connection) == {}
+    assert connection.execute("SELECT version FROM schema_migration").fetchall()[0][0] == "001_initial"
     connection.close()

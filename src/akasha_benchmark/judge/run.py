@@ -2,7 +2,7 @@
 
 所以它落在 ``judge_verdict``、进指标层、参与汇总 —— 与 F1/recall 同层，
 只是需要一个模型。LLM 归因与人工标注是另外两件事，它们进 ``annotation``、
-不参与汇总（§12.5），别合。
+不参与汇总，别合。
 
 两条硬规则：
 
@@ -160,7 +160,7 @@ def run(
         )
         connection.commit()
 
-        # provider 的身份哈希只吃 base_url + model，绝不吃 api_key（§12.5）。
+        # provider 的身份哈希只吃 base_url + model，绝不吃 api_key。
         provider_hash = identity.judge_hash(
             base_url=provider.base_url, model=provider.model, params=None
         )

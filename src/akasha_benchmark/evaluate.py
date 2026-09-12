@@ -7,7 +7,7 @@
 两份的差值就是这个效应的规模。
 
 指标能不能算，由**数据依赖**决定而不是数据集名字：指标声明 ``requires``、
-数据集声明 ``provides``、闸门做集合比对（§12.4）。算不了的指标连同原因一起
+数据集声明 ``provides``、闸门做集合比对。算不了的指标连同原因一起
 记进 ``dataset_eval``，**不伪造 0 分**。
 
     uv run python -m akasha_benchmark.evaluate --query-label run002-query
@@ -367,22 +367,15 @@ def _format_report(label: str, summaries: list[dict[str, Any]], context: dict[st
         "Akasha 的向量召回与词法召回跑在**编译产物**上，而不是原始文档：",
         "`knowledge_chunks` 索引的是 `artifact.markdown`。原文存在",
         "`knowledge_source_chunks` 里，它不参与召回，只在解析引用时提供证据窗口。",
-        "两个后果：Recall@k 被系统性压低，且这种压低不是调参能补回来的；多跳表现",
-        "则取决于编译器有没有把跨文档的实体连起来。",
-        "**因此把这里的数字直接与公开 baseline 对比是无效的。**唯一有意义的对照",
-        "是原文基线（raw-text baseline）。",
+        "编译可能遗漏或改写原文信息，也可能改变跨文档关系。与公开 baseline 比较前，",
+        "需对齐语料、样本、检索单位和答案格式；原文基线可帮助隔离编译影响。",
         "",
-        "`no_match` 和 `general` 两种回答返回空的 `retrievedSources`，它们的检索得分",
-        "按定义就是 0。所以每张检索表都给两份：一份是全样本，一份只算 `knowledge`",
-        "回答。两者之差反映的是生成侧的拒答，不是检索失败。",
+        "返回空 retrievedSources 的回落响应会得到零检索分。报告同时给出全样本和",
+        "knowledge 切片，帮助区分生成侧回落与检索结果。",
         "",
-        "**这里的 Exact Match 预期就是 0.0000，这不是故障。**",
-        "EM 要求归一化后的整段答案与参考答案完全相等，而 Akasha 用解释性散文作答，",
-        "这些数据集的参考答案却是短跨度，两者不可能相等。",
-        "把 EM 当作答案**形状**的探针，而不是答案质量的度量：它变成非零意味着",
-        "生成侧开始输出短跨度，而不是答案变好了。Answer F1 被同样的冗长度稀释",
-        "（精确率被压垮，因为分母是 20-40 个散文 token，而参考答案只有 1-5 个），",
-        "所以它只能用于比较本系统的不同配置，绝不能与公开数字对比。",
+        "**Exact Match 要求归一化后的答案整串相等。**",
+        "解释性长答案通常得分较低，但并非必然为零。F1 也受答案长度影响，",
+        "应结合引用证据与人工抽查解读。",
         "",
         "## 运行配置",
         "",
@@ -408,7 +401,7 @@ def _format_report(label: str, summaries: list[dict[str, Any]], context: dict[st
             f"（HTTP 失败：{summary['http_failures']}）",
             f"- 回答模式分布：{summary['answer_mode_distribution']}",
             f"- answer EM：{overall.get('em', 0.0):.4f}"
-            f"（仅 knowledge：{knowledge.get('em', 0.0):.4f}）— 预期为 0，原因见上",
+            f"（仅 knowledge：{knowledge.get('em', 0.0):.4f}）— 受答案格式影响，见上",
             f"- answer F1：{overall.get('f1', 0.0):.4f}"
             f"（仅 knowledge：{knowledge.get('f1', 0.0):.4f}）",
         ]

@@ -149,37 +149,15 @@ def test_subset_is_deterministic_for_a_seed(normalized):
     other_id, _ = _build(normalized, label="r2", seed=8)
     assert repo.subset_doc_hashes(normalized, other_id, "hotpotqa") != first
 
-
-def test_same_seed_different_label_gives_the_same_subset(normalized):
-    """**同 seed、不同 label 必须抽出同一批文档。**
-
-    这条锁住的是一个会说谎的字段。抽样的随机源一旦含 label，两个层就会拿到
-    相同的 ``subset_hash`` 却是完全不同的子集 —— 实测过：同 seed 不同 label,
-    hotpotqa 400 篇里只重叠 30 篇，而 UI 会照着哈希把它们当成「同一个子集」
-    并列出来做对照。
-
-    更要紧的是 §12.3 那个对照实验：「同子集、换 embedding」需要两个层拿到
-    同一批文档，而 label 必须唯一 —— 随机源含 label 的话永远凑不出来。
-    """
-    left, _ = _build(normalized, label="exp-a", seed=11)
-    right, _ = _build(normalized, label="exp-b", seed=11)
-
-    assert repo.subset_doc_hashes(normalized, left, "hotpotqa") == repo.subset_doc_hashes(
-        normalized, right, "hotpotqa"
-    )
-    # 于是 subset_hash 说的就是实话。
-    assert (
-        repo.get_index_layer(normalized, left)["subset_hash"]
-        == repo.get_index_layer(normalized, right)["subset_hash"]
-    )
+    same_seed_id, _ = _build(normalized, label="r3", seed=7)
+    assert repo.subset_doc_hashes(normalized, same_seed_id, "hotpotqa") == first
+    assert repo.get_index_layer(normalized, same_seed_id)["subset_hash"] == repo.get_index_layer(
+        normalized, layer_id
+    )["subset_hash"]
 
 
 def test_subset_hash_differs_whenever_the_documents_differ(normalized):
-    """反向：文档集不同时，subset_hash 必须也不同。
-
-    这两条合起来才是「哈希与内容一致」。只测一个方向的话，
-    一个恒定的哈希也能通过。
-    """
+    """反向：文档集不同时，subset_hash 必须也不同。"""
     left, _ = _build(normalized, label="s1", seed=11)
     right, _ = _build(normalized, label="s2", seed=12)
 
@@ -193,11 +171,7 @@ def test_subset_hash_differs_whenever_the_documents_differ(normalized):
 
 
 def test_resampling_drops_documents_from_the_earlier_sampling(normalized):
-    """重抽样必须清掉上一次的文档。
-
-    留着的话入库会把它们一起导进 Akasha，语料规模悄悄变大，而 page_map 与
-    子集的条数比对是入库的验收标准之一 —— 那道闸门会因此失效。
-    """
+    """重抽样必须清掉上一次的文档。"""
     layer_id, first = _build(normalized, qa_limit=10, seed=7)
     stale_doc = sorted(repo.subset_doc_hashes(normalized, layer_id, "hotpotqa"))[0]
 
@@ -261,12 +235,7 @@ def test_read_jsonl_reports_the_offending_line(tmp_path: Path):
 
 
 def test_config_comes_only_from_the_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """配置只有一个来源：库里的 connection 表。
-
-    曾经有两条旁路（akasha.config.json、AKASHA_* 环境变量覆盖），两条都删了 ——
-    同一份配置有多个来源时，「我改了但没生效」是查不出来的。这条用例锁住那个
-    决定：设了同名环境变量也不该影响读出来的值。
-    """
+    """配置只有一个来源：库里的 connection 表。"""
     from akasha_benchmark.store import connect, repo
     from akasha_benchmark.store.migrate import migrate
 
@@ -292,35 +261,28 @@ def test_config_comes_only_from_the_database(tmp_path: Path, monkeypatch: pytest
     assert config.request_interval_seconds == 0.5
 
 
-def test_config_for_ui_never_returns_secret_values(tmp_path: Path):
-    """设置页拿到的视图里只有「是否已设置」，没有取值。
-
-    UI 必须能显示「密码已配」而不必持有它 —— 那个字符串一旦进了前端，
-    就会出现在浏览器的内存、可能的日志与任何一次截图里。
-    """
+def test_config_for_ui_returns_secrets_for_settings_page(tmp_path: Path):
+    """设置页拿到的视图里 password / database_url 与 base_url 同路,明文带回。"""
     config = AkashaConfig(password="hunter2", database_url="postgres://u:p@h/db")
     view = config.for_ui()
-    assert view["password_set"] is True
-    assert view["database_url_set"] is True
-    assert "hunter2" not in json.dumps(view)
-    assert "password" not in view
+    assert view["password"] == "hunter2"
+    assert view["database_url"] == "postgres://u:p@h/db"
+    assert "password_set" not in view
+    assert "database_url_set" not in view
 
 
-def test_secret_fields_treat_an_empty_string_as_no_change():
-    """密钥字段传空串是「不改」，不是「清空」。
-
-    UI 拿不到明文，表单里那一格提交上来必然是空的。当成清空的话，
-    每次改 base_url 都会顺手把密码删掉 —— 而那个失效要等到下一次
-    ingest 登录失败才会发现。
+def test_sanitize_updates_passes_fields_through():
+    """password / database_url 与 base_url 同款：传啥就写啥,空串即清空。
+    不出现的字段不进库,自然就是「不改」。
     """
     from akasha_benchmark.config import sanitize_updates
 
     cleaned = sanitize_updates({"base_url": "http://x", "password": "", "database_url": ""})
-    assert cleaned == {"base_url": "http://x"}
+    assert cleaned == {"base_url": "http://x", "password": "", "database_url": ""}
 
     # 非空则照常写入。
     assert sanitize_updates({"password": "pw"}) == {"password": "pw"}
-    # 未知键丢掉，不让它们进表变成噪音。
+    # 未知键丢掉,不让它们进表变成噪音。
     assert sanitize_updates({"evil": "x"}) == {}
 
 

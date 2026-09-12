@@ -1,16 +1,4 @@
-"""从磁盘产物重建库里的产物索引。
-
-存在的理由只有一个：``page_map`` 里那些 ``page_id`` 是真实 Akasha 实例里的行,
-重新挣一遍要烧约 15 小时编译（1722 篇 × 约 40 秒）。§12.9 的血缘视图要靠它们
-跳到 ``knowledge_pages``，所以这批 id 必须能搬进新库。
-
-**只动产物表。** ``annotation`` / ``judge_verdict`` / ``judge_provider`` 一律不碰 ——
-它们没有上游可重算，而它们与产物表同库，一个粗心的 ``DELETE FROM`` 就没了
-（§12.7）。这条不是靠注释保证的，是靠 :data:`REBUILDABLE_TABLES` 白名单 +
-:func:`_assert_protected_untouched` 的前后计数比对保证的。
-
-    uv run python -m akasha_benchmark.store.reindex --run-id run001
-"""
+"""从历史文件恢复产物索引；受保护的人工标注与 judge 记录不参与重建。"""
 
 from __future__ import annotations
 
@@ -248,7 +236,7 @@ def _reindex_gates(
     """把编译与质量闸门的记录搬进库。
 
     ``quality`` 为 null 意味着那趟入库跑的是 ``--skip-compile`` —— 它**不等于**
-    质量验收通过（§6.4）。所以这里不写 quality_gate 行，``quality_passed``
+    质量验收通过。所以这里不写 quality_gate 行，``quality_passed``
     留 NULL，让「没跑过」与「跑过且为 0」在库里也能区分。
     """
     compile_result = manifest.get("compile")

@@ -2,7 +2,7 @@
 
 ``level='sample'`` 的标注**跨 run 继承** —— 样本层是资产，另两层是笔记（决策 14）。
 ``author_kind`` 区分 human 与 model，两者同表，所以一致率是一个 GROUP BY
-就能算出来的免费产物（§12.5）。它是判断「这个 LLM 归因能不能信」的唯一办法。
+就能算出来的免费产物。它是判断「这个 LLM 归因能不能信」的唯一办法。
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def add_annotation(request: Request, payload: dict[str, Any] = Body(...)) -> dic
             author=str(payload.get("author") or "anonymous"),
             labels=list(payload.get("labels") or []),
             note=payload.get("note"),
-            # §12.6：记 source 与 confidence，这样任何指标结果都能追溯到
+            # 记录 source 与 confidence，这样任何指标结果都能追溯到
             # 「它依赖的 gold 有多少是人确认过的」。
             source=str(payload.get("source") or author_kind),
             confidence=payload.get("confidence"),
