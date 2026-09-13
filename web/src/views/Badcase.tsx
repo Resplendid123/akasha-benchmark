@@ -44,14 +44,10 @@ export function Badcase({
 
   return (
     <>
-      <h2>归因</h2>
-      <p className="lede">
-        从原始文档、编译入库、检索到生成，一条链路走完，然后按指标与链路自动定位根因。
-        规则归因不需要模型；配了分析模型会在分类之上补一段因果叙述。
-      </p>
+      <h2>归因层</h2>
 
       {evalLayers.length === 0 ? (
-        <Empty>还没有评测层。先到「评测层」跑一轮。</Empty>
+        <Empty>暂无评测批次。</Empty>
       ) : (
         <>
           <div className="row tight" style={{ marginBottom: 14 }}>
@@ -102,7 +98,7 @@ function BadcaseBody({
       />
 
       {total === 0 ? (
-        <Empty>还没有归因结果。用上面的按钮跑一批。</Empty>
+        <Empty>暂无归因结果。</Empty>
       ) : (
         <>
           <div className="panel">

@@ -82,7 +82,7 @@ class LineageReader:
     def __init__(self, database_url: str) -> None:
         if not database_url:
             raise LineageUnavailable(
-                "no database_url configured. Set AKASHA_DATABASE_URL to enable the "
+                "no database_url configured. Fill database_url in the settings view to enable the "
                 "lineage and diff views; every other view works without it."
             )
         self.database_url = database_url

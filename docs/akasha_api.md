@@ -6,9 +6,10 @@
 | 阶段 | 接口 | 用途 |
 | --- | --- | --- |
 | 入库 | `POST /api/pages/import` | 把 `{doc_id}.md` 导入 space，拿 `page_id` |
-| 查询 | `POST /api/llm-wiki/query` | 跑一条问题，落盘完整响应 |
+| 查询 | `POST /api/llm-wiki/query` | 跑一条问题，将完整响应写入 SQLite |
 
-下面的形状都对着服务端源码核过（`../Akasha`），字段名右侧标注的行号指向 Akasha 仓库。
+下列样例来自此前对 Akasha 服务端源码的核对；外部源码行号仅作为当时的定位参考。
+不同部署可能存在差异，当前客户端契约与平台小样本验证用于检查实际响应。
 
 ## 零、所有响应都套一层信封
 
@@ -105,13 +106,13 @@ spaceId: 018f2c1e-....-....-....-............
 拿不到它会把该行记进 `failures` 而不是继续 —— 没有 page_id 的行等于永久丢失映射，
 评测反查不到就只能当 `__unmapped__` 处理。
 
-写进 `page_map.jsonl` 的是这一行（[ingest.py:136-150](../src/akasha_benchmark/ingest.py#L136-L150)）：
+当前映射写入 SQLite 的 `page_map` 表，下面用 JSON 展示主要字段：
 
 ```json
 {"dataset": "hotpotqa", "doc_id": "hotpotqa_5a7a0693...", "page_id": "0191f3a2-...", "space_id": "018f2c1e-...", "title": "Ed Wood (film)", "md_sha256": "3f1a...", "imported_at": "2026-09-09T02:11:43Z"}
 ```
 
-`md_sha256` 是导入前重算的，和子集 manifest 里的值不符会直接抛错：
+`md_sha256` 是导入前重算的，和库中子集记录的值不符会直接抛错：
 语料在两次运行之间被改过，这份 page_map 就不能用了。
 
 ## 二、`POST /api/llm-wiki/query`
@@ -342,7 +343,7 @@ controller 只给 `citations` 做图片富化（`llm-wiki.controller.ts:234-244`
 `/embeddings`。所以填 `https://host` 会打到 `https://host/chat/completions`，
 少一段 `/v1`，页级诊断只会给出 `errorCode: provider_error` /
 "Knowledge compiler provider request failed."，看不出是路径问题。
-判据是耗时：几百毫秒就失败是 404，真实推理是几十秒。
+应结合 HTTP 状态和服务端日志定位；仅凭耗时不能判断是否为 404。
 
 ## 查询记录
 

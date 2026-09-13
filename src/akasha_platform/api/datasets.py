@@ -20,9 +20,21 @@ from akasha_benchmark.store import repo
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from .._common_types import DEFAULT_PAGE, MAX_PAGE
-from ._common import db, strip_json
+from ._common import db, strip_json, writable
 
 router = APIRouter(prefix="/api")
+
+
+@router.delete("/datasets/{name}")
+def delete_dataset(request: Request, name: str) -> dict[str, Any]:
+    with writable(request) as connection:
+        try:
+            deleted = repo.delete_dataset(connection, name)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not deleted:
+            raise HTTPException(404, f"{name} has not been normalized yet")
+    return {"deleted": deleted, "dataset": name}
 
 
 @router.get("/datasets")
@@ -84,10 +96,31 @@ def adapters(request: Request) -> dict[str, Any]:
                 "blocked_reason": (
                     None
                     if files_present
-                    else "原始文件不在 dataset/ 下，先跑 scripts/download_datasets.py"
+                    else "原始文件缺失，请在「数据集」页点击下载数据集"
                 ),
             }
         )
+
+    markdown_dir = DEFAULT_DATASET_DIR / "markdown"
+    entries.append(
+        {
+            "name": "markdown-docs",
+            "aliases": [],
+            "adapter": "待接入",
+            "adapter_version": "—",
+            "implemented": False,
+            "provides": [],
+            "files_present": markdown_dir.is_dir() and any(markdown_dir.rglob("*.md")),
+            "qa_file": "待定",
+            "corpus_file": "markdown/**/*.md",
+            "expected_qa_rows": None,
+            "normalized": False,
+            "normalized_at": None,
+            "qa_rows": None,
+            "corpus_rows": None,
+            "blocked_reason": "已预留 Markdown 文档包适配器；待确定 QA 数据格式后接入。",
+        }
+    )
 
     unclaimed = (
         sorted(
@@ -133,7 +166,7 @@ def raw_samples(
     if not qa_path.is_file():
         raise HTTPException(
             404,
-            f"{qa_path.name} is not in dataset/. Run scripts/download_datasets.py first.",
+            f"{qa_path.name} 缺失，请在「数据集」页点击下载数据集。",
         )
 
     rows = load_json(qa_path)

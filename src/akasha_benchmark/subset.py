@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from . import run_args
-from .datasets import DATASET_NAMES, DataDependency, get_adapter, subset_dir
+from .datasets import DATASET_NAMES, CorpusDoc, DataDependency, get_adapter, subset_dir
 from .io_utils import atomic_write_json, atomic_write_jsonl, atomic_write_text, sha256_text, utc_now
 from .store import connect, repo
 
@@ -95,15 +95,6 @@ def _safe_doc_id(doc_id: str) -> str:
     ):
         raise ValueError(f"doc_id {doc_id!r} is not safe to use as a filename")
     return doc_id
-
-
-def _markdown(title: str, text: str) -> str:
-    """渲染成 Akasha 导入用的 Markdown。
-
-    Akasha 优先取首个 heading 当 title 并从正文移除，所以 heading 负责 title、
-    文件名负责 doc_id。两者独立，即使 musique 有重复 title 也不影响身份追踪。
-    """
-    return f"# {title}\n\n{text}\n"
 
 
 def build_subset(
@@ -201,7 +192,7 @@ def build_subset(
     docs = []
     for doc_id in doc_ids:
         doc = by_id[doc_id]
-        markdown = _markdown(doc["title"], doc["text"])
+        markdown = CorpusDoc(doc_id=doc_id, title=doc["title"], text=doc["text"]).to_markdown()
         docs.append(
             {
                 "doc_id": _safe_doc_id(doc_id),

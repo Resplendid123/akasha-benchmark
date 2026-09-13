@@ -101,14 +101,14 @@ class CorpusIndex:
 def assign_doc_id(dataset: str, row: dict[str, Any], row_index: int) -> str:
     """按该数据集声明的规则赋 doc_id。"""
     rule = CORPUS_ID_RULES[dataset]
-    if rule == "native_idx":
+    if rule == "native_id":
         if "idx" not in row:
             raise ValueError(
                 f"{dataset}: corpus row {row_index} has no 'idx' but the identity "
                 f"rule is {rule!r}; upstream data shape changed"
             )
         return str(row["idx"])
-    if rule == "row_index":
+    if rule == "row_idx":
         # 之所以用行号当身份，前提就是这份 corpus 没有 idx。
         # 它突然有了，说明数据换版了，行号身份不再可信。
         if "idx" in row:

@@ -1,12 +1,10 @@
-"""路由共用的依赖与取数辅助。
-
-一条贯穿的口径：**读走库，写只有「起任务」「改配置」「加标注」三类。**
-阶段计算一律不在请求里跑 —— 15 小时的 ingest 不能挂在一个 HTTP 连接上。
-"""
+"""路由共用的数据库上下文、连接配置和响应字段转换。"""
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from typing import Any
 
 from akasha_benchmark.config import AkashaConfig, load_config
@@ -21,13 +19,18 @@ def settings_of(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def db(request: Request) -> sqlite3.Connection:
-    """只读连接。读路径一律走它 —— 写要显式用 writable。"""
-    return connect(settings_of(request).db_path, read_only=True)
+@contextmanager
+def db(request: Request) -> Iterator[sqlite3.Connection]:
+    """请求结束时关闭只读连接。"""
+    with closing(connect(settings_of(request).db_path, read_only=True)) as connection:
+        yield connection
 
 
-def writable(request: Request) -> sqlite3.Connection:
-    return connect(settings_of(request).db_path)
+@contextmanager
+def writable(request: Request) -> Iterator[sqlite3.Connection]:
+    """成功时提交、异常时回滚，始终关闭连接。"""
+    with closing(connect(settings_of(request).db_path)) as connection, connection:
+        yield connection
 
 
 def config_of(request: Request) -> AkashaConfig:

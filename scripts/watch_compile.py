@@ -5,13 +5,6 @@
     uv run --with 'psycopg[binary]' python scripts/watch_compile.py \
         --run-id run001 --via-db                                 # 直连 Postgres
 
-``--via-db`` 存在的原因：登录接口会在认证通过后的会话创建阶段返回 502，
-HTTP 通道因此整条不可用，而编译本身照常在 worker 上推进。直连库既能拿到
-真实进度，也避免了「失败登录 + 5 次重试」反过来消耗 auth 限流配额。
-
-space_id 从 data/ingest/<run-id>/page_map.jsonl 里读，所以不用手填 UUID。
-每次执行会把 (时间, succeeded) 存进同目录的 .watch_state.json，
-下次执行时打印两次之间的增量 —— 用来分辨「在跑」和「卡住」。
 """
 
 from __future__ import annotations

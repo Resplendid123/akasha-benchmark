@@ -415,7 +415,11 @@ def test_baseline_preserves_populated_legacy_database(tmp_path: Path):
     from akasha_benchmark.store.migrate import LEGACY_CHECKSUMS
 
     db = tmp_path / "t.db"
-    migrate(db, verbose=False)
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    baseline = Path(__file__).resolve().parents[1] / "migrations" / "001_initial.sql"
+    (baseline_dir / baseline.name).write_text(baseline.read_text(), encoding="utf-8")
+    migrate(db, baseline_dir, verbose=False)
     connection = connect(db)
     repo.upsert_dataset(
         connection,

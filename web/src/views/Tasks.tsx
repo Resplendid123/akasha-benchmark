@@ -3,15 +3,6 @@ import { api } from '../api'
 import type { Task, TaskDetail } from '../types'
 import { Bar, Failed, Loading, useAction, useAsync } from '../ui'
 
-/** 任务层：各阶段任务的启动、停止与清理。
- *
- * 每个阶段是一个独立进程，进度逐行写库。后端重启、崩掉、被 Ctrl-C，任务都继续
- * 跑 —— 15 小时的入库不能与 Web 后端同生命周期。
- *
- * 「暂停」做成可续跑的**停止**：Windows 上没有 SIGSTOP，而 ingest 与 query 本来
- * 就跳过已完成项，所以「停掉再起」与「暂停再继续」在效果上等价，而前者不需要
- * 假装持有一个挂起的进程。
- */
 const STATUS_CLASS: Record<Task['status'], string> = {
   queued: 'tag',
   running: 'tag accent',
@@ -34,7 +25,7 @@ export function Tasks() {
   const [openTask, setOpenTask] = useState<number | null>(null)
   const cleanup = useAction<{ deleted: number }>()
 
-  // 有任务在跑就每 3 秒刷一次。进度是逐行提交的，所以这里看得到动静。
+  // 有任务在跑就每 3 秒刷一次，进度逐行提交。
   useEffect(() => {
     const active = tasks.data?.some((t) => t.status === 'running' || t.status === 'queued')
     if (!active) return
@@ -49,20 +40,16 @@ export function Tasks() {
   return (
     <>
       <h2>任务</h2>
-      <p className="lede">
-        每个阶段是一个独立进程，进度逐行写库。停止是<strong>可续跑的</strong> ——
-        重新起同一阶段会接着上次的进度，因为入库与查询都跳过已完成项。
-      </p>
 
       {stages.data && (
         <div className="panel">
-          <h3 style={{ marginTop: 0 }}>阶段与它们的代价</h3>
+          <h3 style={{ marginTop: 0 }}>阶段描述</h3>
           <table>
             <thead>
               <tr>
                 <th>阶段</th>
                 <th>代价</th>
-                <th>需要 Akasha 在线</th>
+                <th>需要 Akasha 启动</th>
               </tr>
             </thead>
             <tbody>
@@ -77,10 +64,6 @@ export function Tasks() {
               ))}
             </tbody>
           </table>
-          <p className="small muted" style={{ marginBottom: 0 }}>
-            任务从各层的界面起（编译层起 subset/ingest，评测层起 query/evaluate，
-            归因层起归因）—— 那里有对应的参数与前置检查。这一层负责看与停。
-          </p>
         </div>
       )}
 
@@ -157,14 +140,14 @@ function TaskRow({
   const action = useAction<unknown>()
   const running = task.status === 'running' || task.status === 'queued'
   const ratio =
-    task.progress_total && task.progress_total > 0
+    task.status === 'succeeded' ? 1 : task.progress_total && task.progress_total > 0
       ? task.progress_done / task.progress_total
       : null
 
   return (
     <tr className={open ? 'selected' : ''}>
       <td className="mono">{task.id}</td>
-      <td>{task.stage === 'verify' ? '小样本验证' : task.stage}</td>
+      <td>{task.stage === 'verify' ? '链路测试' : task.stage}</td>
       <td>
         <span className={STATUS_CLASS[task.status]}>{STATUS_TEXT[task.status]}</span>
       </td>
@@ -173,13 +156,15 @@ function TaskRow({
           <>
             <Bar value={ratio} kind={task.status === 'failed' ? 'bad' : undefined} />
             <span className="small mono muted">
-              {task.progress_done}/{task.progress_total}
+              {task.status === 'succeeded' || task.progress_total === 10000
+                ? `${Math.floor(ratio * 100)}%`
+                : `${task.progress_done}/${task.progress_total}`}
             </span>
           </>
         ) : (
           <span className="small mono muted">{task.progress_done || '—'}</span>
         )}
-        {task.progress_note && <span className="small muted"> {task.progress_note}</span>}
+        {task.progress_note && <span className="small muted"> {task.status === 'succeeded' ? '已完成' : task.progress_note}</span>}
       </td>
       <td className="small mono muted truncate" title={JSON.stringify(task.args)}>
         {Object.entries(task.args)

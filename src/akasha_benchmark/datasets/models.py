@@ -20,25 +20,27 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 # doc_id / sample_id 的口径收在这里一处，避免预处理与评测两侧各写一份而漂移。
+# native_id 使用原生标识字段；row_idx 使用原始全量文件行号，筛选子集后不重新编号。
 # 各数据集 corpus 行身份：
 #   hotpotqa     用原生 "idx"（int）转 str
 #   2wiki        用 corpus 数组行号转 str
 #   musique      用 corpus 数组行号转 str，title 有歧义时用 (title, text) 消歧
 #   narrativeqa  用原生 "idx"（str，形如 "{document_id}_{chunk_seq}"）
 CORPUS_ID_RULES: dict[str, str] = {
-    "hotpotqa": "native_idx",
-    "2wikimultihopqa": "row_index",
-    "musique": "row_index",
-    "narrativeqa": "native_idx",
+    "hotpotqa": "native_id",
+    "2wikimultihopqa": "row_idx",
+    "musique": "row_idx",
+    "narrativeqa": "native_id",
 }
 
 # 样本身份。narrativeqa 没有原生 QA ID，用它在**全量**数据文件里的行号字符串
 # （不是子集里的行号）。
+# hotpotqa / 2wikimultihopqa 的原生字段为 "_id"，musique 为 "id"。
 SAMPLE_ID_RULES: dict[str, str] = {
-    "hotpotqa": "native__id",
-    "2wikimultihopqa": "native__id",
+    "hotpotqa": "native_id",
+    "2wikimultihopqa": "native_id",
     "musique": "native_id",
-    "narrativeqa": "full_dataset_row_index",
+    "narrativeqa": "row_idx",
 }
 
 

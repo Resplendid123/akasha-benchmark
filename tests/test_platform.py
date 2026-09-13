@@ -83,6 +83,10 @@ def test_stage_args_are_type_checked():
     assert _clean_args("subset", {"seed": "42"}) == {"seed": 42}
     with pytest.raises(TaskRejected, match="expected int"):
         _clean_args("subset", {"seed": "not-a-number"})
+    with pytest.raises(TaskRejected, match="expected list"):
+        _clean_args("subset", {"datasets": "hotpotqa"})
+    with pytest.raises(TaskRejected, match="expected bool"):
+        _clean_args("query", {"retry_failed": "false"})
 
 
 def test_run_config_round_trips_into_stage_arguments(tmp_path: Path):
@@ -356,3 +360,54 @@ def test_lineage_returns_503_without_a_readonly_database(tmp_path: Path):
     response = client.get("/api/lineage/some-page-id")
     assert response.status_code == 503
     assert "database_url" in response.json()["detail"]
+
+
+def test_delete_normalized_dataset_preserves_other_data(seeded):
+    client, _, connection = seeded
+    connection.execute(
+        "INSERT INTO dataset SELECT 'removable', adapter, adapter_version, provides_json, "
+        "identity_rules_json, qa_path, qa_sha256, qa_rows, corpus_path, corpus_sha256, "
+        "corpus_rows, dedup_stats_json, gold_count_distribution_json, unique_question_texts, "
+        "normalized_at FROM dataset WHERE name = ?", (DATASET,)
+    )
+    connection.execute(
+        "INSERT INTO sample VALUES ('removable', 'removable:0', '0', 'question', '[]', '[]', '{}')"
+    )
+    connection.execute(
+        "INSERT INTO corpus_doc VALUES ('removable', '0', 'title', 'body', 'hash')"
+    )
+    connection.commit()
+    response = client.delete('/api/datasets/removable')
+    assert response.status_code == 200
+    assert response.json() == {'deleted': 1, 'dataset': 'removable'}
+    assert repo.get_dataset(connection, 'removable') is None
+    assert repo.samples_of(connection, 'removable') == []
+    assert repo.corpus_of(connection, 'removable') == []
+    assert repo.get_dataset(connection, DATASET) is not None
+    assert client.delete('/api/datasets/removable').status_code == 404
+
+
+def test_delete_normalized_dataset_rejects_downstream_references(seeded):
+    client, _, connection = seeded
+    assert client.delete(f'/api/datasets/{DATASET}').status_code == 409
+    assert repo.get_dataset(connection, DATASET) is not None
+
+
+def test_delete_normalized_dataset_rejects_active_tasks(seeded):
+    client, _, connection = seeded
+    repo.create_task(connection, stage='normalize', argv=[])
+    connection.commit()
+    response = client.delete(f'/api/datasets/{DATASET}')
+    assert response.status_code == 409
+    assert '任务' in response.json()['detail']
+    assert repo.get_dataset(connection, DATASET) is not None
+
+
+def test_layer_tree_preserves_compilation_run_identity(seeded):
+    client, eval_id, _ = seeded
+    layer = client.get('/api/layers').json()['index_layers'][0]
+    query = layer['query_layers'][0]
+    evaluation = next(row for row in query['eval_layers'] if row['id'] == eval_id)
+    assert layer['run_id'] == query['run_id'] == evaluation['run_id'] == layer['label']
+    assert query['index_layer_id'] == layer['id']
+    assert evaluation['query_layer_id'] == query['id']

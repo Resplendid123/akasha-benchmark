@@ -1,4 +1,4 @@
-"""跑 judge 指标。judge **是指标**，不是新的一层（决策 9）。
+"""运行评估指标 judge；结果写入现有评测层。
 
 所以它落在 ``judge_verdict``、进指标层、参与汇总 —— 与 F1/recall 同层，
 只是需要一个模型。LLM 归因与人工标注是另外两件事，它们进 ``annotation``、
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .. import run_args
+from .. import run_args, progress
 from ..datasets import DATASET_NAMES
 from ..store import connect, identity, repo
 from . import faithfulness
@@ -177,6 +177,7 @@ def run(
         if already:
             print(f"resuming: {len(already)} already judged, {len(rows)} to go")
 
+        progress.report(0, len(rows) + 1, "Judge 评测")
         counts = {"scored": 0, "skipped": 0, "failed": 0}
         with JudgeClient(provider) as client:
             for position, row in enumerate(rows, 1):
@@ -198,6 +199,7 @@ def run(
                     prompt_version=faithfulness.PROMPT_VERSION,
                 )
                 connection.commit()
+                progress.report(position, len(rows) + 1, f"Judge 样本 {position}/{len(rows)}")
 
                 if result["failure_kind"]:
                     counts["failed"] += 1
@@ -212,10 +214,13 @@ def run(
         # judge 分数也进 metric_summary，这样它和 F1/recall 在同一张表里 ——
         # 那是决策 9「judge 是指标」在数据层的落点。
         for dataset in datasets:
+            dataset_sample_ids = {
+                row["sample_id"] for row in repo.responses_of(connection, query_layer_id, dataset)
+            }
             per_dataset = [
                 v
                 for v in repo.judge_verdicts(connection, eval_layer_id, METRIC)
-                if v["score"] is not None
+                if v["score"] is not None and v["sample_id"] in dataset_sample_ids
             ]
             if per_dataset:
                 repo.record_metric_summary(
@@ -247,6 +252,7 @@ def run(
                 file=sys.stderr,
             )
             return 1
+        progress.report(len(rows) + 1, len(rows) + 1, "Judge 汇总完成")
         return 0
     finally:
         connection.close()

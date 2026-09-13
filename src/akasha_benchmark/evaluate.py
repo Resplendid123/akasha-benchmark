@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import run_args
+from . import run_args, progress
 from .datasets import DATASET_NAMES, DataDependency, get_adapter
 from .datasets.resolver import DEFAULT_DATA_DIR
 from .io_utils import atomic_write_json, atomic_write_jsonl, atomic_write_text, utc_now
@@ -141,7 +141,8 @@ def evaluate_dataset(
     http_failures = 0
     unmapped_pages: set[str] = set()
 
-    for row in responses:
+    progress.report(0, len(responses) + 1, f"{dataset} 计算指标")
+    for position, row in enumerate(responses, 1):
         sample_id = row["sample_id"]
         sample = samples.get(sample_id)
         if sample is None:
@@ -234,9 +235,12 @@ def evaluate_dataset(
             detail=detail,
         )
         repo.record_sample_metrics(connection, eval_layer_id, sample_id, dataset, metrics)
+        if position % 100 == 0 or position == len(responses):
+            connection.commit()
+            progress.report(position, len(responses) + 1, f"{dataset} 样本 {position}/{len(responses)}")
     connection.commit()
 
-    return _summarize(
+    summary = _summarize(
         connection,
         eval_layer_id,
         dataset,
@@ -249,6 +253,8 @@ def evaluate_dataset(
         http_failures=http_failures,
         unmapped_pages=sorted(unmapped_pages),
     )
+    progress.report(len(responses) + 1, len(responses) + 1, f"{dataset} 汇总完成")
+    return summary
 
 
 def _aggregate(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -469,6 +475,8 @@ def ensure_eval_layer(
     """取或建评测层。同 label 复用，并清掉旧的确定性结果（judge 判决保留）。"""
     existing = repo.eval_layer_by_label(connection, label)
     if existing:
+        if existing["query_layer_id"] != query_layer_id:
+            raise ValueError("评测记录属于另一次查询，请使用新名称")
         layer_id = int(existing["id"])
         # 重跑确定性指标要先清旧结果，否则汇总会翻倍。judge_verdict 与
         # annotation 刻意不动 —— 前者要花钱，后者无法重算。
@@ -622,19 +630,20 @@ def run(
 
         summaries: list[dict[str, Any]] = []
         failures = 0
-        for dataset in datasets:
+        for index, dataset in enumerate(datasets):
             try:
-                summaries.append(
-                    evaluate_dataset(
-                        connection,
-                        eval_layer_id,
-                        query_layer_id,
-                        index_layer_id,
-                        dataset,
-                        ks,
-                        selected,
+                with progress.scope(index, index + 1, len(datasets), dataset):
+                    summaries.append(
+                        evaluate_dataset(
+                            connection,
+                            eval_layer_id,
+                            query_layer_id,
+                            index_layer_id,
+                            dataset,
+                            ks,
+                            selected,
+                        )
                     )
-                )
             except FileNotFoundError as exc:
                 # 该数据集没跑过查询，跳过而不算失败。
                 print(f"skip {dataset}: {exc}", file=sys.stderr)

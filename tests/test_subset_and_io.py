@@ -58,7 +58,7 @@ def _seed_normalized(
         adapter="HotpotQAAdapter",
         adapter_version="1",
         provides=["gold_docs", "reference_answers"],
-        identity_rules={"sample_id": "native__id", "corpus_doc_id": "native_idx"},
+        identity_rules={"sample_id": "native_id", "corpus_doc_id": "native_id"},
         qa_path="q",
         qa_sha256="s" * 64,
         qa_rows=len(samples),

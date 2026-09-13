@@ -4,33 +4,8 @@ import { api } from '../api'
 import type { AppConnection, ConnectionTest, ModelConfigsView, Provider } from '../types'
 import { Failed, Loading, Pass, useAction, useAsync } from '../ui'
 
-// 提示性 placeholder：聚焦时空字段不该用它们填充。
-const PROMPTY_PLACEHOLDERS = new Set(['必填', '填一次即可', '已设置', '••••••••'])
-
-// 聚焦时空字段用 placeholder 填充并全选；已有值时直接全选方便覆盖。
-// 直接操作 DOM，避免触发受控 input 的 onChange 闭包——但 input 是受控的，
-// 我们也手动同步触发 React 知道这件事。
-function selectOrFill(event: FocusEvent<HTMLInputElement | HTMLTextAreaElement>) {
-  const target = event.currentTarget
-  const current = target.value ?? ''
-  if (current) {
-    target.select()
-    return
-  }
-  const placeholder = target.placeholder.trim()
-  if (!placeholder || PROMPTY_PLACEHOLDERS.has(placeholder)) {
-    target.select()
-    return
-  }
-  // 用原生 setter 写值，绕过 React 的 input value tracker，
-  // 这样下一次 onChange 能正常触发（用户接着输入会替换）。
-  const nativeSetter = Object.getOwnPropertyDescriptor(
-    target.constructor.prototype,
-    'value',
-  )?.set
-  nativeSetter?.call(target, placeholder)
-  target.dispatchEvent(new Event('input', { bubbles: true }))
-  target.select()
+function selectInput(event: FocusEvent<HTMLInputElement | HTMLTextAreaElement>) {
+  event.currentTarget.select()
 }
 
 function SecretInput({
@@ -71,19 +46,6 @@ function SecretInput({
   )
 }
 
-/** 配置层：四组配置，一处改完。
- *
- * 1. Akasha 连接 —— 只有一份，只能改
- * 2. Akasha 那边的模型配置（compiler / embedding / answer / image）
- * 3. judge 模型
- * 4. 归因分析模型
- *
- * 第 2 组原先在编译层。挪过来是因为「改一个模型要去哪」不该取决于它属于哪一层 ——
- * 用户想的是「我要改配置」。编译层保留只读的漂移提示，那是它该管的事。
- *
- * 配置只存在库里。曾经有过两条旁路（配置文件、环境变量覆盖），都删了：
- * 同一份配置有多个来源时，「我改了但没生效」是查不出来的。
- */
 export function Settings() {
   return (
     <>
@@ -96,7 +58,7 @@ export function Settings() {
       <ProviderPanel
         role="judge"
         title="评估模型"
-        hint="LLM as a judge。Akasha 只回传 apiKeySet 布尔量、不回传 key，密钥在Akasha端配置。"
+        hint="用于 LLM 评估，密钥由本平台保存。"
       />
       <ProviderPanel
         role="analysis"
@@ -107,16 +69,15 @@ export function Settings() {
   )
 }
 
-/** Akasha 连接。**只有一份**，只能改，没有新增与删除。 */
 function Connection() {
   const { data, error, loading, reload } = useAsync(() => api.connection(), [])
   const [form, setForm] = useState<Record<string, unknown>>({})
-  const save = useAction()
+  const save = useAction<{ updated: string[]; connection: AppConnection }>()
   const test = useAction<ConnectionTest>()
 
   useEffect(() => setForm({}), [data?.updated_at])
 
-  if (loading) return <Loading what="连接配置" />
+  if (loading) return <Loading what="Akasha 连接配置" />
   if (error) return <Failed error={error} />
   if (!data) return null
 
@@ -128,7 +89,7 @@ function Connection() {
   return (
     <div className="panel">
       <div className="spread">
-        <h3 style={{ margin: 0 }}>Akasha 连接</h3>
+        <h3 style={{ margin: 0 }}>Akasha 连接配置</h3>
         <div className="row tight">
           <button className="action" disabled={test.busy} onClick={() => test.run(() => api.testConnection())}>
             {test.busy ? '测试中…' : '测试连接'}
@@ -139,6 +100,7 @@ function Connection() {
             onClick={() =>
               save.run(async () => {
                 const result = await api.saveConnection(form)
+                setForm({})
                 reload()
                 return result
               })
@@ -151,11 +113,11 @@ function Connection() {
 
       <div className="grid2" style={{ marginTop: 10 }}>
         <label className="field">
-          base_url
+          base_url（部署根地址）
           <input
             value={value('base_url') as string}
             placeholder="http://localhost:3000"
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => set('base_url', event.target.value)}
           />
         </label>
@@ -164,17 +126,17 @@ function Connection() {
           <input
             value={value('email') as string}
             placeholder="test@example.com"
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => set('email', event.target.value)}
           />
         </label>
         <label className="field">
           password
-          <input
-            type="text"
+          <SecretInput
+            secretLabel="密码"
             placeholder="12345678"
             value={value('password') as string}
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => set('password', event.target.value)}
           />
         </label>
@@ -184,7 +146,7 @@ function Connection() {
             type="text"
             placeholder="postgres://akasha:STRONG_DB_PASSWORD@localhost:5432/akasha"
             value={value('database_url') as string}
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => set('database_url', event.target.value)}
           />
         </label>
@@ -208,7 +170,7 @@ function Connection() {
               step="any"
               style={{ minWidth: 110 }}
               value={String(value(name))}
-              onFocus={selectOrFill}
+              onFocus={selectInput}
               onChange={(event) => set(name, Number(event.target.value))}
             />
           </label>
@@ -275,17 +237,16 @@ function TestResult({ result }: { result: ConnectionTest }) {
   )
 }
 
-/** Akasha 那边的四项模型配置。改 compiler/embedding 要二次确认。 */
 function AkashaModels() {
   const { data, error, loading, reload } = useAsync(() => api.modelConfigs(), [])
-  const [pending, setPending] = useState<{ feature: string; payload: string } | null>(null)
+  const [pending, setPending] = useState<{ feature: string; initial: Record<string, string> } | null>(null)
   const action = useAction<{ impact: string }>()
 
   if (loading) return <Loading what="Akasha 模型配置" />
   if (error)
     return (
       <div className="panel">
-        <h3 style={{ marginTop: 0 }}>Akasha 的模型配置</h3>
+        <h3 style={{ marginTop: 0 }}>Akasha 模型配置</h3>
         <div className="note warn">
           <strong>拿不到。</strong> {error}
           <div className="small" style={{ marginTop: 4 }}>
@@ -301,8 +262,8 @@ function AkashaModels() {
   return (
     <div className="panel">
       <div className="spread">
-        <h3 style={{ margin: 0 }}>Akasha 的模型配置</h3>
-        <span className="small muted">编译、向量化与回答用的模型</span>
+        <h3 style={{ margin: 0 }}>Akasha 模型配置</h3>
+        <span className="small muted">编译、向量化与问答用的模型</span>
       </div>
 
       <table style={{ marginTop: 8 }}>
@@ -311,7 +272,7 @@ function AkashaModels() {
             <th>用途</th>
             <th>provider</th>
             <th>模型</th>
-            <th>baseUrl</th>
+            <th>base_url</th>
             <th>影响</th>
             <th />
           </tr>
@@ -336,9 +297,11 @@ function AkashaModels() {
                 <td>
                   <button
                     className="action small"
-                    onClick={() =>
-                      setPending({ feature, payload: JSON.stringify(entry ?? {}, null, 2) })
-                    }
+                    disabled={action.busy}
+                    onClick={() => {
+                      action.reset()
+                      setPending({ feature, initial: entry ?? {} })
+                    }}
                   >
                     修改
                   </button>
@@ -353,8 +316,9 @@ function AkashaModels() {
 
       {pending && (
         <ConfirmModelChange
+          key={pending.feature}
           feature={pending.feature}
-          initial={pending.payload}
+          initial={pending.initial}
           busy={action.busy}
           error={action.error}
           result={action.result}
@@ -364,7 +328,7 @@ function AkashaModels() {
           }}
           onConfirm={(payload) =>
             action.run(async () => {
-              const result = await api.saveModelConfig(pending.feature, JSON.parse(payload))
+              const result = await api.saveModelConfig(pending.feature, payload)
               reload()
               return result
             })
@@ -404,15 +368,10 @@ function DriftTable({ layers }: { layers: ModelConfigsView['index_layers'] }) {
           ))}
         </tbody>
       </table>
-      <p className="small muted">
-        embedding 漂移会让那一层的 chunk 永远召回不到，所以查询阶段对它
-        <strong>拒绝执行</strong>，而不是给个警告。
-      </p>
     </>
   )
 }
 
-/** 提交前的确认。影响范围与「必须新建一层」写在这里，不是提交之后才说。 */
 function ConfirmModelChange({
   feature,
   initial,
@@ -423,62 +382,77 @@ function ConfirmModelChange({
   onConfirm,
 }: {
   feature: string
-  initial: string
+  initial: Record<string, string>
   busy: boolean
   error: string | null
   result: { impact: string } | null
   onCancel: () => void
-  onConfirm: (payload: string) => void
+  onConfirm: (payload: Record<string, string>) => void
 }) {
-  const [payload, setPayload] = useState(initial)
+  const [model, setModel] = useState(initial.model ?? '')
+  const [baseUrl, setBaseUrl] = useState(initial.baseUrl ?? '')
+  const [apiKey, setApiKey] = useState('')
+  const [apiKeyTouched, setApiKeyTouched] = useState(false)
   const rebuild = feature === 'compiler' || feature === 'embedding'
-  let invalid: string | null = null
-  try {
-    JSON.parse(payload)
-  } catch (exc) {
-    invalid = String(exc)
-  }
 
   return (
     <div className="panel" style={{ marginTop: 12 }}>
       <h4 style={{ marginTop: 0 }}>修改 {feature} 配置</h4>
 
       <div className={`note ${rebuild ? 'bad' : 'warn'}`}>
-        <strong>改的是 Akasha 那个部署的设置，不是本平台的。</strong>
-        同一部署上的其他账号也会受影响。
-        {rebuild && (
-          <div style={{ marginTop: 6 }}>
-            改完之后既有的编译层与新配置<strong>不再可比</strong>，需要新建一层重编译。
-            {feature === 'embedding' && (
-              <>
-                {' '}
-                embedding 更硬：旧 chunk 带的是旧 profile，它们永远召回不到，而评测会
-                照常算出一份看着合理的坏报告 —— 那种失效不会报错。
-              </>
-            )}
-          </div>
-        )}
+        <strong>影响：</strong>{rebuild ? '需新建编译层并重新编译。' : '无影响。'}
       </div>
 
-      <textarea
-        value={payload}
-        onChange={(event) => setPayload(event.target.value)}
-        rows={8}
-        style={{ width: '100%', fontFamily: 'var(--mono)', fontSize: 12 }}
-      />
-      {invalid && <div className="note bad small">JSON 解析失败：{invalid}</div>}
+      <div className="grid2">
+        <label className="field">
+          model
+          <input
+            value={model}
+            onChange={(event) => setModel(event.target.value)}
+            onFocus={selectInput}
+            placeholder="gpt-4o-mini"
+          />
+        </label>
+        <label className="field">
+          base_url（API 根地址，含版本路径）
+          <input
+            value={baseUrl}
+            onChange={(event) => setBaseUrl(event.target.value)}
+            onFocus={selectInput}
+            placeholder="https://api.openai.com/v1"
+          />
+        </label>
+        <label className="field">
+          api_key
+          <SecretInput
+            secretLabel="API Key"
+            value={apiKey}
+            placeholder={apiKeyTouched ? '留空将清除密钥' : '留空保留当前密钥'}
+            onFocus={selectInput}
+            onChange={(event) => {
+              setApiKey(event.target.value)
+              setApiKeyTouched(true)
+            }}
+          />
+        </label>
+      </div>
+
       {error && <div className="note bad">{error}</div>}
       {result && <div className="note">{result.impact}</div>}
 
       <div className="row" style={{ marginTop: 10 }}>
         <button
           className="action primary"
-          disabled={busy || invalid !== null || result !== null}
-          onClick={() => onConfirm(payload)}
+          disabled={busy || !model || !baseUrl || result !== null}
+          onClick={() => {
+            const payload: Record<string, string> = { ...initial, model, baseUrl }
+            if (apiKeyTouched) payload.apiKey = apiKey
+            onConfirm(payload)
+          }}
         >
           {busy ? '提交中…' : '确认修改'}
         </button>
-        <button className="action" onClick={onCancel}>
+        <button className="action" disabled={busy} onClick={onCancel}>
           {result ? '关闭' : '取消'}
         </button>
       </div>
@@ -545,16 +519,16 @@ function ProviderPanel({
           <input
             value={form.label}
             placeholder="default"
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => setForm({ ...form, label: event.target.value })}
           />
         </label>
         <label className="field">
-          base_url
+          base_url（API 根地址，含版本路径）
           <input
             value={form.base_url}
             placeholder="https://api.openai.com/v1"
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => setForm({ ...form, base_url: event.target.value })}
           />
         </label>
@@ -563,7 +537,7 @@ function ProviderPanel({
           <input
             value={form.model}
             placeholder="gpt-4o-mini"
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => setForm({ ...form, model: event.target.value })}
           />
         </label>
@@ -573,7 +547,7 @@ function ProviderPanel({
             secretLabel="API Key"
             value={form.api_key}
             placeholder="必填"
-            onFocus={selectOrFill}
+            onFocus={selectInput}
             onChange={(event) => setForm({ ...form, api_key: event.target.value })}
           />
         </label>

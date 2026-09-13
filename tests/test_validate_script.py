@@ -69,7 +69,7 @@ def _seed(connection: sqlite3.Connection, *, qa_sha256: str) -> None:
 DATASET_DIR = REPO_ROOT / "dataset"
 needs_dataset = pytest.mark.skipif(
     not (DATASET_DIR / "hotpotqa.json").is_file(),
-    reason="需要 dataset/hotpotqa.json（make download）",
+    reason="需要 dataset/hotpotqa.json（通过数据集页面下载）",
 )
 
 

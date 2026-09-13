@@ -2,7 +2,6 @@
 
 逐行过全量数据，并把归一化产物与原始文件对比。
 
-
 每个数据集检查：
   * 每一行原始数据能否通过适配器
   * dataset_sample_id 是否缺失或重复
@@ -29,14 +28,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from akasha_benchmark.datasets import (  # noqa: E402
+from akasha_benchmark.datasets import (
     DATASET_NAMES,
     DataDependency,
     load_corpus,
     resolve,
 )
-from akasha_benchmark.io_utils import load_json, sha256_file  # noqa: E402
-from akasha_benchmark.store import connect, repo  # noqa: E402
+from akasha_benchmark.io_utils import load_json, sha256_file
+from akasha_benchmark.store import connect, repo
+from akasha_benchmark import progress
 
 
 class Report:
@@ -92,7 +92,7 @@ def validate(dataset: str, dataset_dir: Path | None, connection: sqlite3.Connect
     for row_index, row in enumerate(rows):
         try:
             sample = adapter.parse_row(row, row_index, corpus)
-        except Exception as exc:  # noqa: BLE001 - 记下来继续走完，别只报第一行
+        except Exception as exc:
             report.fail(f"row {row_index}: {type(exc).__name__}: {exc}")
             continue
 
@@ -134,8 +134,6 @@ def validate(dataset: str, dataset_dir: Path | None, connection: sqlite3.Connect
         f"questions={len(rederived)} unique={len(questions)} duplicate_texts={len(duplicates)}"
     )
     if duplicates:
-        # 不算致命错误。但审计归因按 sha256(query) join 审计表，
-        # 这些行必须从那个 join 里排除，所以要在这里点出来。
         sample_q = next(iter(duplicates))
         report.note(
             f"WARNING duplicate question text blocks the audit-table join for "
@@ -143,11 +141,6 @@ def validate(dataset: str, dataset_dir: Path | None, connection: sqlite3.Connect
         )
 
     # --- 库里的产物必须与重新推导的结果一致 ---
-    #
-    # 库是事实来源，所以这里比对的是 sample / corpus_doc 表，不是 jsonl 文件。
-    # 校验的性质没变：**逐行重新推导一遍再比**，这样「归一化跑过之后原始数据
-    # 又变了」或者「适配器改过但没重跑」都会在这里暴露，而不是等到指标算出来
-    # 才发现数字对不上。
     record = repo.get_dataset(connection, adapter.name)
     if record is None:
         report.fail(
@@ -190,8 +183,6 @@ def validate(dataset: str, dataset_dir: Path | None, connection: sqlite3.Connect
         report.fail("database corpus doc_ids differ from the re-derived corpus identity")
     report.note(f"corpus rows in database={len(stored_corpus_ids)}")
 
-    # 上游哈希链的起点：库里记的原始文件 sha256 必须仍与磁盘上的一致。
-    # 不一致意味着 normalize 之后原始数据又换过，而这一层的下游全部过期。
     for label, path, column in (
         ("qa", resolved.qa_path, "qa_sha256"),
         ("corpus", resolved.corpus_path, "corpus_sha256"),
@@ -218,8 +209,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    # 只读连接：这一步只核对产物，不写任何东西。库不存在时给一句清楚的提示,
-    # 而不是让 read_only 的 FileNotFoundError 从循环深处冒出来。
     try:
         connection = connect(args.db, read_only=True)
     except FileNotFoundError as exc:
@@ -228,7 +217,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         failed = 0
-        for name in args.dataset or list(DATASET_NAMES):
+        names = args.dataset or list(DATASET_NAMES)
+        for index, name in enumerate(names):
+            progress.report(index, len(names), f"验收 {name}")
             try:
                 report = validate(name, args.dataset_dir, connection)
             except Exception as exc:  # noqa: BLE001 - 直接抛出来的硬失败也是一种结果
@@ -244,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             if len(report.errors) > 20:
                 print(f"  ... and {len(report.errors) - 20} more errors")
             failed += not report.ok
+            progress.report(index + 1, len(names), f"{name} 验收{'通过' if report.ok else '失败'}")
 
         print(f"\n{'all datasets pass' if not failed else f'{failed} dataset(s) FAILED'}")
         return 1 if failed else 0

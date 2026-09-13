@@ -1,14 +1,6 @@
-"""归一化：把四组原始数据整成库里的 ``sample`` + ``corpus_doc``。
+"""将原始数据经适配器转换为 SQLite 中的样本和语料。
 
-**库是事实来源**。这一步把原始文件读进库，之后所有阶段
-都从库里取样本与语料；``--export`` 可以另外落一份 jsonl，那是可选导出，
-不是任何阶段的输入。
-
-这一步不依赖 Akasha 在线，改造后仍然如此。
-
-    uv run python -m akasha_benchmark.normalize
-    uv run python -m akasha_benchmark.normalize --dataset hotpotqa --export
-"""
+归一化离线执行；--export 可额外导出 JSONL 快照。"""
 
 from __future__ import annotations
 
@@ -28,7 +20,7 @@ from .datasets import (
     repo_relative,
     resolve,
 )
-from . import run_args
+from . import run_args, progress
 from .io_utils import (
     atomic_write_json,
     atomic_write_jsonl,
@@ -49,6 +41,7 @@ def normalize_dataset(
     adapter = resolved.adapter
 
     # 先建 corpus 索引：适配器解析 gold 时要靠它反查 doc_id。
+    progress.report(0, 3, f"{name} 读取语料")
     corpus = load_corpus(adapter.name, resolved.corpus_path)
     rows = load_json(resolved.qa_path)
     if not isinstance(rows, list):
@@ -62,6 +55,7 @@ def normalize_dataset(
             "The snapshot changed; re-verify the identity rules before continuing."
         )
 
+    progress.report(1, 3, f"{name} 语料已读取")
     samples: list[CanonicalSample] = []
     seen_ids: dict[str, int] = {}
     for row_index, row in enumerate(rows):
@@ -74,51 +68,55 @@ def normalize_dataset(
             )
         seen_ids[sample.sample_id] = row_index
         samples.append(sample)
+        if (row_index + 1) % 100 == 0 or row_index + 1 == len(rows):
+            progress.report(1 + (row_index + 1) / len(rows), 3, f"{name} 样本 {row_index + 1}/{len(rows)}")
 
     gold_dist: dict[int, int] = {}
     for sample in samples:
         gold_dist[len(sample.gold_doc_ids)] = gold_dist.get(len(sample.gold_doc_ids), 0) + 1
 
-    # 上游哈希链的起点：原始文件的 sha256 进库，下游各层逐级往下带。
-    repo.upsert_dataset(
-        connection,
-        name=adapter.name,
-        adapter=type(adapter).__name__,
-        adapter_version=adapter.version,
-        provides=sorted(d.value for d in adapter.provides),
-        identity_rules={
-            "sample_id": SAMPLE_ID_RULES[adapter.name],
-            "corpus_doc_id": CORPUS_ID_RULES[adapter.name],
-        },
-        qa_path=repo_relative(resolved.qa_path),
-        qa_sha256=sha256_file(resolved.qa_path),
-        qa_rows=len(rows),
-        corpus_path=repo_relative(resolved.corpus_path),
-        corpus_sha256=sha256_file(resolved.corpus_path),
-        corpus_rows=len(corpus.docs),
-        # 只报告不执行去重：musique 的重复 title 是不同段落，去重会丢 gold。
-        dedup_stats=corpus.dedup_stats(),
-        # 这是**去重后**的 gold 篇数分布，与原始标注条数不同 ——
-        # hotpotqa 的 supporting_facts 是 (title, 句子下标) 对，同一篇会出现多次。
-        gold_count_distribution={str(k): v for k, v in sorted(gold_dist.items())},
-        # 审计归因按 sha256(query) join 审计表，重复 question 会让那一行没法连。
-        unique_question_texts=len({s.question for s in samples}),
-    )
-    sample_count = repo.replace_samples(
-        connection, adapter.name, (s.model_dump(mode="json") for s in samples)
-    )
-    connection.commit()
+    progress.report(2, 3, f"{name} 写入样本与语料")
+    # 数据集元信息、样本和语料作为同一事务更新。
+    with connection:
+        # 上游哈希链的起点：原始文件的 sha256 进库，下游各层逐级往下带。
+        repo.upsert_dataset(
+            connection,
+            name=adapter.name,
+            adapter=type(adapter).__name__,
+            adapter_version=adapter.version,
+            provides=sorted(d.value for d in adapter.provides),
+            identity_rules={
+                "sample_id": SAMPLE_ID_RULES[adapter.name],
+                "corpus_doc_id": CORPUS_ID_RULES[adapter.name],
+            },
+            qa_path=repo_relative(resolved.qa_path),
+            qa_sha256=sha256_file(resolved.qa_path),
+            qa_rows=len(rows),
+            corpus_path=repo_relative(resolved.corpus_path),
+            corpus_sha256=sha256_file(resolved.corpus_path),
+            corpus_rows=len(corpus.docs),
+            # 只报告不执行去重：musique 的重复 title 是不同段落，去重会丢 gold。
+            dedup_stats=corpus.dedup_stats(),
+            # 这是**去重后**的 gold 篇数分布，与原始标注条数不同 ——
+            # hotpotqa 的 supporting_facts 是 (title, 句子下标) 对，同一篇会出现多次。
+            gold_count_distribution={str(k): v for k, v in sorted(gold_dist.items())},
+            # 审计归因按 sha256(query) join 审计表，重复 question 会让那一行没法连。
+            unique_question_texts=len({s.question for s in samples}),
+        )
+        sample_count = repo.replace_samples(
+            connection, adapter.name, (s.model_dump(mode="json") for s in samples)
+        )
 
-    corpus_count = repo.replace_corpus(
-        connection,
-        adapter.name,
-        (
-            {**doc.model_dump(mode="json"), "text_sha256": sha256_text(doc.text)}
-            for doc in corpus.docs
-        ),
-    )
-    connection.commit()
+        corpus_count = repo.replace_corpus(
+            connection,
+            adapter.name,
+            (
+                {**doc.model_dump(mode="json"), "text_sha256": sha256_text(doc.text)}
+                for doc in corpus.docs
+            ),
+        )
 
+    progress.report(3, 3, f"{name} 入库完成")
     return {
         "dataset": adapter.name,
         "samples": sample_count,
@@ -219,9 +217,11 @@ def main(argv: list[str] | None = None) -> int:
         connection.commit()
 
         failures = 0
-        for name in args.dataset or list(DATASET_NAMES):
+        names = args.dataset or list(DATASET_NAMES)
+        for index, name in enumerate(names):
             try:
-                result = normalize_dataset(connection, name, args.dataset_dir)
+                with progress.scope(index, index + 1, len(names), name):
+                    result = normalize_dataset(connection, name, args.dataset_dir)
             except Exception as exc:  # noqa: BLE001 - 报告后继续做下一个数据集
                 failures += 1
                 print(f"FAIL {name}: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { NormalizedSampleDetail } from '../types'
-import { Failed, Loading, Pager, useAsync } from '../ui'
+import { Failed, Loading, Pager, useAction, useAsync } from '../ui'
 
 /** 归一化层：适配器状态 + 归一化后的任意样本。
  *
@@ -9,23 +9,28 @@ import { Failed, Loading, Pager, useAsync } from '../ui'
  * （哪个字段当 doc_id、gold 怎么解析）必须逐组核对，猜不出来 —— 按字段存在性
  * 去猜的话，数据换个版本就会静默走错分支，而症状是一个看着挺合理的指标。
  */
-export function Normalize() {
-  const { data, error, loading } = useAsync(() => api.adapters(), [])
+export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
+  const { data, error, loading, reload } = useAsync(() => api.adapters(), [])
   const [dataset, setDataset] = useState<string | null>(null)
+  const deletion = useAction<void>()
+  const normalization = useAction<void>()
 
   if (loading) return <Loading what="适配器状态" />
   if (error) return <Failed error={error} />
   if (!data) return null
 
   const ready = data.adapters.filter((a) => a.normalized)
+  const pending = data.adapters.filter((a) => a.implemented && a.files_present && !a.normalized)
+  const normalize = (datasets: string[]) => normalization.run(async () => {
+    await api.startTask('normalize', { datasets })
+    onOpenTasks()
+  })
 
   return (
     <>
       <h2>归一化</h2>
-      <p className="lede">
-        原始数据经适配器整成库里的 <code>sample</code> + <code>corpus_doc</code>。
-        适配器同时声明这个数据集<strong>拥有</strong>哪些标注，那决定了它能算哪些指标。
-      </p>
+      {deletion.error && <Failed error={deletion.error} />}
+      {normalization.error && <Failed error={normalization.error} />}
 
       <table>
         <thead>
@@ -45,8 +50,14 @@ export function Normalize() {
             <tr key={entry.name} className={dataset === entry.name ? 'selected' : ''}>
               <td>{entry.name}</td>
               <td className="small mono muted">
-                {entry.adapter}
-                <span className="muted"> v{entry.adapter_version}</span>
+                {entry.implemented ? (
+                  <>
+                    {entry.adapter}
+                    <span className="muted"> v{entry.adapter_version}</span>
+                  </>
+                ) : (
+                  <span className="tag">预留</span>
+                )}
               </td>
               <td>
                 {entry.provides.map((d) => (
@@ -56,7 +67,11 @@ export function Normalize() {
                 ))}
               </td>
               <td>
-                {entry.files_present ? (
+                {!entry.implemented ? (
+                  <span className="tag" title={entry.blocked_reason ?? ''}>
+                    待接入
+                  </span>
+                ) : entry.files_present ? (
                   <span className="tag ok">在位</span>
                 ) : (
                   <span className="tag bad" title={entry.blocked_reason ?? ''}>
@@ -76,13 +91,38 @@ export function Normalize() {
               <td className="num">{entry.qa_rows ?? '—'}</td>
               <td className="num">{entry.corpus_rows ?? '—'}</td>
               <td>
+                {!entry.normalized && entry.implemented && (
+                  <button
+                    className="action small"
+                    disabled={!entry.files_present || normalization.busy}
+                    onClick={() => normalize([entry.name])}
+                  >
+                    归一化
+                  </button>
+                )}
                 <button
                   className="action small"
                   disabled={!entry.normalized}
                   onClick={() => setDataset(dataset === entry.name ? null : entry.name)}
                 >
-                  {dataset === entry.name ? '收起' : '看样本'}
+                  {dataset === entry.name ? '收起' : '查看'}
                 </button>
+                {entry.normalized && (
+                  <button
+                    className="action small"
+                    disabled={deletion.busy}
+                    onClick={() => {
+                      if (!window.confirm(`删除 ${entry.name} 的归一化样本和语料？原始文件会保留。`)) return
+                      deletion.run(async () => {
+                        await api.deleteDataset(entry.name)
+                        setDataset((current) => current === entry.name ? null : current)
+                        reload()
+                      })
+                    }}
+                  >
+                    删除
+                  </button>
+                )}
               </td>
             </tr>
           ))}
@@ -102,12 +142,18 @@ export function Normalize() {
       )}
 
       {ready.length === 0 && (
-        <div className="note warn">
-          还没有任何数据集归一化过。从「任务」层起一次 normalize。
+        <div style={{ marginTop: 14 }}>
+          <button
+            className="action primary"
+            disabled={pending.length === 0 || normalization.busy}
+            onClick={() => normalize(pending.map((entry) => entry.name))}
+          >
+            {normalization.busy ? '启动中…' : '开始归一化'}
+          </button>
         </div>
       )}
 
-      {dataset && <SampleBrowser dataset={dataset} />}
+      {dataset && <SampleBrowser key={dataset} dataset={dataset} />}
     </>
   )
 }
@@ -118,7 +164,7 @@ function SampleBrowser({ dataset }: { dataset: string }) {
   const [term, setTerm] = useState('')
   const [q, setQ] = useState('')
   const [openSample, setOpenSample] = useState<string | null>(null)
-  const limit = 20
+  const limit = 5
 
   const { data, error, loading } = useAsync(
     () => api.normalizedSamples(dataset, { q, limit, offset }),
@@ -128,6 +174,20 @@ function SampleBrowser({ dataset }: { dataset: string }) {
   const search = () => {
     setQ(term)
     setOffset(0)
+  }
+
+  if (openSample) {
+    return (
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="spread">
+          <h3 style={{ margin: 0 }}>{dataset} 样本详情</h3>
+          <button className="action small" onClick={() => setOpenSample(null)}>
+            ← 返回样本列表
+          </button>
+        </div>
+        <SampleDetail dataset={dataset} sampleId={openSample} />
+      </div>
+    )
   }
 
   return (
@@ -194,10 +254,8 @@ function SampleBrowser({ dataset }: { dataset: string }) {
               {data.samples.map((sample) => (
                 <tr
                   key={sample.sample_id}
-                  className={`clickable${openSample === sample.sample_id ? ' selected' : ''}`}
-                  onClick={() =>
-                    setOpenSample(openSample === sample.sample_id ? null : sample.sample_id)
-                  }
+                  className="clickable"
+                  onClick={() => setOpenSample(sample.sample_id)}
                 >
                   <td className="small mono">{sample.dataset_sample_id}</td>
                   <td className="small">{sample.question}</td>
@@ -211,7 +269,6 @@ function SampleBrowser({ dataset }: { dataset: string }) {
         </>
       )}
 
-      {openSample && <SampleDetail dataset={dataset} sampleId={openSample} />}
     </div>
   )
 }

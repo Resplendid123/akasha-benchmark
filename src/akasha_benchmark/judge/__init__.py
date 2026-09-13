@@ -1,4 +1,4 @@
-"""Judge 指标与确定性指标同属评测层；归因与人工标注独立存储。"""
+"""评估指标 judge 与确定性指标同属评测层；归因与人工标注独立存储。"""
 
 from . import faithfulness
 from .client import (

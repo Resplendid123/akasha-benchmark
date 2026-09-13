@@ -121,8 +121,15 @@ def stages() -> list[dict[str, Any]]:
     """
     return [
         {
+            "stage": "download",
+            "label": "下载数据集",
+            "args": [],
+            "cost": "下载后自动校验原始文件",
+            "needs_akasha": False,
+        },
+        {
             "stage": "verify",
-            "label": "小样本验证",
+            "label": "链路测试",
             "args": sorted(tasks_mod.STAGE_ARGS["verify"]),
             "cost": "1–5 条样本，自动入库编译、查询和评测；会调用模型，产物保留",
             "needs_akasha": True,
@@ -150,21 +157,21 @@ def stages() -> list[dict[str, Any]]:
         },
         {
             "stage": "query",
-            "label": "跑查询",
+            "label": "查询",
             "args": sorted(tasks_mod.STAGE_ARGS["query"]),
             "cost": "10-14 秒每条",
             "needs_akasha": True,
         },
         {
             "stage": "evaluate",
-            "label": "算指标",
+            "label": "评测",
             "args": sorted(tasks_mod.STAGE_ARGS["evaluate"]),
-            "cost": "秒级，纯离线",
+            "cost": "计算所选指标；Judge 指标会调用模型",
             "needs_akasha": False,
         },
         {
             "stage": "judge",
-            "label": "judge 指标",
+            "label": "评估指标 judge",
             "args": sorted(tasks_mod.STAGE_ARGS["judge"]),
             "cost": "会调模型花钱；失败率超阈值整轮判失败",
             "needs_akasha": False,

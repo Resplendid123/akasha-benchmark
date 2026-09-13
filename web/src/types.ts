@@ -222,6 +222,7 @@ export interface IndexLayerDataset {
 }
 
 export interface EvalLayerSummary {
+  run_id: string
   id: number
   label: string
   config_hash: string
@@ -230,6 +231,8 @@ export interface EvalLayerSummary {
 }
 
 export interface QueryLayerSummary {
+  run_id: string
+  selection: Record<string, string[]> | null
   id: number
   label: string
   config_hash: string
@@ -245,6 +248,7 @@ export interface QueryLayerSummary {
 }
 
 export interface IndexLayer {
+  run_id: string
   id: number
   label: string
   /** 抽样配置的哈希。答「是同一个子集吗」，离线可算。 */
@@ -299,7 +303,7 @@ export interface LayerDocDetail {
   note: string | null
 }
 
-// --- 评测层与报告层 ---
+// --- 评测层 ---
 
 export interface ResponseRow {
   sample_id: string

@@ -1,24 +1,20 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { IndexLayer } from '../types'
-import { DatasetPicker, Empty, Failed, Loading, Pager, Pass, useAction, useAsync } from '../ui'
+import { Empty, Failed, Loading, Pager, Pass, useAction, useAsync } from '../ui'
 import { DocDiff } from './DocDiff'
 
-/** 编译层：编译模型配置 + 任意已编译文档的变化。
- *
- * 分层依据是重编译语义（§12.3）：compiler / embedding 改了必须重编译，
- * 所以它们属于这一层；answer 改了不用，那属于评测层。
- */
+/** 创建语料子集、启动编译并查看文档变化。模型配置由配置页管理。 */
 export function Compile({
   activeLayer,
   onSelectLayer,
   onOpenTasks,
-  onOpenSettings,
+  onOpenQuery,
 }: {
   activeLayer: number | null
   onSelectLayer: (id: number) => void
   onOpenTasks: () => void
-  onOpenSettings: () => void
+  onOpenQuery: (id: number) => void
 }) {
   const { data, error, loading, reload } = useAsync(() => api.layers(), [])
 
@@ -30,34 +26,19 @@ export function Compile({
   return (
     <>
       <h2>编译层</h2>
-      <p className="lede">
-        一层 = 一批文档 + 一组 compiler/embedding 配置。Akasha 的召回跑在
-        <strong>编译产物</strong>上而不是原文，所以「这篇文档编译成什么样了」
-        决定了它能不能被检索到 —— 那是下面 diff 视图要回答的问题。
-      </p>
-      <p className="small muted">
-        编译模型本身在
-        <button className="action small" onClick={onOpenSettings} style={{ margin: '0 4px' }}>
-          配置层
-        </button>
-        改。这里显示的是「这些层是用什么编出来的」，以及它们与当前配置是否还一致。
-      </p>
 
       <NewLayer existing={layers} onDone={reload} onOpenTasks={onOpenTasks} />
 
-      {layers.length === 0 ? (
-        <Empty>用上面的表单建第一层。</Empty>
-      ) : (
-        layers.map((layer) => (
+      {layers.map((layer) => (
           <LayerCard
             key={layer.id}
             layer={layer}
             active={activeLayer === layer.id}
             onSelect={() => onSelectLayer(layer.id)}
+            onOpenQuery={() => onOpenQuery(layer.id)}
             onOpenTasks={onOpenTasks}
           />
-        ))
-      )}
+        ))}
 
       {activeLayer !== null && <DocBrowser layerId={activeLayer} />}
     </>
@@ -85,15 +66,14 @@ function NewLayer({
   const datasets = useAsync(() => api.datasets(), [])
   const [open, setOpen] = useState(existing.length === 0)
   const [label, setLabel] = useState('')
-  const [picked, setPicked] = useState<string[]>([])
+  const [dataset, setDataset] = useState('')
   const [seed, setSeed] = useState(20260908)
   const [qaLimit, setQaLimit] = useState(100)
   const [negatives, setNegatives] = useState(1.0)
-  const [narrativeDocs, setNarrativeDocs] = useState(2)
   const start = useAction<{ id: number }>()
 
   const available = (datasets.data ?? []).map((entry) => entry.name)
-  const chosen = picked.length > 0 ? picked : available
+  const chosen = dataset ? [dataset] : available
   const ingestedLabels = new Set(
     existing.filter((l) => l.ingest_identity.ingested_at).map((l) => l.label),
   )
@@ -104,9 +84,8 @@ function NewLayer({
     return (
       <div className="row" style={{ marginBottom: 14 }}>
         <button className="action primary" onClick={() => setOpen(true)}>
-          建一层
+          参数配置
         </button>
-        <span className="small muted">抽样条数、种子、负样本比例都在那里配</span>
       </div>
     )
   }
@@ -114,7 +93,7 @@ function NewLayer({
   return (
     <div className="panel">
       <div className="spread">
-        <h3 style={{ margin: 0 }}>建一层</h3>
+        <h3 style={{ margin: 0 }}>参数配置</h3>
         <button className="action small" onClick={() => setOpen(false)}>
           收起
         </button>
@@ -122,10 +101,10 @@ function NewLayer({
 
       <div className="row" style={{ marginTop: 10 }}>
         <label className="field">
-          标签
+          编译批次（run_id）
           <input
             value={label}
-            placeholder="run003"
+            placeholder="run001"
             onChange={(event) => setLabel(event.target.value)}
           />
         </label>
@@ -156,32 +135,31 @@ function NewLayer({
             onChange={(event) => setNegatives(Number(event.target.value))}
           />
         </label>
-        <label className="field">
-          narrativeqa 取几篇文档
-          <input
-            type="number"
-            min={1}
-            value={narrativeDocs}
-            onChange={(event) => setNarrativeDocs(Number(event.target.value))}
-          />
-        </label>
       </div>
 
       <div className="row" style={{ marginTop: 8 }}>
         <label className="field">
-          数据集（不选则全部）
-          <DatasetPicker all={available} selected={picked} onChange={setPicked} />
+          数据集
+          <select value={dataset} onChange={(event) => setDataset(event.target.value)}>
+            <option value="">全部数据集</option>
+            {available.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
         </label>
       </div>
 
+      {datasets.loading && <Loading what="数据集" />}
+      {datasets.error && <Failed error={datasets.error} />}
+      {!datasets.loading && !datasets.error && available.length === 0 && (
+        <Empty>暂无归一化数据集，请到「归一化」页准备数据。</Empty>
+      )}
+
       <div className="note plain small">
         抽样顺序是<strong>先 QA 后 corpus</strong>：先按种子抽 {qaLimit} 条问题，
-        它们的 gold 文档全集必选，再按比例补负样本。反过来随机抽文档的话，
-        大部分 gold 会落在子集外，Recall 会因为跟检索器无关的原因被钉在 0 附近。
-        <div style={{ marginTop: 4 }}>
-          narrativeqa 走另一条路（整篇整篇取文档）—— 它没有 gold 标注，
-          而 293 个问题只覆盖 10 篇文档，按问题抽会把绝大多数 chunk 都牵进来。
-        </div>
+        它们的 gold 文档全集必选，再按比例补负样本。
       </div>
 
       {clash && (
@@ -200,7 +178,7 @@ function NewLayer({
       <div className="row" style={{ marginTop: 10 }}>
         <button
           className="action primary"
-          disabled={start.busy || !label.trim() || clash}
+          disabled={start.busy || datasets.loading || !!datasets.error || chosen.length === 0 || !label.trim() || clash}
           onClick={() =>
             start.run(async () => {
               const task = await api.startTask('subset', {
@@ -209,7 +187,6 @@ function NewLayer({
                 seed,
                 qa_limit: qaLimit,
                 negatives_ratio: negatives,
-                narrativeqa_docs: narrativeDocs,
               })
               onDone()
               return task
@@ -218,9 +195,6 @@ function NewLayer({
         >
           {start.busy ? '启动中…' : '抽子集'}
         </button>
-        <span className="small muted">
-          离线，秒级。抽完再在层卡片上「入库编译」—— 那一步约 40 秒/篇。
-        </span>
       </div>
 
       {start.error && <div className="note bad">{start.error}</div>}
@@ -244,11 +218,13 @@ function LayerCard({
   active,
   onSelect,
   onOpenTasks,
+  onOpenQuery,
 }: {
   layer: IndexLayer
   active: boolean
   onSelect: () => void
   onOpenTasks: () => void
+  onOpenQuery: () => void
 }) {
   const imported = Object.values(layer.page_map_counts).reduce((a, b) => a + b, 0)
 
@@ -267,6 +243,7 @@ function LayerCard({
           <button className={`action small${active ? ' primary' : ''}`} onClick={onSelect}>
             {active ? '已选中' : '看文档变化'}
           </button>
+          <button className="action small" disabled={!layer.ready_for_query} onClick={onOpenQuery}>去查询</button>
         </div>
       </div>
 

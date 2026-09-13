@@ -1,11 +1,4 @@
 """FastAPI 应用与 ``akasha-platform`` 入口。
-
-只挂 API。前端在 dev 时由 Vite dev server 起在 :5173，把 ``/api/*`` 代理到
-这里的 :8848；本地浏览器访问 http://127.0.0.1:5173 即可。
-
-**安全**：默认只绑 ``127.0.0.1``。绑非回环地址且没设访问令牌时**拒绝启动** ——
-这个服务持有 Akasha 管理员凭据、只读数据库连接、以及启动长任务的能力。
-
     uv run akasha-platform
     uv run akasha-platform --port 9000
 """
@@ -13,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -102,9 +96,15 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     print(f"API on http://{settings.host}:{settings.port}  db={settings.db_path}")
-    print(f"前端 dev: npm --prefix web run dev  → http://127.0.0.1:5173")
+    print("前端 dev: npm --prefix web run dev  → http://127.0.0.1:5173")
     if not settings.auth_token:
         print("no auth token set — bound to loopback only")
+    # Uvicorn 热更新子进程会重新调用工厂，通过环境继承已解析的启动参数。
+    os.environ.update({
+        "AKASHA_PLATFORM_HOST": settings.host,
+        "AKASHA_PLATFORM_PORT": str(settings.port),
+        "AKASHA_PLATFORM_DB": str(settings.db_path.resolve()),
+    })
     uvicorn.run(
         "akasha_platform.main:create_app",
         factory=True,

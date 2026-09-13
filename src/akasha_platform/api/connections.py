@@ -1,15 +1,4 @@
-"""配置层：Akasha 连接 + 它那边的四项模型配置 + judge/归因分析端点。
-
-四件事都在这里，因为它们回答的是同一个问题：「这一轮跑在什么上」。原先编译模型
-配置在编译层、连接在别处，那让「改一个模型要去哪」取决于它属于哪一层 ——
-而用户想的是「我要改配置」。
-
-**连接只有一份**，只能改，不能新增或删除（``CHECK (id = 1)`` 写在 schema 里）。
-历史记录不靠多行：``index_layer.connection_json`` 存了入库时那份配置的快照。
-
-**这个路由会把明文密钥写进库。** 那是明确的取舍：配置要能在 UI 里填改。
-代价是 ``akasha_bench.db`` 成为凭据文件（已 gitignore）。
-"""
+"""配置路由：Akasha 连接、远端模型配置及本地评估/归因模型。"""
 
 from __future__ import annotations
 
@@ -222,15 +211,7 @@ def put_model_config(
         "feature": feature,
         "result": result,
         "requires_new_index_layer": requires_rebuild,
-        "impact": (
-            f"已改 {config.base_url} 上的 {feature} 配置 —— 同一部署上的其他账号也会"
-            "受影响。既有索引层与新配置不再可比：需要新建一个索引层重编译才能得到"
-            "可比的结果。embedding 的情况更硬 —— 旧 chunk 带的是旧 profile，"
-            "它们永远召回不到，而评测会照常算出一份看着合理的坏报告。"
-            if requires_rebuild
-            else f"已改 {config.base_url} 上的 {feature} 配置。这一项不需要重编译，"
-            "新建查询层即可。"
-        ),
+        "impact": "需重编译" if requires_rebuild else "无影响",
     }
 
 
@@ -261,7 +242,7 @@ def put_provider(
 ) -> dict[str, Any]:
     """存一个 judge / analysis 端点。
 
-    ``api_key`` 传空串表示**不改**，不是清空（同连接那条的理由）。
+    ``api_key`` 为空时保留现有密钥；连接密码的空值语义不同。
     """
     if role not in {"judge", "analysis"}:
         raise HTTPException(422, "role must be judge or analysis")

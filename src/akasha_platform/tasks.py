@@ -1,14 +1,6 @@
-"""阶段任务走 subprocess，进度写库（决策 7）。
+"""启动白名单阶段子进程，由后台线程读取 stdout 并记录任务进度。
 
-**15 小时的 ingest 不能与 Web 后端同生命周期。** 后端重启、崩掉、被 Ctrl-C,
-那个任务都该继续跑；反过来任务卡住也不该拖死 Web 端。所以：
-
-* 每个任务是一个独立进程，``python -m akasha_benchmark.<stage>``
-* 进度与日志由**读它 stdout 的线程**写库，逐行提交
-* 库里存 pid 与退出码，后端重启后还能认出「这个任务还在跑」
-
-ingest 的进度条本质是「帮我盯着别人干活」—— 真正在编译的是 Akasha 的
-BullMQ worker，观察到的约 40 秒/篇是那边的吞吐。
+日志采集依赖 Web 进程；当前不保证后端重启后继续采集或托管任务。
 """
 
 from __future__ import annotations
@@ -22,17 +14,19 @@ from pathlib import Path
 from typing import Any
 
 from akasha_benchmark.store import connect, repo
+from akasha_benchmark import progress
 
 from .settings import Settings
 
 # 阶段名 -> 模块。**白名单**：argv 由这里拼，不接受请求体里的任意命令。
 STAGE_MODULES = {
     "verify": "akasha_platform.verify",
-    "normalize": "akasha_benchmark.normalize",
+    "download": "akasha_platform.download",
+    "normalize": "akasha_platform.prepare_normalize",
     "subset": "akasha_benchmark.subset",
     "ingest": "akasha_benchmark.ingest",
     "query": "akasha_benchmark.run_queries",
-    "evaluate": "akasha_benchmark.evaluate",
+    "evaluate": "akasha_platform.evaluation",
     "audit": "akasha_benchmark.audit_join",
     "judge": "akasha_benchmark.judge.run",
     "reindex": "akasha_benchmark.store.reindex",
@@ -48,14 +42,10 @@ class TaskRejected(RuntimeError):
     """请求的任务不合法（未知阶段，或同类任务已在跑）。"""
 
 
-# 每个阶段接受哪些参数。**这是白名单**：请求体里的其他键不会进 run_config,
-# 阶段代码也就读不到它们。
-#
-# 原先这里是一张「键 -> 命令行标志 -> 类型」的三元映射表，参数逐项拼进 argv。
-# 改成先写库、argv 只带一个 id 之后，映射表退化成「允许哪些键 + 什么类型」——
-# 少了「标志名」这一列，也就少了一处会与阶段 argparse 漂开的地方。
+# 阶段参数白名单，写入 run_config 后由对应 CLI 读取。
 STAGE_ARGS: dict[str, dict[str, type]] = {
     "verify": {"dataset": str, "samples": int},
+    "download": {},
     "normalize": {"datasets": list, "export": bool},
     "subset": {
         "label": str,
@@ -77,6 +67,7 @@ STAGE_ARGS: dict[str, dict[str, type]] = {
         "retry_failed": bool,
     },
     "evaluate": {
+        "provider_label": str,
         "query_label": str,
         "eval_label": str,
         "datasets": list,
@@ -115,9 +106,13 @@ def _clean_args(stage: str, args: dict[str, Any]) -> dict[str, Any]:
             continue
         try:
             if kind is list:
+                if not isinstance(value, list):
+                    raise ValueError("expected a JSON array")
                 cleaned[key] = [str(v) for v in value] if key != "k" else [int(v) for v in value]
             elif kind is bool:
-                cleaned[key] = bool(value)
+                if not isinstance(value, bool):
+                    raise ValueError("expected a JSON boolean")
+                cleaned[key] = value
             else:
                 cleaned[key] = kind(value)
         except (TypeError, ValueError) as exc:
@@ -148,16 +143,27 @@ def _pump(task_id: int, process: subprocess.Popen[str], settings: Settings, log_
     """读子进程 stdout，写日志文件与库。**逐行提交**，Web 端才看得到进度。"""
     connection = connect(settings.db_path)
     try:
+        structured_progress = False
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w", encoding="utf-8", newline="\n") as log:
             assert process.stdout is not None
             for line in process.stdout:
                 line = line.rstrip("\n")
+                event = progress.parse(line)
+                if event:
+                    line = f"[进度] {event['note']}"
                 log.write(line + "\n")
                 log.flush()
                 repo.add_task_event(connection, task_id, "info", line[:2000])
                 match = _PROGRESS.search(line)
-                if match:
+                if event:
+                    structured_progress = True
+                    repo.update_task_progress(
+                        connection, task_id,
+                        done=min(event['done'], event['total'] - 1),
+                        total=event['total'], note=event['note'],
+                    )
+                elif match and not structured_progress:
                     repo.update_task_progress(
                         connection,
                         task_id,
@@ -185,16 +191,16 @@ def start(stage: str, args: dict[str, Any], settings: Settings) -> dict[str, Any
     """起一个阶段任务，立刻返回。返回库里那条 task 记录。"""
     connection = connect(settings.db_path)
     try:
-        # 小样本验证跨多个阶段，执行期间不允许其他阶段任务并行。
+        # 数据准备会改写阶段输入，小样本验证跨多个阶段；两者都独占执行。
         running = [
             t for t in repo.running_tasks(connection)
-            if t["stage"] == stage or stage == "verify" or t["stage"] == "verify"
+            if t["stage"] == stage or stage in {"verify", "download", "normalize"}
+            or t["stage"] in {"verify", "download", "normalize"}
         ]
         if running:
             raise TaskRejected(
                 f"a {running[0]['stage']} task is already running (task #{running[0]['id']}). "
-                "Verification runs exclusively; overlapping stages can create duplicate pages "
-                "that no page_map row points at."
+                "Data preparation and verification run exclusively; wait for the active task."
             )
 
         cleaned = _clean_args(stage, args)

@@ -9,14 +9,15 @@
 
 ```bash
 uv sync
-uv run python scripts/download_datasets.py  # 下载到 dataset/
-make setup                                # 校验下载、建库、归一化、验收
-make web                                  # 构建前端
-make serve                                # http://127.0.0.1:8848
+npm --prefix web ci
+make setup                                # 初始化数据库
 ```
 
-`make setup` 不自动下载数据。已有数据时可用 `make check-download` 单独检查。
-开发时分别运行 `uv run akasha-platform` 和 `npm --prefix web run dev`；Vite 的 `/api` 请求代理到后端。
+数据集下载在「数据集」页操作，下载完成后自动校验。
+在两个终端分别运行 `make web` 和 `make serve`，前后端均启用热更新。
+打开 `http://127.0.0.1:5173`；Vite 将 `/api` 请求代理到 `http://127.0.0.1:8848`。
+在「归一化」页点击「开始归一化」，自动检查原始文件、归一化并验收产物。
+前端构建使用 `npm --prefix web run build`，FastAPI 仅提供 API，不托管前端产物。
 
 ## 运行实验
 
@@ -26,10 +27,11 @@ make serve                                # http://127.0.0.1:8848
 | --- | --- |
 | 数据集、归一化 | 查看原始数据、统一样本和 gold 文档 |
 | 编译层 | 抽子集、导入和编译语料，查看原文与编译结果的差异 |
-| 评测层 | 运行查询、选择指标并评测 |
-| 报告层 | 查看汇总、样本明细及分层结果 |
+| 查询层 | 选择编译批次和 Q 数量，查看逐条检索、引用与生成响应 |
+| 评测层 | 选择查询记录与指标，计算并查看评测结果 |
 | 归因层 | 查看链路、规则归因及可选的模型分析 |
 | 任务 | 查看进度、日志，停止或清理任务 |
+| 测试 | 运行小样本端到端链路测试 |
 
 平台将阶段参数存入 `run_config`，子进程通过 `--run-config` 读取。阶段也保留命令行参数，
 可用 `uv run python -m akasha_benchmark.<阶段> --help` 查看；指定 `--run-config` 时库中参数优先。
@@ -41,14 +43,15 @@ embedding 配置漂移拒绝执行，compiler 漂移会警告。
 要将已入库的层转到另一部署，先调用 `POST /api/layers/index/{id}/discard-ingest`（`confirm=true`）。
 这会清除本地入库记录并保留子集，不删除远端 Space。
 
-首次运行可在「评测层 → 小样本验证」选择数据集和 1–5 条样本，自动完成抽样、入库编译、
-响应契约与映射校验、续跑检查和评测。进度与检查结果在「任务」页查看，报告使用普通评测层。
+首次运行可在「测试」选择数据集和 1–5 条样本，自动完成抽样、入库编译、
+响应契约与映射校验、续跑检查和评测。进度与检查结果在「任务」页查看，指标结果在「评测层」查看。
 此流程会调用模型，独立创建的层与远端 Space 保留以便复查；不需要运行测试命令。
 
 ## 数据与配置
 
 `akasha_bench.db` 是各阶段的事实来源。索引层保存子集和入库产物，查询层保存完整响应，
-评测层保存指标与汇总；索引层的 `subset_hash` 按实际文档内容计算，`config_hash` 在入库时加入模型配置。
+评测层保存指标与汇总。编译批次标签作为共同的 `run_id` 展示，查询和评测各有独立 ID，
+分别关联编译批次与查询记录；查询开始前固定样本 ID，续跑使用同一批问题。索引层的 `subset_hash` 按实际文档内容计算，`config_hash` 在入库时加入模型配置。
 入库和查询按库中已有记录跳过已处理条目，中断后可续跑。
 
 连接和模型密钥在界面配置并存入数据库。库及备份包含明文凭据，已被 gitignore。
@@ -68,7 +71,7 @@ data/subsets/{label}/{ds}/  samples.jsonl、corpus/*.md、corpus_hashes.json
 data/reports/{eval_label}/  metrics.json、per_sample.jsonl、report.md
 ```
 
-常规阶段从库读取；`store.reindex` 用于从历史文件恢复产物。`make distclean` 清理导出、
+常规阶段从库读取；`store.reindex` 用于从历史文件恢复产物。`make clean` 清理导出、
 缓存、日志及前端产物，保留数据库和原始数据集。
 
 ## 指标口径
@@ -84,6 +87,7 @@ data/reports/{eval_label}/  metrics.json、per_sample.jsonl、report.md
 - [原始数据集](docs/datasets.md) · [归一化字段](docs/normalized_datasets.md)
 - [接口约定](docs/akasha_api.md) · [指标定义](docs/metrics.md)
 - [排查案例](docs/cases/README.md)
+- [代码架构](docs/architecture.md)
 
 ```bash
 make test

@@ -122,6 +122,10 @@ export const api = {
   // --- 数据集层与归一化层 ---
   datasets: () => request<Dataset[]>('/api/datasets'),
   adapters: () => request<AdapterList>('/api/adapters'),
+  deleteDataset: (name: string) =>
+    request<{ deleted: number; dataset: string }>(`/api/datasets/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
   rawSamples: (name: string, params: { limit?: number; offset?: number } = {}) =>
     request<RawSamples>(`/api/datasets/${name}/raw${query(params)}`),
   normalizedSamples: (

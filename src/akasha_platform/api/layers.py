@@ -50,6 +50,7 @@ def layers(request: Request) -> dict[str, Any]:
             index_layers.append(
                 {
                     **strip_json(layer),
+                    "run_id": layer["label"],
                     "model_configs": repo.loads(layer["model_configs_json"]),
                     "datasets": repo.index_layer_datasets(connection, layer_id),
                     "page_map_counts": repo.page_map_counts(connection, layer_id),
@@ -68,10 +69,12 @@ def layers(request: Request) -> dict[str, Any]:
                     "query_layers": [
                         {
                             **strip_json(q),
+                            "run_id": layer["label"],
+                            "selection": repo.query_selection(connection, int(q["id"])),
                             "stats": repo.response_stats(connection, int(q["id"])),
                             "request_window": repo.request_window(connection, int(q["id"])),
                             "eval_layers": [
-                                strip_json(e)
+                                {**strip_json(e), "run_id": layer["label"]}
                                 for e in repo.list_eval_layers(connection, int(q["id"]))
                             ],
                         }

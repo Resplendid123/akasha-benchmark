@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api'
 import type { Metrics, RootCause } from './types'
 
-/** 指标值的显示。**缺失显示 `—` 而不是 0** —— 那是两种不同的状态。 */
+/** 缺失指标显示为 `—`，避免与数值 0 混淆。 */
 export function metric(values: Metrics, name: string, digits = 4): string {
   const value = values[name]
   return value === undefined ? '—' : value.toFixed(digits)
@@ -16,7 +16,6 @@ export function num(value: number | null | undefined, digits = 0): string {
   return value === null || value === undefined ? '—' : value.toFixed(digits)
 }
 
-/** 一个异步取数的小 hook。够用，不引状态库。 */
 export function useAsync<T>(
   load: () => Promise<T>,
   deps: unknown[],
@@ -30,7 +29,7 @@ export function useAsync<T>(
     let alive = true
     setLoading(true)
     setError(null)
-    load()
+    Promise.resolve().then(load)
       .then((result) => {
         if (alive) setData(result)
       })
@@ -50,7 +49,6 @@ export function useAsync<T>(
   return { data, error, loading, reload: useCallback(() => setNonce((n) => n + 1), []) }
 }
 
-/** 一次「点了按钮才发」的请求。返回 run / busy / error / result。 */
 export function useAction<T>(): {
   run: (task: () => Promise<T>) => void
   busy: boolean
@@ -62,12 +60,19 @@ export function useAction<T>(): {
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<T | null>(null)
   const alive = useRef(true)
-  useEffect(() => () => void (alive.current = false), [])
+  useEffect(() => {
+    // StrictMode 会重新执行 effect，每次挂载都要恢复异步更新标记。
+    alive.current = true
+    return () => {
+      alive.current = false
+    }
+  }, [])
 
   const run = useCallback((task: () => Promise<T>) => {
     setBusy(true)
     setError(null)
-    task()
+    setResult(null)
+    Promise.resolve().then(task)
       .then((value) => alive.current && setResult(value))
       .catch((exc: unknown) =>
         alive.current && setError(exc instanceof ApiError ? exc.message : String(exc)),

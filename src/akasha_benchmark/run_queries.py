@@ -90,7 +90,11 @@ def run_dataset(
 ) -> dict[str, Any]:
     """跑完一个数据集的全部 query，返回该数据集的统计。"""
     samples = repo.subset_samples(connection, index_layer_id, dataset)
-    if limit is not None:
+    selection = repo.query_selection(connection, query_layer_id)
+    if selection is not None:
+        by_id = {s["sample_id"]: s for s in samples}
+        samples = [by_id[sample_id] for sample_id in selection.get(dataset, [])]
+    elif limit is not None:
         samples = samples[:limit]
 
     done = repo.completed_sample_ids(connection, query_layer_id, dataset)
@@ -184,6 +188,10 @@ def ensure_query_layer(
     """取或建查询层，返回 ``(id, 是否新建)``。同 label 复用，这样重跑是续跑。"""
     existing = repo.query_layer_by_label(connection, label)
     if existing:
+        if existing["index_layer_id"] != index_layer_id:
+            raise ValueError("查询记录属于另一个编译批次，请使用新名称")
+        if existing["score_threshold"] != score_threshold or repo.loads(existing["model_configs_json"]) != model_configs:
+            raise ValueError("查询配置已变化，请创建新的查询记录")
         return int(existing["id"]), False
     index_layer = repo.get_index_layer(connection, index_layer_id) or {}
     layer_id = repo.create_query_layer(
@@ -308,6 +316,9 @@ def run(
                 f"query layer #{query_layer_id} "
                 f"({'created' if created else 'reused'}), concurrency={config.concurrency}"
             )
+
+            repo.freeze_query_selection(connection, query_layer_id, index_layer_id, datasets, limit)
+            connection.commit()
 
             if retry_failed:
                 removed = repo.delete_failed_responses(connection, query_layer_id)

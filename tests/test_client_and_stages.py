@@ -919,15 +919,26 @@ def test_run_queries_concurrent_resume_skips_completed_rows(
     fake = FakeAkasha()
     _patch_client(monkeypatch, rq_mod, fake, config)
 
-    # 先只跑第一条，制造一个「跑了一半」的查询层。
-    assert rq_mod.run(LABEL, [DATASET], staged.db_path, None, 1, False) == 0
-    assert len(fake.queries) == 1
+    # 固定全量选择，再移除第二条响应，模拟中断后只持久化了第一条。
+    assert _query(staged) == 0
+    staged.connection.execute("DELETE FROM query_response WHERE sample_id = ?", (f"{DATASET}:s2",))
+    staged.connection.commit()
 
     second = FakeAkasha()
     _patch_client(monkeypatch, rq_mod, second, config)
     assert _query(staged) == 0
     assert [q["query"] for q in second.queries] == ["second question"]
     assert {r["sample_id"] for r in _responses(staged)} == {f"{DATASET}:s1", f"{DATASET}:s2"}
+
+
+def test_query_selection_cannot_expand_on_resume(staged, config, monkeypatch):
+    _prepare_query_stage(staged)
+    fake = FakeAkasha()
+    _patch_client(monkeypatch, rq_mod, fake, config)
+    assert rq_mod.run(LABEL, [DATASET], staged.db_path, None, 1, False) == 0
+    with pytest.raises(ValueError, match="样本范围已固定"):
+        _query(staged)
+    assert len(fake.queries) == 1
 
 
 def test_run_queries_records_failures_as_rows(
@@ -1058,3 +1069,47 @@ def test_run_queries_never_overrides_an_embedding_change(
     # 即便显式允许漂移，这一项也必须拦住。
     assert _query(staged, drift_ok=True) == 1
     assert fake.queries == []
+
+
+def test_evaluation_task_uses_selected_query_and_metrics(staged, config, monkeypatch):
+    from akasha_platform import evaluation
+    _prepare_query_stage(staged)
+    fake = FakeAkasha()
+    _patch_client(monkeypatch, rq_mod, fake, config)
+    assert _query(staged) == 0
+    assert evaluation.main([
+        '--db', str(staged.db_path), '--query-label', QUERY_LABEL,
+        '--eval-label', 'selected-eval', '--dataset', DATASET,
+        '--metric', 'f1', '--k', '5',
+    ]) == 0
+    record = repo.eval_layer_by_label(staged.connection, 'selected-eval')
+    query = repo.query_layer_by_label(staged.connection, QUERY_LABEL)
+    assert record['query_layer_id'] == query['id']
+    assert repo.loads(record['metrics_json']) == ['f1']
+    with pytest.raises(ValueError, match='名称已存在'):
+        evaluation.main([
+            '--db', str(staged.db_path), '--query-label', QUERY_LABEL,
+            '--eval-label', 'selected-eval', '--metric', 'f1',
+        ])
+
+
+@pytest.mark.parametrize("judge_exit", [0, 1])
+def test_evaluation_task_chains_judge_when_selected(staged, config, monkeypatch, judge_exit):
+    from akasha_platform import evaluation
+    _prepare_query_stage(staged)
+    fake = FakeAkasha()
+    _patch_client(monkeypatch, rq_mod, fake, config)
+    assert _query(staged) == 0
+    calls = []
+    monkeypatch.setattr(evaluation.judge, 'main', lambda args: calls.append(args) or judge_exit)
+    assert evaluation.main([
+        '--db', str(staged.db_path), '--query-label', QUERY_LABEL,
+        '--eval-label', 'judge-eval', '--dataset', DATASET,
+        '--metric', 'faithfulness', '--provider-label', 'test-judge',
+    ]) == judge_exit
+    record = repo.eval_layer_by_label(staged.connection, "judge-eval")
+    assert bool(record["finished_at"]) is (judge_exit == 0)
+    assert calls == [[
+        '--eval-label', 'judge-eval', '--provider', 'test-judge',
+        '--db', str(staged.db_path), '--dataset', DATASET,
+    ]]

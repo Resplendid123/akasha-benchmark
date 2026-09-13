@@ -2,13 +2,11 @@
 
 来源：https://huggingface.co/datasets/osunlp/HippoRAG_2
 
-四组 QA 文件与对应语料下载到 ``dataset/``。仓库里 NarrativeQA 那一份叫
-``narrativeqa_dev_10_doc``，本地统一存成 ``narrativeqa``，让四组的命名一致。
+四组 QA 文件与对应语料下载到 ``dataset/``。
 
 用法（从仓库根执行）：
     uv run python scripts/download_datasets.py
     uv run python scripts/download_datasets.py --check      # 只校验，不下载
-    HF_ENDPOINT=https://huggingface.co uv run python scripts/download_datasets.py
 
 已存在且字节数符合预期的文件会跳过，下载中断后直接重跑即可。
 """
@@ -17,25 +15,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 import time
 from pathlib import Path
 
+from akasha_benchmark import progress
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 
 REPO_ID = "osunlp/HippoRAG_2"
 REPO_TYPE = "dataset"
-# 仓库根的 dataset/，不是脚本目录下的 —— 本文件在 scripts/
+# 目标目录
 DEST = Path(__file__).resolve().parent.parent / "dataset"
-
-# 候选站点，按顺序尝试。hf-mirror.com 是只读的社区镜像，
-# 在访问不到 huggingface.co 的网络环境下有用。
+# 候选站点，按顺序尝试。
 ENDPOINTS = ("https://hf-mirror.com", "https://huggingface.co")
 
-# (仓库里的文件名, 存到本地的文件名)
+# (仓库里的文件名 -> 存到本地的文件名)
 FILES: tuple[tuple[str, str], ...] = (
     ("hotpotqa.json", "hotpotqa.json"),
     ("hotpotqa_corpus.json", "hotpotqa_corpus.json"),
@@ -47,25 +43,23 @@ FILES: tuple[tuple[str, str], ...] = (
     ("narrativeqa_dev_10_doc_corpus.json", "narrativeqa_corpus.json"),
 )
 
-MAX_ATTEMPTS = 3
-
+MAX_ATTEMPTS = 2
 
 def resolve_endpoint() -> tuple[str, dict[str, int]]:
     """返回第一个连得上的站点，以及它报告的各文件大小。"""
-    candidates = (os.environ["HF_ENDPOINT"],) if os.environ.get("HF_ENDPOINT") else ENDPOINTS
     errors: list[str] = []
 
-    for endpoint in candidates:
+    for endpoint in ENDPOINTS:
         try:
             info = HfApi(endpoint=endpoint).repo_info(
                 REPO_ID, repo_type=REPO_TYPE, files_metadata=True
             )
-        except Exception as exc:  # noqa: BLE001 - 这里就是在探测连通性
+        except Exception as exc:
             errors.append(f"  {endpoint}: {type(exc).__name__}: {str(exc)[:200]}")
             print(f"unreachable: {endpoint}", file=sys.stderr)
             continue
 
-        sizes = {s.rfilename: s.size for s in info.siblings if s.size is not None}
+        sizes = {s.rfilename: s.size for s in (info.siblings or []) if s.size is not None}
         print(f"using endpoint: {endpoint}")
         return endpoint, sizes
 
@@ -103,7 +97,7 @@ def fetch(remote: str, local: str, endpoint: str, expected: int | None) -> Path:
         print(f"{label}" if remote == local else f"{label}   (from {remote})")
         return target
 
-    raise RuntimeError(f"unreachable: {remote}")  # pragma: no cover
+    raise RuntimeError(f"unreachable: {remote}")
 
 
 def summarize(paths: list[Path]) -> int:
@@ -112,22 +106,27 @@ def summarize(paths: list[Path]) -> int:
     print("-" * 56)
 
     failures = 0
-    for path in paths:
+    for index, path in enumerate(paths):
+        progress.report(index, len(paths), f"校验 {path.name}")
         size = f"{path.stat().st_size / 1e6:.2f} MB"
         try:
             with path.open(encoding="utf-8") as handle:
                 data = json.load(handle)
-            count = str(len(data)) if isinstance(data, (list, dict)) else "n/a"
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            if not isinstance(data, list) or not data:
+                raise ValueError("expected a non-empty JSON array")
+            count = str(len(data))
+        except (ValueError, UnicodeDecodeError) as exc:
             count = "INVALID"
             failures += 1
             print(f"  {path.name}: {exc}", file=sys.stderr)
         print(f"{path.name:<32}{size:>12}{count:>12}")
 
+    if not failures:
+        progress.report(len(paths), len(paths), "文件校验通过")
     return failures
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--check", action="store_true", help="只校验已有文件，不下载"
@@ -135,7 +134,7 @@ def main() -> int:
     parser.add_argument(
         "--keep-cache", action="store_true", help="保留中间的 HF 缓存目录"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     DEST.mkdir(parents=True, exist_ok=True)
 
@@ -147,12 +146,18 @@ def main() -> int:
             print(f"MISSING: {name}", file=sys.stderr)
         return 1 if (failures or missing) else 0
 
+    progress.report(0, 1, "连接下载源")
     endpoint, sizes = resolve_endpoint()
     print(f"downloading {len(FILES)} files to {DEST}")
 
-    paths = [fetch(remote, local, endpoint, sizes.get(remote)) for remote, local in FILES]
-
-    failures = summarize(paths)
+    paths = []
+    with progress.scope(0, 1, 2, "下载文件"):
+        for index, (remote, local) in enumerate(FILES):
+            progress.report(index, len(FILES), f"下载 {local}")
+            paths.append(fetch(remote, local, endpoint, sizes.get(remote)))
+            progress.report(index + 1, len(FILES), f"已下载 {local}")
+    with progress.scope(1, 2, 2, "校验文件"):
+        failures = summarize(paths)
 
     cache = DEST / ".hf_cache"
     if cache.exists() and not args.keep_cache:

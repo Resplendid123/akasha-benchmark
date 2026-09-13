@@ -4,7 +4,6 @@ import type { DatasetEval, EvalLayerDetail, MetricDefinition, SampleRow } from '
 import {
   Bar,
   CauseTag,
-  Empty,
   Failed,
   Loading,
   ModeTag,
@@ -13,64 +12,7 @@ import {
   useAsync,
 } from '../ui'
 
-/** 报告层：本轮所选指标的结果，以及任意样本。
- *
- * 两条口径贯穿这一页：
- *
- * 1. **每张检索表都给两份** —— 全样本，以及只算 answerMode == knowledge 的切片。
- *    差值就是生成端拒答的规模，不是检索失败。
- * 2. **算不了的指标连同原因一起显示，不画成 0。** 缺依赖与没勾选是两种原因,
- *    要分开陈述。
- */
-export function Report({
-  activeEval,
-  onSelectEval,
-  onOpenBadcase,
-}: {
-  activeEval: number | null
-  onSelectEval: (id: number) => void
-  onOpenBadcase: (id: number) => void
-}) {
-  const layers = useAsync(() => api.layers(), [])
-
-  const evalLayers = (layers.data?.index_layers ?? []).flatMap((index) =>
-    index.query_layers.flatMap((query) =>
-      query.eval_layers.map((entry) => ({ ...entry, indexLabel: index.label })),
-    ),
-  )
-  const current = activeEval ?? evalLayers[0]?.id ?? null
-
-  if (layers.loading) return <Loading what="评测层" />
-  if (layers.error) return <Failed error={layers.error} />
-
-  return (
-    <>
-      <h2>报告</h2>
-      {evalLayers.length === 0 ? (
-        <Empty>还没有评测层。到「评测层」勾好指标跑一轮。</Empty>
-      ) : (
-        <>
-          <div className="row tight" style={{ marginBottom: 14 }}>
-            {evalLayers.map((entry) => (
-              <button
-                key={entry.id}
-                className={`action${current === entry.id ? ' primary' : ''}`}
-                onClick={() => onSelectEval(entry.id)}
-              >
-                #{entry.id} {entry.label}
-              </button>
-            ))}
-          </div>
-          {current !== null && (
-            <ReportBody evalLayerId={current} onOpenBadcase={onOpenBadcase} />
-          )}
-        </>
-      )}
-    </>
-  )
-}
-
-function ReportBody({
+export function EvaluationResults({
   evalLayerId,
   onOpenBadcase,
 }: {
@@ -89,15 +31,6 @@ function ReportBody({
 
   return (
     <>
-      <div className="note plain">
-        <strong>这些数字该怎么读。</strong> Akasha 的召回跑在<strong>编译产物</strong>上而不是
-        原文。编译可能改写或遗漏信息；与公开 baseline 比较前需对齐语料、样本、
-        检索单位和答案格式。原文基线可帮助隔离编译影响。
-        <div className="small" style={{ marginTop: 6 }}>
-          Exact Match 要求归一化后的整段答案与参考答案相等。解释性长答案通常得分较低，
-          但并非必然为零；请结合 F1、引用证据和人工抽查解读。
-        </div>
-      </div>
 
       <div className="panel">
         <div className="spread">

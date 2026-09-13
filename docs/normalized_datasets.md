@@ -166,10 +166,10 @@ narrativeqa 的答案分数因此有个天然上限，见 [metrics.md](metrics.m
 
 | 数据集 | 规则 | 形如 |
 | --- | --- | --- |
-| hotpotqa | `native_idx`，原生 `idx` 转 str | `"0"`, `"1"` |
-| 2wikimultihopqa | `row_index`，corpus 数组行号 | `"0"`, `"1"` |
-| musique | `row_index` | `"0"`, `"1"` |
-| narrativeqa | `native_idx`，原生 str idx | `"4b30ab…865_0"` |
+| hotpotqa | `native_id`，原生 `idx` 转 str | `"0"`, `"1"` |
+| 2wikimultihopqa | `row_idx`，corpus 数组行号 | `"0"`, `"1"` |
+| musique | `row_idx` | `"0"`, `"1"` |
+| narrativeqa | `native_id`，原生 str idx | `"4b30ab…865_0"` |
 
 2wiki 和 musique 用行号是因为它们的原始 corpus 根本没有 `idx`。
 这条前提写进了断言：这两组的 corpus 行里**突然出现** `idx` 会直接报错，

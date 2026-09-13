@@ -1,15 +1,6 @@
-"""OpenAI 兼容的 judge 客户端。**平台第一次持有 LLM 密钥。**
+"""评估与归因共用的 OpenAI 兼容 HTTP 客户端。
 
-``apiKeySet`` 只是布尔量，Akasha 不回传 key，所以即便 judge 用同一个
-端点同一个模型，平台也得自己配一份凭据。
-
-密钥存库（``model_provider.api_key``），在配置层里填。**不进哈希、不进日志** ——
-后两条仍然是硬规则：``judge_hash`` 只吃 base_url + model，
-``redacted()`` 白名单式只报是否有值。
-
-重试直接复用 :mod:`..akasha_client` 那套语义（429/502/503/504、5 次指数退避带
-抖动、4xx 不重试）—— 它对 judge 同样适用，不必重写一遍。
-"""
+凭据从 model_provider 读取，不进入身份哈希；网络重试复用 Akasha 客户端常量。"""
 
 from __future__ import annotations
 

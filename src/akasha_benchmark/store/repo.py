@@ -103,6 +103,30 @@ def upsert_dataset(
     )
 
 
+def delete_dataset(connection: sqlite3.Connection, name: str) -> int:
+    """删除归一化产物；保留原始文件，拒绝破坏已有下游引用。"""
+    connection.execute("BEGIN IMMEDIATE")
+    if get_dataset(connection, name) is None:
+        return 0
+    if running_tasks(connection):
+        raise ValueError("有任务正在运行或排队，请待任务结束后删除归一化数据集。")
+    if connection.execute(
+        "SELECT 1 FROM annotation a JOIN sample s ON a.target_id = s.sample_id "
+        "WHERE a.level = 'sample' AND s.dataset = ? LIMIT 1", (name,)
+    ).fetchone():
+        raise ValueError("数据集仍有样本标注，请先清理关联标注。")
+    for table in (
+        "index_layer_dataset", "subset_sample", "subset_doc", "page_map",
+        "import_failure", "query_response", "sample_eval", "sample_metric",
+        "metric_summary", "dataset_eval",
+    ):
+        if connection.execute(
+            f"SELECT 1 FROM {table} WHERE dataset = ? LIMIT 1", (name,)
+        ).fetchone():
+            raise ValueError(f"数据集仍被下游记录引用（{table}），请先清理关联记录。")
+    return connection.execute("DELETE FROM dataset WHERE name = ?", (name,)).rowcount
+
+
 def get_dataset(connection: sqlite3.Connection, name: str) -> dict[str, Any] | None:
     return row_to_dict(
         connection.execute("SELECT * FROM dataset WHERE name = ?", (name,)).fetchone()
@@ -969,6 +993,41 @@ def finish_query_layer(connection: sqlite3.Connection, layer_id: int) -> None:
     )
 
 
+def freeze_query_selection(
+    connection: sqlite3.Connection, query_layer_id: int, index_layer_id: int,
+    datasets: list[str], limit: int | None,
+) -> dict[str, list[str]]:
+    """固定本轮每个数据集的样本 ID；续跑必须使用同一选择。"""
+    if limit is not None and limit < 1:
+        raise ValueError("查询数量必须大于 0")
+    selected = {}
+    for dataset in sorted(set(datasets)):
+        samples = subset_samples(connection, index_layer_id, dataset)
+        if not samples:
+            raise ValueError(f"{dataset} 不在所选编译批次的 QA 子集中")
+        if limit is not None and limit > len(samples):
+            raise ValueError(f"{dataset} 最多可查询 {len(samples)} 条")
+        selected[dataset] = [s["sample_id"] for s in samples[:limit]]
+    if not selected:
+        raise ValueError("请选择至少一个数据集")
+    previous = query_selection(connection, query_layer_id)
+    if previous is not None and previous != selected:
+        raise ValueError("查询样本范围已固定；更改数量或数据集请创建新的查询记录")
+    if previous is None:
+        connection.execute(
+            "INSERT INTO query_selection VALUES (?, ?, ?)",
+            (query_layer_id, dumps(selected), utc_now()),
+        )
+    return selected
+
+
+def query_selection(connection: sqlite3.Connection, query_layer_id: int) -> dict[str, list[str]] | None:
+    row = connection.execute(
+        "SELECT selection_json FROM query_selection WHERE query_layer_id = ?", (query_layer_id,)
+    ).fetchone()
+    return loads(row[0]) if row else None
+
+
 def completed_sample_ids(
     connection: sqlite3.Connection, query_layer_id: int, dataset: str | None = None
 ) -> set[str]:
@@ -1190,6 +1249,10 @@ def finish_eval_layer(connection: sqlite3.Connection, layer_id: int) -> None:
     connection.execute(
         "UPDATE eval_layer SET finished_at = ? WHERE id = ?", (utc_now(), layer_id)
     )
+
+
+def mark_eval_pending(connection: sqlite3.Connection, layer_id: int) -> None:
+    connection.execute("UPDATE eval_layer SET finished_at = NULL WHERE id = ?", (layer_id,))
 
 
 def clear_eval_results(connection: sqlite3.Connection, eval_layer_id: int) -> None:
@@ -1809,6 +1872,8 @@ def finish_task(
     exit_code: int | None,
     error: str | None = None,
 ) -> None:
+    if status == "succeeded":
+        update_task_progress(connection, task_id, done=10000, total=10000, note="已完成")
     connection.execute(
         "UPDATE task SET status = ?, exit_code = ?, error = ?, finished_at = ? WHERE id = ?",
         (status, exit_code, error, utc_now(), task_id),
