@@ -10,9 +10,15 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from akasha_benchmark.store import loads, run_store
+from akasha_benchmark.store import (
+    attribution_store,
+    compile_store,
+    eval_store,
+    loads,
+    query_store,
+)
 
-from ._common import db, writable
+from ._common import db, public_run, reject_if_busy, writable
 
 router = APIRouter(prefix="/api")
 
@@ -28,48 +34,43 @@ def list_compiles(request: Request) -> dict[str, Any]:
     """编译记录树：每次编译连同它的查询、评测、归因。各层的选择器都读它。"""
     with db(request) as connection:
         runs = []
-        for row in run_store.list_compile_runs(connection):
+        for row in compile_store.list_compile_runs(connection):
             compile_id = int(row["id"])
             queries = []
-            for q in run_store.list_query_runs(connection, compile_id):
+            for q in query_store.list_query_runs(connection, compile_id):
                 query_id = int(q["id"])
                 queries.append(
                     {
-                        **_public(q),
-                        "stats": run_store.query_stats(connection, query_id),
+                        **public_run(q),
+                        "stats": query_store.query_stats(connection, query_id),
                         "evals": [
                             {
-                                **_public(e),
+                                **public_run(e),
                                 "ks": loads(e["ks_json"], []),
                                 "metrics": loads(e["metrics_json"], []),
                                 "attributions": [
-                                    _public(a)
-                                    for a in run_store.list_attribution_runs(
+                                    public_run(a)
+                                    for a in attribution_store.list_attribution_runs(
                                         connection, int(e["id"])
                                     )
                                 ],
                             }
-                            for e in run_store.list_eval_runs(connection, query_id)
+                            for e in eval_store.list_eval_runs(connection, query_id)
                         ],
                     }
                 )
             runs.append(
                 {
-                    **_public(row),
+                    **public_run(row),
                     "datasets": loads(row["datasets_json"], []),
-                    "stats": run_store.compile_stats(connection, compile_id),
+                    "stats": compile_store.compile_stats(connection, compile_id),
                     "quality": loads(row["quality_json"]),
                     "pace": loads(row["pace_json"]),
-                    "readiness": run_store.compile_ready(connection, compile_id),
+                    "readiness": compile_store.compile_ready(connection, compile_id),
                     "queries": queries,
                 }
             )
     return {"compiles": runs}
-
-
-def _public(row: dict[str, Any]) -> dict[str, Any]:
-    """去掉 ``*_json`` 原始列。需要的那些由调用方解开后单独加回。"""
-    return {k: v for k, v in row.items() if not k.endswith("_json")}
 
 
 @router.get("/compiles/{compile_id}/docs")
@@ -86,9 +87,9 @@ def compile_docs(
     没导入成功的 ``page_id`` 为空，它们照样列出 —— 缺篇本身是要看的信息。
     """
     with db(request) as connection:
-        if run_store.get_compile_run(connection, compile_id) is None:
+        if compile_store.get_compile_run(connection, compile_id) is None:
             raise HTTPException(404, f"编译 #{compile_id} 不存在")
-        docs = run_store.compile_docs(connection, compile_id, dataset)
+        docs = compile_store.compile_docs(connection, compile_id, dataset)
     if gold_only:
         docs = [d for d in docs if d["is_gold"]]
     return {
@@ -105,11 +106,11 @@ def compile_docs(
 def delete_compile(request: Request, compile_id: int) -> dict[str, Any]:
     """清理一次编译及其下游的查询、评测、归因。远端 space 不删。"""
     with writable(request) as connection:
-        row = run_store.get_compile_run(connection, compile_id)
+        row = compile_store.get_compile_run(connection, compile_id)
         if row is None:
             raise HTTPException(404, f"编译 #{compile_id} 不存在")
-        _reject_if_busy(connection, "compile", compile_id)
-        removed = run_store.delete_compile_run(connection, compile_id)
+        reject_if_busy(connection, "compile", compile_id)
+        removed = compile_store.delete_compile_run(connection, compile_id)
     return {
         "deleted": removed,
         "space_id": row["space_id"],
@@ -135,9 +136,9 @@ def query_responses(
     混在一起读会把生成端拒答误当成检索失败。
     """
     with db(request) as connection:
-        if run_store.get_query_run(connection, query_id) is None:
+        if query_store.get_query_run(connection, query_id) is None:
             raise HTTPException(404, f"查询 #{query_id} 不存在")
-        rows = run_store.responses_of(connection, query_id, dataset)
+        rows = query_store.responses_of(connection, query_id, dataset)
 
     counts: dict[str, int] = {}
     for row in rows:
@@ -174,7 +175,7 @@ def query_responses(
 def query_response(request: Request, query_id: int, sample_id: str) -> dict[str, Any]:
     """单条完整响应体。"""
     with db(request) as connection:
-        row = run_store.response_of(connection, query_id, sample_id)
+        row = query_store.response_of(connection, query_id, sample_id)
         if row is None:
             raise HTTPException(404, f"查询 #{query_id} 里没有 {sample_id!r} 的响应")
         return row
@@ -184,19 +185,8 @@ def query_response(request: Request, query_id: int, sample_id: str) -> dict[str,
 def delete_query(request: Request, query_id: int) -> dict[str, Any]:
     """清理一次查询及其下游的评测、归因。"""
     with writable(request) as connection:
-        if run_store.get_query_run(connection, query_id) is None:
+        if query_store.get_query_run(connection, query_id) is None:
             raise HTTPException(404, f"查询 #{query_id} 不存在")
-        _reject_if_busy(connection, "query", query_id)
-        removed = run_store.delete_query_run(connection, query_id)
+        reject_if_busy(connection, "query", query_id)
+        removed = query_store.delete_query_run(connection, query_id)
     return {"deleted": removed}
-
-
-def _reject_if_busy(connection, kind: str, target_id: int) -> None:
-    """有任务正在往这条记录里写就拒绝清理。"""
-    from akasha_benchmark.store import task_store
-
-    for task in task_store.active_tasks(connection):
-        if task["target_kind"] == kind and task["target_id"] == target_id:
-            raise HTTPException(
-                409, f"任务 #{task['id']} 正在写这条记录，请先暂停它再清理"
-            )

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import queue
 import sqlite3
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -16,7 +17,7 @@ import httpx
 from ..akasha_client import AkashaClient, AkashaError
 from ..config import load_config
 from ..model_configs import drift
-from ..store import loads, run_store
+from ..store import compile_store, loads, query_store
 from ..task import TaskContext
 
 
@@ -28,9 +29,7 @@ def _query_one(
 ) -> dict[str, Any]:
     """跑一条 query。失败也返回可落库的行。"""
     try:
-        response = client.query(
-            sample["question"], [space_id], score_threshold=score_threshold
-        )
+        response = client.query(sample["question"], [space_id], score_threshold=score_threshold)
         status, body, latency = response.status, response.body, response.latency_ms
         error = None
     except (AkashaError, httpx.RequestError, OSError) as exc:
@@ -56,7 +55,7 @@ def _select_samples(
 ) -> list[dict[str, Any]]:
     picked: list[dict[str, Any]] = []
     for dataset in datasets:
-        samples = run_store.compile_samples(connection, compile_id, dataset)
+        samples = compile_store.compile_samples(connection, compile_id, dataset)
         picked.extend(samples[:limit] if limit else samples)
     return picked
 
@@ -67,17 +66,17 @@ def run(ctx: TaskContext) -> None:
     if not compile_id:
         raise ValueError("请选择一次编译")
 
-    compile_run = run_store.get_compile_run(ctx.db, compile_id)
+    compile_run = compile_store.get_compile_run(ctx.db, compile_id)
     if compile_run is None:
         raise ValueError(f"编译 #{compile_id} 不存在")
 
     # 不可跳过的前置闸门：半成品索引会产出一份看着合理的坏报告。
-    readiness = run_store.compile_ready(ctx.db, compile_id)
+    readiness = compile_store.compile_ready(ctx.db, compile_id)
     if not readiness["ready"]:
         raise ValueError("这次编译还不能用于查询：" + "；".join(readiness["reasons"]))
 
     datasets = list(params.get("datasets") or loads(compile_run["datasets_json"], []))
-    available = set(run_store.compile_stats(ctx.db, compile_id))
+    available = set(compile_store.compile_stats(ctx.db, compile_id))
     unknown = sorted(set(datasets) - available)
     if unknown:
         raise ValueError(f"这次编译不含数据集：{unknown}")
@@ -96,7 +95,7 @@ def run(ctx: TaskContext) -> None:
 
         # workspace 不匹配拒绝执行：换个地方跑会打到一个空 space，且不报错。
         me = client.current_user()
-        mismatch = run_store.workspace_mismatch(
+        mismatch = compile_store.workspace_mismatch(
             ctx.db, compile_id, ((me or {}).get("workspace") or {}).get("id")
         )
         if mismatch:
@@ -106,24 +105,30 @@ def run(ctx: TaskContext) -> None:
         snapshot = loads(compile_run["model_configs_json"])
         changed = drift(current, snapshot)
         if changed["embedding"]:
-            # 不可绕过：旧 chunk 的 embedding_profile 对不上，永远召回不到。
+            # 阻止使用与当前 embedding 配置不匹配的编译产物。
             raise RuntimeError(
-                "embedding 模型在这次编译之后改过了。旧 chunk 永远召回不到，"
-                "检索指标会全部错但不报错。请重新编译。"
+                "embedding 配置与编译时不一致，无法保证已有编译产物可用于查询。请重新编译。"
             )
         for feature in ("compiler", "answer", "image"):
             if changed[feature]:
                 ctx.log(f"{feature} 模型与编译时不同，两次运行不可比", "warn")
 
-        name = str(params.get("name") or "").strip() or f"{compile_run['run_id']}-q"
-        existing = run_store.query_run_by_name(ctx.db, name)
-        if existing:
-            if int(existing["compile_id"]) != compile_id:
-                raise ValueError(f"查询记录 {name!r} 属于另一次编译，请换个名称")
-            query_id = int(existing["id"])
-            run_store.set_query_status(ctx.db, query_id, run_store.STATUS_RUNNING)
-        else:
-            query_id = run_store.create_query_run(
+        name = (
+            str(params.get("name") or "").strip()
+            or f"{compile_run['run_id']}-q-{uuid.uuid4().hex[:6]}"
+        )
+        query_id = ctx.target("query")
+        ctx.freeze(
+            name=name,
+            datasets=datasets,
+            concurrency=concurrency,
+            score_threshold=score_threshold,
+            sample_limit=limit,
+        )
+        if query_id is None:
+            if query_store.query_run_by_name(ctx.db, name):
+                raise ValueError(f"查询名称 {name!r} 已存在，请换个名称或继续原任务")
+            query_id = query_store.create_query_run(
                 ctx.db,
                 name=name,
                 compile_id=compile_id,
@@ -131,35 +136,24 @@ def run(ctx: TaskContext) -> None:
                 concurrency=concurrency,
                 model_configs=current,
             )
-        ctx.db.commit()
-        ctx.bind("query", query_id)
+            ctx.bind("query", query_id)
 
         # 固化这一轮问哪些样本，续跑以它为准。
-        selected = _select_samples(ctx.db, compile_id, datasets, limit)
-        if not selected:
-            raise ValueError("所选数据集在这次编译里没有样本")
-        run_store.freeze_query_samples(ctx.db, query_id, selected)
-        ctx.db.commit()
+        if not query_store.query_samples(ctx.db, query_id):
+            selected = _select_samples(ctx.db, compile_id, datasets, limit)
+            if not selected:
+                raise ValueError("所选数据集在这次编译里没有样本")
+            query_store.freeze_query_samples(ctx.db, query_id, selected)
+            ctx.db.commit()
 
         if params.get("retry_failed"):
-            removed = run_store.delete_failed_responses(ctx.db, query_id)
+            removed = query_store.delete_failed_responses(ctx.db, query_id)
             ctx.db.commit()
             ctx.log(f"已清除 {removed} 条失败响应以便重试")
 
-        try:
-            _issue(ctx, client, query_id, compile_run["space_id"], score_threshold, concurrency)
-        except BaseException:
-            run_store.set_query_status(
-                ctx.db,
-                query_id,
-                run_store.STATUS_PAUSED if ctx.pause_requested else run_store.STATUS_FAILED,
-            )
-            ctx.db.commit()
-            raise
+        _issue(ctx, client, query_id, compile_run["space_id"], score_threshold, concurrency)
 
-    run_store.set_query_status(ctx.db, query_id, run_store.STATUS_SUCCEEDED, finished=True)
-    ctx.db.commit()
-    stats = run_store.query_stats(ctx.db, query_id)
+    stats = query_store.query_stats(ctx.db, query_id)
     for dataset, row in stats.items():
         ctx.log(
             f"{dataset}: 响应 {row['responses']}，失败 {row['failures']}，"
@@ -176,8 +170,8 @@ def _issue(
     concurrency: int,
 ) -> None:
     """发请求并逐条落库。已有响应的样本跳过，所以暂停后继续即续跑。"""
-    todo = run_store.pending_query_samples(ctx.db, query_id)
-    total = len(run_store.query_samples(ctx.db, query_id))
+    todo = query_store.pending_query_samples(ctx.db, query_id)
+    total = len(query_store.query_samples(ctx.db, query_id))
     done = total - len(todo)
     if not todo:
         ctx.log(f"{total} 条样本均已有响应，跳过")
@@ -186,7 +180,7 @@ def _issue(
 
     def emit(row: dict[str, Any]) -> None:
         nonlocal done
-        run_store.record_response(
+        query_store.record_response(
             ctx.db,
             query_id,
             sample_id=row["sample_id"],

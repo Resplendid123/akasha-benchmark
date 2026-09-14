@@ -16,42 +16,34 @@ from test_akasha import FakeClient
 
 from akasha_benchmark.stages import (
     STAGES,
-    attribute,
     chain,
     compile,
-    evaluate,
     query,
 )
-from akasha_benchmark.store import config_store, connect, data_store, run_store, task_store
-from akasha_benchmark.task import TaskContext
+from akasha_benchmark.store import (
+    attribution_store,
+    compile_store,
+    config_store,
+    connect,
+    eval_store,
+    query_store,
+    run_store,
+    task_store,
+)
+from akasha_benchmark.task import TaskContext, execute
 
 
 def _imported_pages(connection) -> list[str]:
     """本次编译已导入的 page_id。gold 优先，让检索指标算得出非零值。"""
-    runs = run_store.list_compile_runs(connection)
+    runs = compile_store.list_compile_runs(connection)
     if not runs:
         return []
-    docs = run_store.compile_docs(connection, int(runs[0]["id"]))
+    docs = compile_store.compile_docs(connection, int(runs[0]["id"]))
     return [doc["page_id"] for doc in docs if doc["page_id"] and doc["is_gold"]]
-
-
-def _install_dataset(connection, dataset_dir) -> None:
-    """把假数据集归一化进库。运行器那条用例要自己的库，用不上 normalized 夹具。"""
-    from akasha_benchmark.datasets.hotpotqa import HotpotQAAdapter
-    from akasha_benchmark.stages import normalize
-
-    original = HotpotQAAdapter.expected_qa_rows
-    HotpotQAAdapter.expected_qa_rows = lambda self: None  # type: ignore[assignment]
-    try:
-        normalize.normalize_dataset(connection, "hotpotqa", None, dataset_dir)
-    finally:
-        HotpotQAAdapter.expected_qa_rows = original  # type: ignore[assignment]
-    assert data_store.get_dataset(connection, "hotpotqa") is not None
 
 
 def test_chain_is_not_a_stage():
     """链路测试不能出现在阶段表里 —— 否则任务列表又多一类。"""
-    assert "smoke" not in STAGES
     assert set(STAGES) == {
         "download",
         "normalize",
@@ -94,9 +86,7 @@ def test_full_chain(normalized, monkeypatch):
     )
     monkeypatch.setattr(chain, "DATASETS", ("hotpotqa",))
 
-    steps = chain.build(
-        {"dataset": "hotpotqa", "samples": 2, "use_model": False}, normalized
-    )
+    steps = chain.build({"dataset": "hotpotqa", "samples": 2, "use_model": False}, normalized)
 
     # 按运行器的方式推进：上一步的产物 id 填进下一步的关联参数。
     target: int | None = None
@@ -113,7 +103,7 @@ def test_full_chain(normalized, monkeypatch):
             connection=normalized,
             pause_event=threading.Event(),
         )
-        STAGES[step["stage"]].run(ctx)
+        execute(STAGES[step["stage"]].run, ctx)
 
         task = task_store.get_task(normalized, task_id) or {}
         target = task.get("target_id")
@@ -122,26 +112,26 @@ def test_full_chain(normalized, monkeypatch):
         if check := chain.VERIFY.get(step["stage"]):
             check(normalized, int(target))
 
-    compile_run = run_store.list_compile_runs(normalized)[0]
+    compile_run = compile_store.list_compile_runs(normalized)[0]
     compile_id = int(compile_run["id"])
     assert compile_run["status"] == run_store.STATUS_SUCCEEDED
 
-    query_run = run_store.list_query_runs(normalized, compile_id)[0]
+    query_run = query_store.list_query_runs(normalized, compile_id)[0]
     query_id = int(query_run["id"])
     assert query_run["status"] == run_store.STATUS_SUCCEEDED
 
-    eval_run = run_store.list_eval_runs(normalized, query_id)[0]
+    eval_run = eval_store.list_eval_runs(normalized, query_id)[0]
     eval_id = int(eval_run["id"])
     assert eval_run["status"] == run_store.STATUS_SUCCEEDED
 
     # 三层的样本集必须一致，否则指标的分母就不是同一批东西。
-    expected = {s["sample_id"] for s in run_store.compile_samples(normalized, compile_id)}
-    assert {r["sample_id"] for r in run_store.responses_of(normalized, query_id)} == expected
-    assert {r["sample_id"] for r in run_store.sample_evals(normalized, eval_id)} == expected
+    expected = {s["sample_id"] for s in compile_store.compile_samples(normalized, compile_id)}
+    assert {r["sample_id"] for r in query_store.responses_of(normalized, query_id)} == expected
+    assert {r["sample_id"] for r in eval_store.sample_evals(normalized, eval_id)} == expected
 
-    attribution_run = run_store.list_attribution_runs(normalized, eval_id)[0]
+    attribution_run = attribution_store.list_attribution_runs(normalized, eval_id)[0]
     assert attribution_run["status"] == run_store.STATUS_SUCCEEDED
-    results = run_store.attribution_results(normalized, int(attribution_run["id"]))
+    results = attribution_store.attribution_results(normalized, int(attribution_run["id"]))
     assert results
     # 没配归因模型时只出规则结论 —— 那仍然是一条有效的归因。
     assert all(r["rule_based"] == 1 for r in results)
@@ -204,20 +194,14 @@ def test_build_rejects_out_of_range_samples(normalized, monkeypatch):
         raise AssertionError("样本数超出上限应当拒绝")
 
 
-def test_runner_advances_the_chain(db_path, dataset_dir, monkeypatch):
-    """运行器真的一步接一步推进：起一条链，最后落成四条任务。
-
-    不打桩 ``_advance_chain`` —— 链能不能自己走完，是这次改动的核心。
-    """
+def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
+    """运行器自动推进完整链路，最终完成四条任务。"""
     from akasha_platform.settings import Settings
     from akasha_platform.tasks import TaskRunner
 
     connection = connect(db_path)
     try:
-        _install_dataset(connection, dataset_dir)
-        config_store.update_connection(
-            connection, base_url="http://x", email="e@x", password="p"
-        )
+        config_store.update_connection(connection, base_url="http://x", email="e@x", password="p")
         connection.commit()
     finally:
         connection.close()
@@ -268,9 +252,3 @@ def test_runner_advances_the_chain(db_path, dataset_dir, monkeypatch):
         assert task_store.task_chain(probe, max(int(t["id"]) for t in tasks))[1] == []
     finally:
         probe.close()
-
-
-def test_evaluate_module_exposes_provider_resolution(normalized):
-    """归因层复用评测层的 provider 解析，所以它必须是公开入口。"""
-    assert callable(evaluate.resolve_provider)
-    assert callable(attribute.run)

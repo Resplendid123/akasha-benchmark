@@ -6,16 +6,17 @@ PostgreSQL，没配 database_url 时跳过那一段判据。
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from .. import attribution, textdiff
 from ..config import load_config
 from ..judge.client import JudgeClient, JudgeConfigError, parse_json_object
+from ..judge.providers import resolve_provider
 from ..lineage import BadPageId, LineageReader, LineageUnavailable
 from ..metrics import registry
-from ..store import run_store
+from ..store import attribution_store, compile_store, eval_store, query_store
 from ..task import TaskContext
-from .evaluate import resolve_provider
 
 DEFAULT_METRIC = "recall@5"
 DEFAULT_LIMIT = 10
@@ -67,10 +68,10 @@ def run(ctx: TaskContext) -> None:
     if not eval_id:
         raise ValueError("请选择一次评测")
 
-    eval_run = run_store.get_eval_run(ctx.db, eval_id)
+    eval_run = eval_store.get_eval_run(ctx.db, eval_id)
     if eval_run is None:
         raise ValueError(f"评测 #{eval_id} 不存在")
-    query_run = run_store.get_query_run(ctx.db, int(eval_run["query_id"]))
+    query_run = query_store.get_query_run(ctx.db, int(eval_run["query_id"]))
     if query_run is None:
         raise ValueError("这次评测对应的查询记录已不存在")
     compile_id = int(query_run["compile_id"])
@@ -89,6 +90,7 @@ def run(ctx: TaskContext) -> None:
     if use_model:
         try:
             provider = resolve_provider(ctx.db, provider_id, "attribution")
+            provider_id = provider.provider_id
         except JudgeConfigError as exc:
             # 模型没配好不算失败，规则结论仍是一条有效归因。
             ctx.log(f"未使用模型：{exc}", "warn")
@@ -99,15 +101,15 @@ def run(ctx: TaskContext) -> None:
     except LineageUnavailable as exc:
         ctx.log(f"链路证据不可用（compiled_away 判不了）：{exc}", "warn")
 
-    name = str(params.get("name") or "").strip() or f"{eval_run['name']}-a"
-    existing = run_store.attribution_run_by_name(ctx.db, name)
-    if existing:
-        if int(existing["eval_id"]) != eval_id:
-            raise ValueError(f"归因记录 {name!r} 属于另一次评测，请换个名称")
-        attribution_id = int(existing["id"])
-        run_store.set_attribution_status(ctx.db, attribution_id, run_store.STATUS_RUNNING)
-    else:
-        attribution_id = run_store.create_attribution_run(
+    name = str(params.get("name") or "").strip() or f"{eval_run['name']}-a-{uuid.uuid4().hex[:6]}"
+    attribution_id = ctx.target("attribution")
+    ctx.freeze(
+        name=name, metric=metric, sample_limit=limit, use_model=use_model, provider_id=provider_id
+    )
+    if attribution_id is None:
+        if attribution_store.attribution_run_by_name(ctx.db, name):
+            raise ValueError(f"归因名称 {name!r} 已存在，请换个名称或继续原任务")
+        attribution_id = attribution_store.create_attribution_run(
             ctx.db,
             name=name,
             eval_id=eval_id,
@@ -115,35 +117,21 @@ def run(ctx: TaskContext) -> None:
             sample_limit=limit,
             provider_id=provider_id if provider else None,
         )
-    ctx.db.commit()
-    ctx.bind("attribution", attribution_id)
+        ctx.bind("attribution", attribution_id)
 
-    try:
-        _analyze(
-            ctx,
-            attribution_id,
-            eval_id,
-            compile_id,
-            metric,
-            definition.higher_is_better,
-            limit,
-            provider,
-            reader,
-        )
-    except BaseException:
-        run_store.set_attribution_status(
-            ctx.db,
-            attribution_id,
-            run_store.STATUS_PAUSED if ctx.pause_requested else run_store.STATUS_FAILED,
-        )
-        ctx.db.commit()
-        raise
-
-    run_store.set_attribution_status(
-        ctx.db, attribution_id, run_store.STATUS_SUCCEEDED, finished=True
+    _analyze(
+        ctx,
+        attribution_id,
+        eval_id,
+        compile_id,
+        metric,
+        definition.higher_is_better,
+        limit,
+        provider,
+        reader,
     )
-    ctx.db.commit()
-    counts = run_store.cause_counts(ctx.db, attribution_id)
+
+    counts = attribution_store.cause_counts(ctx.db, attribution_id)
     ctx.log(f"根因分布：{counts}")
 
 
@@ -158,13 +146,13 @@ def _analyze(
     provider: Any,
     reader: LineageReader | None,
 ) -> None:
-    ranked = run_store.samples_ranked_by(
+    ranked = eval_store.samples_ranked_by(
         ctx.db, eval_id, metric, ascending=higher_is_better, limit=limit
     )
     if not ranked:
         raise ValueError(f"这次评测没有 {metric} 的逐样本值")
 
-    already = run_store.attributed_sample_ids(ctx.db, attribution_id)
+    already = attribution_store.attributed_sample_ids(ctx.db, attribution_id)
     todo = [row for row in ranked if row["sample_id"] not in already]
     if already:
         ctx.log(f"续跑：已归因 {len(already)} 条，待归因 {len(todo)} 条")
@@ -173,13 +161,13 @@ def _analyze(
     for position, row in enumerate(todo, 1):
         ctx.checkpoint()
         dataset = row["dataset"]
-        sample = run_store.sample_eval(ctx.db, eval_id, row["sample_id"])
+        sample = eval_store.sample_eval(ctx.db, eval_id, row["sample_id"])
         if sample is None:
             continue
-        sample["metrics"] = run_store.sample_metrics_of(ctx.db, eval_id, row["sample_id"])
+        sample["metrics"] = eval_store.sample_metrics_of(ctx.db, eval_id, row["sample_id"])
 
         if dataset not in page_maps:
-            page_to_doc = run_store.page_to_doc(ctx.db, compile_id, dataset)
+            page_to_doc = compile_store.page_to_doc(ctx.db, compile_id, dataset)
             page_maps[dataset] = {doc: page for page, doc in page_to_doc.items()}
 
         lineage = _lineage_of(
@@ -215,7 +203,7 @@ def _analyze(
                     }
                     rule_based = False
 
-        run_store.record_attribution(
+        attribution_store.record_attribution(
             ctx.db,
             attribution_id,
             sample_id=row["sample_id"],

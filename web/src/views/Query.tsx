@@ -186,7 +186,7 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
         onChange={setSelected}
       />
       <div className="row" style={{ marginTop: 10 }}>
-        <Field label="查询名称" hint="留空自动生成；填已有的则续跑">
+        <Field label="查询名称" hint="留空自动生成；续跑请到任务页继续原任务">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="自动" />
         </Field>
         <Field label="每组样本数" hint="留空则跑全部">

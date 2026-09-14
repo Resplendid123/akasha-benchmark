@@ -23,7 +23,7 @@ import type {
   TaskDetail,
 } from './types'
 
-// 令牌只在绑非回环地址时需要。放 sessionStorage：关掉标签页就没了。
+// 后端配置了令牌时，请求须携带它。sessionStorage 在标签页关闭后清除。
 const TOKEN_KEY = 'akasha-platform-token'
 
 export const setToken = (token: string) => sessionStorage.setItem(TOKEN_KEY, token)
@@ -86,7 +86,7 @@ export const api = {
     request<{
       ok: boolean
       settings: Record<string, unknown>
-      startup: { archived_legacy_db: string | null; recovered_tasks: number }
+      startup: { recovered_tasks: number }
     }>('/api/health'),
 
   // --- 配置 ---

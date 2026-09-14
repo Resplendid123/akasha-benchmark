@@ -20,9 +20,7 @@ ACTIVE = (QUEUED, RUNNING)
 TERMINAL = (SUCCEEDED, FAILED)
 
 
-def create_task(
-    connection: sqlite3.Connection, *, stage: str, params: dict[str, Any]
-) -> int:
+def create_task(connection: sqlite3.Connection, *, stage: str, params: dict[str, Any]) -> int:
     cursor = connection.execute(
         "INSERT INTO task (stage, status, params_json, created_at) VALUES (?, ?, ?, ?)",
         (stage, QUEUED, dumps(params), utc_now()),
@@ -30,28 +28,21 @@ def create_task(
     return int(cursor.lastrowid or 0)
 
 
-def start_task(connection: sqlite3.Connection, task_id: int) -> None:
-    connection.execute(
-        "UPDATE task SET status = ?, started_at = COALESCE(started_at, ?), "
-        "finished_at = NULL, error = NULL WHERE id = ?",
-        (RUNNING, utc_now(), task_id),
-    )
-
-
-def finish_task(
-    connection: sqlite3.Connection, task_id: int, *, status: str, error: str | None = None
+def transition(
+    connection: sqlite3.Connection, task_id: int, status: str, *, error: str | None = None
 ) -> None:
-    connection.execute(
-        "UPDATE task SET status = ?, error = ?, finished_at = ? WHERE id = ?",
-        (status, error, utc_now(), task_id),
-    )
+    """在同一事务内更新任务及其绑定产物的状态。调用方负责提交。"""
+    from .run_store import RUN_TABLES, set_run_status
 
-
-def pause_task(connection: sqlite3.Connection, task_id: int) -> None:
     connection.execute(
-        "UPDATE task SET status = ?, finished_at = ? WHERE id = ?",
-        (PAUSED, utc_now(), task_id),
+        "UPDATE task SET status = ?, error = ?, "
+        "started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END, "
+        "finished_at = ? WHERE id = ?",
+        (status, error, status, utc_now(), None if status in ACTIVE else utc_now(), task_id),
     )
+    task = get_task(connection, task_id)
+    if task and task["target_kind"] in RUN_TABLES:
+        set_run_status(connection, task["target_kind"], task["target_id"], status)
 
 
 def set_task_target(
@@ -147,9 +138,7 @@ def delete_task(connection: sqlite3.Connection, task_id: int) -> int:
 
 def delete_inactive_tasks(connection: sqlite3.Connection) -> int:
     marks = ", ".join("?" for _ in ACTIVE)
-    return connection.execute(
-        f"DELETE FROM task WHERE status NOT IN ({marks})", ACTIVE
-    ).rowcount
+    return connection.execute(f"DELETE FROM task WHERE status NOT IN ({marks})", ACTIVE).rowcount
 
 
 def log(
@@ -187,6 +176,4 @@ def audit_logs(
         sql += " WHERE stage = ?"
         params.append(stage)
     params.append(limit)
-    return [
-        dict(row) for row in connection.execute(sql + " ORDER BY id DESC LIMIT ?", params)
-    ]
+    return [dict(row) for row in connection.execute(sql + " ORDER BY id DESC LIMIT ?", params)]

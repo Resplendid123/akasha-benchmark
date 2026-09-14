@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from akasha_benchmark.store import connect, data_store, init_db
+from akasha_benchmark.store import (
+    compile_store,
+    connect,
+    data_store,
+    eval_store,
+    init_db,
+    query_store,
+)
 
 # 一份最小的假数据集：2 条 QA、4 篇语料，够跑通抽样与指标。
 QA_ROWS = [
@@ -72,3 +79,24 @@ def normalized(db, dataset_dir: Path, monkeypatch):
     normalize.normalize_dataset(db, "hotpotqa", None, dataset_dir)
     assert data_store.get_dataset(db, "hotpotqa") is not None
     return db
+
+
+@pytest.fixture
+def compile_id(db):
+    return compile_store.create_compile_run(
+        db, run_id="r", datasets=["d"], seed=1, qa_limit=2, negatives_ratio=1.0
+    )
+
+
+@pytest.fixture
+def query_id(db, compile_id):
+    return query_store.create_query_run(
+        db, name="q", compile_id=compile_id, score_threshold=None, concurrency=1, model_configs={}
+    )
+
+
+@pytest.fixture
+def eval_id(db, query_id):
+    return eval_store.create_eval_run(
+        db, name="e", query_id=query_id, ks=[2], metrics=["faithfulness"], judge_provider_id=None
+    )

@@ -8,9 +8,9 @@ from fastapi import APIRouter, Body, HTTPException, Request
 
 from akasha_benchmark.akasha_client import AkashaClient, AkashaError
 from akasha_benchmark.judge import JudgeClient, JudgeConfigError
+from akasha_benchmark.judge.providers import resolve_provider
 from akasha_benchmark.model_configs import FEATURES, drift
-from akasha_benchmark.stages.evaluate import resolve_provider
-from akasha_benchmark.store import config_store, loads, run_store
+from akasha_benchmark.store import compile_store, config_store, loads
 
 from ._common import config_of, db, writable
 
@@ -29,7 +29,7 @@ def get_connection(request: Request) -> dict[str, Any]:
                 "workspace_id": r["workspace_id"],
                 "space_id": r["space_id"],
             }
-            for r in run_store.list_compile_runs(connection)
+            for r in compile_store.list_compile_runs(connection)
             if r["space_id"]
         ]
     return {**{k: v for k, v in row.items() if k != "id"}, "compiles": compiles}
@@ -77,8 +77,8 @@ def test_connection(request: Request) -> dict[str, Any]:
     # 同一道判据 compile / query 在登录后也会走，这里先说出来。
     with db(request) as connection:
         blocked = []
-        for row in run_store.list_compile_runs(connection):
-            reason = run_store.workspace_mismatch(
+        for row in compile_store.list_compile_runs(connection):
+            reason = compile_store.workspace_mismatch(
                 connection, int(row["id"]), workspace.get("id")
             )
             if reason:
@@ -126,7 +126,7 @@ def get_model_configs(request: Request) -> dict[str, Any]:
                 "run_id": row["run_id"],
                 "drift": drift(live, loads(row["model_configs_json"])),
             }
-            for row in run_store.list_compile_runs(connection)
+            for row in compile_store.list_compile_runs(connection)
             if row["model_configs_json"]
         ]
     return {"features": list(FEATURES), "live": live, "compiles": compiles}

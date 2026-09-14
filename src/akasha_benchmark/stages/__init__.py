@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..task import TaskContext
+from ..task import Stage, TaskContext
 from . import attribute, chain, compile, download, evaluate, normalize, query
 
 
@@ -19,7 +19,7 @@ from . import attribute, chain, compile, download, evaluate, normalize, query
 class StageSpec:
     name: str
     label: str
-    run: Any
+    run: Stage
     # 参数名 -> 类型。未声明的键丢掉。
     params: dict[str, type] = field(default_factory=dict)
     cost: str = ""

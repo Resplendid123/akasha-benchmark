@@ -9,7 +9,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from akasha_benchmark.stages import STAGES, StageSpec
-from akasha_benchmark.store import connect, run_store, task_store
+from akasha_benchmark.store import (
+    compile_store,
+    connect,
+    query_store,
+    run_store,
+    task_store,
+)
 from akasha_platform.main import create_app
 from akasha_platform.settings import Settings
 from akasha_platform.tasks import TaskRejected, TaskRunner
@@ -164,7 +170,7 @@ def test_recover_marks_orphaned_tasks_paused(settings):
     connection = connect(settings.db_path)
     try:
         task_id = task_store.create_task(connection, stage="compile", params={})
-        task_store.start_task(connection, task_id)
+        task_store.transition(connection, task_id, task_store.RUNNING)
         connection.commit()
     finally:
         connection.close()
@@ -310,8 +316,12 @@ def test_provider_probe_reports_missing_key(client):
     connection = connect(client.app.state.settings.db_path)
     try:
         provider_id = config_store.upsert_provider(
-            connection, role="judge", label="nokey", base_url="https://x/v1",
-            model="m", api_key="",
+            connection,
+            role="judge",
+            label="nokey",
+            base_url="https://x/v1",
+            model="m",
+            api_key="",
         )
         connection.commit()
     finally:
@@ -331,18 +341,16 @@ def test_connection_test_flags_compiles_in_another_workspace(client, db_path, mo
     """预检：不必等起了任务才发现这些编译在当前连接下用不了。"""
     connection = connect(db_path)
     try:
-        compile_id = run_store.create_compile_run(
+        compile_id = compile_store.create_compile_run(
             connection, run_id="r1", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
         )
-        run_store.update_compile_run(
+        compile_store.update_compile_run(
             connection, compile_id, space_id="s1", workspace_id="w-original"
         )
         connection.commit()
     finally:
         connection.close()
-    client.put(
-        "/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"}
-    )
+    client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
 
     from akasha_platform.api import config as config_api
 
@@ -479,7 +487,9 @@ def test_model_config_put_fills_the_only_legal_provider(client, monkeypatch):
 
 
 def test_bad_role_is_rejected(client):
-    assert client.put("/api/providers/bogus", json={"base_url": "u", "model": "m"}).status_code == 422
+    assert (
+        client.put("/api/providers/bogus", json={"base_url": "u", "model": "m"}).status_code == 422
+    )
     assert client.get("/api/providers?role=bogus").status_code == 422
 
 
@@ -491,10 +501,10 @@ def test_missing_records_return_404(client):
 def test_compile_cleanup_reports_untouched_space(client, db_path):
     connection = connect(db_path)
     try:
-        compile_id = run_store.create_compile_run(
+        compile_id = compile_store.create_compile_run(
             connection, run_id="r", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
         )
-        run_store.update_compile_run(connection, compile_id, space_id="space-1")
+        compile_store.update_compile_run(connection, compile_id, space_id="space-1")
         connection.commit()
     finally:
         connection.close()
@@ -508,11 +518,11 @@ def test_compile_cleanup_reports_untouched_space(client, db_path):
 def test_cleanup_refused_while_a_task_writes_the_record(client, db_path):
     connection = connect(db_path)
     try:
-        compile_id = run_store.create_compile_run(
+        compile_id = compile_store.create_compile_run(
             connection, run_id="r", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
         )
         task_id = task_store.create_task(connection, stage="compile", params={})
-        task_store.start_task(connection, task_id)
+        task_store.transition(connection, task_id, task_store.RUNNING)
         task_store.set_task_target(connection, task_id, "compile", compile_id)
         connection.commit()
     finally:
@@ -532,3 +542,103 @@ def test_non_loopback_without_token_refuses_to_start(db_path):
     """这个服务持有 Akasha 管理员凭据并能起长任务，不能裸奔在 0.0.0.0 上。"""
     with pytest.raises(RuntimeError, match="拒绝绑定"):
         create_app(Settings(db_path=db_path, host="0.0.0.0"))
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "failed", "paused", "invalid_result"])
+def test_task_and_run_finish_together(settings, db, query_id, monkeypatch, outcome):
+    from akasha_benchmark.task import Paused
+
+    db.commit()
+
+    def stage(ctx):
+        ctx.bind("query", query_id)
+        if outcome == "failed":
+            raise RuntimeError("stage failed")
+        if outcome == "paused":
+            raise Paused("checkpoint")
+
+    _register(monkeypatch, "unit", stage)
+    runner = TaskRunner(settings)
+    if outcome == "invalid_result":
+
+        def reject_result(*args):
+            raise ValueError("invalid result")
+
+        monkeypatch.setattr(runner, "_verify", reject_result)
+    task = runner.start("unit", {})
+    expected = "failed" if outcome == "invalid_result" else outcome
+    finished = _wait(settings, task["id"], {expected})
+    run = query_store.get_query_run(db, query_id)
+    assert run["status"] == finished["status"]
+    assert run["finished_at"] is not None
+
+
+def test_recovery_pauses_bound_run(settings, db, query_id):
+    task_id = task_store.create_task(db, stage="query", params={})
+    task_store.set_task_target(db, task_id, "query", query_id)
+    task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+    assert TaskRunner(settings).recover() == 1
+    assert task_store.get_task(db, task_id)["status"] == "paused"
+    assert query_store.get_query_run(db, query_id)["status"] == "paused"
+
+
+@pytest.mark.parametrize("bound", [False, True], ids=["queued-input", "bound-output"])
+@pytest.mark.parametrize(
+    "parent,stage",
+    [
+        ("compile", "query"),
+        ("compile", "evaluate"),
+        ("query", "attribute"),
+        ("eval", "attribute"),
+    ],
+)
+def test_cleanup_protects_active_descendants(
+    client, db, compile_id, query_id, eval_id, parent, stage, bound
+):
+    from akasha_benchmark.store import attribution_store
+
+    attribution_id = attribution_store.create_attribution_run(
+        db,
+        name="a",
+        eval_id=eval_id,
+        metric="em",
+        sample_limit=1,
+        provider_id=None,
+    )
+    ids = {"compile": compile_id, "query": query_id, "eval": eval_id, "attribution": attribution_id}
+    kind = {"query": "query", "evaluate": "eval", "attribute": "attribution"}[stage]
+    input_kind, param = run_store.STAGE_INPUTS[stage]
+    task_id = task_store.create_task(db, stage=stage, params={param: ids[input_kind]})
+    if bound:
+        task_store.set_task_target(db, task_id, kind, ids[kind])
+        task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+
+    route = {"compile": "compiles", "query": "queries", "eval": "evals"}[parent]
+    assert client.delete(f"/api/{route}/{ids[parent]}").status_code == 409
+    assert run_store.get_run(db, parent, ids[parent]) is not None
+    task_store.transition(db, task_id, task_store.PAUSED)
+    db.commit()
+    assert client.delete(f"/api/{route}/{ids[parent]}").status_code == 200
+    assert attribution_store.get_attribution_run(db, attribution_id) is None
+
+
+def test_concurrent_starts_admit_only_one_task(settings, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    _register(monkeypatch, "unit", lambda ctx: None)
+    runner = TaskRunner(settings)
+    monkeypatch.setattr(runner, "_spawn", lambda *args: None)
+    barrier = threading.Barrier(2)
+
+    def start():
+        barrier.wait()
+        try:
+            return runner.start("unit", {})["id"]
+        except TaskRejected:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: start(), range(2)))
+    assert sum(task_id is not None for task_id in results) == 1

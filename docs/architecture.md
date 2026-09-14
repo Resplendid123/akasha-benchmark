@@ -1,16 +1,17 @@
 # 代码架构
 
-前后端分离：所有操作从前端发起，后端执行。项目不保留脚本或命令行入口。
+前端通过 FastAPI 发起操作，后端在线程中执行各阶段任务。
 
 | 模块 | 职责 | 位置 |
 | --- | --- | --- |
 | 前端页面 | 九个视图，各层的表单、任务操作与结果展示 | `web/src/views/` |
-| 前端公共代码 | HTTP 请求、响应类型、异步状态与基础控件 | `web/src/api.ts`、`types.ts`、`ui.tsx` |
+| 前端公共代码 | HTTP 请求、响应类型、异步状态与基础控件 | `web/src/api.ts`、`web/src/types.ts`、`web/src/ui.tsx` |
 | 后端路由 | 请求处理、配置读写、结果查询 | `src/akasha_platform/api/` |
-| 任务运行器 | 线程调度、暂停/继续、失败落库、重启恢复 | `akasha_platform/tasks.py` |
+| 任务运行器 | 线程调度、启动互斥、暂停/继续、重启恢复 | `src/akasha_platform/tasks.py` |
+| 任务执行接口 | 实际参数保存、产物绑定、阶段执行与最终状态 | `src/akasha_benchmark/task.py` |
 | 阶段 | 六层流水线加链路测试 | `src/akasha_benchmark/stages/` |
-| 存储 | SQLite 连接、schema、按数据职责分的读写 | `akasha_benchmark/store/` |
-| 外部客户端 | Akasha HTTP、模型 HTTP、只读 PostgreSQL | `akasha_client.py`、`judge/client.py`、`lineage.py` |
+| 存储 | SQLite 连接、schema、按数据职责分的读写 | `src/akasha_benchmark/store/` |
+| 外部客户端 | Akasha HTTP、模型 HTTP、只读 PostgreSQL | `src/akasha_benchmark/akasha_client.py`、`src/akasha_benchmark/judge/client.py`、`src/akasha_benchmark/lineage.py` |
 
 ## 分层与数据流
 
@@ -20,39 +21,43 @@
 
 1. **数据集层**：原始 JSON 下载到 `dataset/`，校验能否解析成 JSON 数组。
 2. **归一化层**：经适配器转成 `sample` / `corpus_doc` 进 SQLite，**不写 Akasha**。写库后验收 gold 是否都在语料内。
-3. **编译层**：按数据集抽子集（先 QA 后 corpus），随机创建一个 Akasha 空间并导入语料、编译、过质量闸门。`run_id` 上固化这次的配置与模型快照。
-4. **查询层**：选一次编译的空间逐条跑 query，存完整响应体。不算指标。
-5. **评测层**：从响应算指标，需要时执行 Judge。每个检索指标出 `overall` 与 `knowledge_only` 两份。
+3. **编译层**：按数据集抽子集（先 QA 后 corpus），创建 Akasha 空间，导入语料并编译，检查编译完整性。`compile_run` 记录本次抽样配置与模型快照。
+4. **查询层**：在指定编译的空间中逐条查询，保存完整响应体。
+5. **评测层**：从响应算指标，需要时执行 Judge。确定性指标分别汇总为 `overall` 与 `knowledge_only`。
 6. **归因层**：规则判据从指标与链路推根因，模型可选地补一段因果叙述。
 
-SQLite 是每一层的输入来源。`page_id` 是贯穿链路的钥匙：评测靠它把响应里的 `sourcePageId` 反查回语料文档，归因靠它走到编译产物。
+原始文件保存在 `dataset/`；归一化后，各阶段从 SQLite 读取数据与运行记录。评测通过 `page_id` 将响应中的 `sourcePageId` 映射回语料文档，归因用它查询编译产物。
 
 ## 任务：暂停、继续、清理
 
-阶段在后端进程里跑（不起子进程），一个任务一条线程。
+阶段在后端进程里执行，一个任务一条线程。`execute()` 统一处理执行与链路校验，
+`task_store.transition()` 在同一事务内更新任务及绑定产物的状态。阶段只负责参数解析、产物绑定和计算。
+任务启动与续跑通过 SQLite 写事务完成互斥检查和占位；运行器用于单个后端进程。
 
 - **暂停**是协作式的：阶段在每个可续跑的边界调 `ctx.checkpoint()`，所以暂停总是停在一个已落库的位置。
-- **继续**用同一条任务记录重跑，阶段自己跳过已完成的部分（编译跳过已导入的文档，查询跳过已有响应的样本，评测与归因跳过已有结果的样本）。
-- **清理**是删该层主表的那一行：产物表全部 `ON DELETE CASCADE`，所以一条 DELETE 清掉这一层及其下游。远端的 Akasha 空间不删。
+- **新建**创建独立任务与产物，名称重复时报错。
+- **继续**使用原任务保存的实际参数与产物 ID，由各阶段决定重算或跳过：编译跳过已导入的文档，查询跳过已有响应的样本，确定性评测按数据集重算，Judge 按指标跳过已有判定，归因跳过已有结果的样本。
+- **清理运行记录**：删除编译、查询、评测或归因主表记录时，通过 `ON DELETE CASCADE` 删除关联产物及下游记录。删除前检查当前记录、全部下游及排队任务的输入引用；检查和删除处于同一写事务。清理任务仅删除任务记录，远端 Akasha 空间保留。
 - **审计日志**（`audit_log`）只追加，清理任务记录不删它。
 
-后端重启会中断在跑的任务：启动时把它们标成暂停，让用户显式继续，而不是留一条状态是「运行中」但没人在跑的记录。
+后端启动时将上次进程遗留的排队、运行中任务及其绑定产物同步标记为暂停，由用户继续执行。
 
-## 那些不会报错的失败
+存储按 `compile_store`、`query_store`、`eval_store`、`attribution_store` 分文件，直接执行 SQL。
+`run_store` 只维护共享状态与上下游依赖；模型端点解析集中在 `judge/providers.py`。
 
-这套流水线里最贵的错误都是**静默的** —— 它们不抛异常，只产出一份看着合理的坏报告。所以下面每一条都有一道显式闸门：
+## 执行前检查与报告口径
 
-- **非 owner 账号**在第三道授权闸门静默丢弃 chunk，症状看起来像召回质量差。编译前拦住。
-- **embedding 换过**之后旧 chunk 的 `embedding_profile` 对不上，那些 chunk 永远召回不到。查询前拒绝执行，且不可绕过。
-- **换了账号或部署**之后，编译时那个 `space_id` 在新的 workspace 里解析不到。查询打上去不报错，只会每条都召回不到。判据是登录后**服务端刚解析出的** workspace（`users/me`）与 `compile_run.workspace_id` 比对，编译续跑与查询各一道，测试连接时另做一次预检。
-- **质量闸门取不到值**时四项计数都是 `None`，而 `all(v == 0)` 对空集合返回 `True`。判据收紧到「四项都拿到值且都为 0」。
-- **`no_match` / `general` 无条件返回空 `retrievedSources`**，它们的检索得分按定义为 0。评测出两份口径，差值就是生成端拒答的规模。
-- **缺依赖的指标**（narrativeqa 没有 gold 标注）省略并写明原因，不伪造 0 分 —— 假分数会污染任何包含它的汇总。
-- **Judge 失败**该条排除而不是记 0，另叠失败率闸门：排除得太多时那个均值已不代表整体。
-- **子集被重建过**时样本 ID 对得上而内容变了，评测按问题文本再比一次。
+- **账号权限**：编译前要求账号角色为 owner。
+- **模型配置**：查询前比较当前配置与编译快照，embedding 不一致时拒绝执行；compiler、answer、image 不一致时记录警告。
+- **Workspace**：编译续跑和查询前，将 `users/me` 返回的 workspace 与 `compile_run.workspace_id` 比对，不一致时拒绝执行。连接测试也提供预检。
+- **编译完整性**：`missingChunk`、`missingEmbedding`、`missingSource`、`stalePageCount` 四项计数必须全部取得且为 0。
+- **回答模式**：确定性指标分别汇总为 `overall` 与 `knowledge_only`。均值差反映样本范围的影响，不能直接解释为拒答比例或根因。
+- **指标依赖**：缺少所需标注的指标省略并记录原因，不计为 0 分。
+- **Judge**：跳过和失败条目不计入评分均值；单项失败率超过 10% 时，评测任务标记为失败。
+- **样本一致性**：评测按样本 ID 匹配后，再检查响应中保存的问题文本是否与编译子集一致。
 
 ## 配置
 
-Akasha 连接与模型端点都在 `connection` / `model_provider` 两张表，由配置页读写。Akasha 那边的四项模型配置是在线读写那个部署，不是本平台的设置；编译时把它们的快照固化在 `compile_run` 上，供查询前比对。
+Akasha 连接与模型端点都在 `akasha_connection` / `model_provider` 两张表，由配置页读写。配置页在线读写 Akasha 部署的 compiler、embedding、answer、image 模型配置；编译时把它们的快照固化在 `compile_run` 上，供查询前比对。
 
-`database_url`（只读 PostgreSQL）只有归因层的链路视图需要，不填则跳过 `compiled_away` 那一段判据，其余判据照旧成立。
+`database_url`（只读 PostgreSQL）用于链路查询与归因证据读取。未配置或连接不可用时，自动归因跳过 `compiled_away` 判据，继续执行其他规则。

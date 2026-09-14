@@ -412,7 +412,7 @@ function Results({ evalId }: { evalId: number }) {
   )
 }
 
-/** 全样本 vs 仅 knowledge 并排，差值即生成端拒答的规模。 */
+/** 并排展示全样本与 knowledge 子集的指标均值。 */
 function ScopeTable({ scopes }: { scopes: Record<string, Record<string, number>> }) {
   const names = Array.from(
     new Set(Object.values(scopes).flatMap((entry) => Object.keys(entry))),

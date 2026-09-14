@@ -53,6 +53,7 @@ class JudgeProvider:
     model: str
     api_key: str = ""
     timeout_seconds: float = 120.0
+    provider_id: int | None = None
 
     def resolve_key(self) -> str:
         key = (self.api_key or "").strip()
@@ -156,8 +157,7 @@ class JudgeClient:
 
             if response.status_code in RETRYABLE_STATUSES and attempt < MAX_RETRIES:
                 print(
-                    f"  judge retry {attempt + 1}/{MAX_RETRIES} after "
-                    f"HTTP {response.status_code}",
+                    f"  judge retry {attempt + 1}/{MAX_RETRIES} after HTTP {response.status_code}",
                     file=sys.stderr,
                 )
                 time.sleep(_delay(attempt))

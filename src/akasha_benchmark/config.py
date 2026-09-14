@@ -6,7 +6,6 @@ import sqlite3
 from dataclasses import dataclass, fields
 from typing import Any
 
-
 # Akasha 的全局前缀，不随部署变，所以不做成配置项。
 API_PREFIX = "/api"
 

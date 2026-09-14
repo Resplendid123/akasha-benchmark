@@ -4,7 +4,7 @@
 启动时 :meth:`TaskRunner.recover` 把它们标成暂停，让用户显式继续。
 
 暂停是协作式的：阶段在每个可续跑的边界调 ``ctx.checkpoint()``。
-继续即用同一条任务记录重跑，阶段自己跳过已完成的部分。
+继续使用同一任务保存的参数与产物 ID，各阶段按自身规则重算或跳过。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any
 
 from akasha_benchmark.stages import STAGES, chain, clean_params
 from akasha_benchmark.store import connect, task_store
-from akasha_benchmark.task import Paused, TaskContext
+from akasha_benchmark.task import Paused, TaskContext, execute
 
 from .settings import Settings
 
@@ -46,7 +46,7 @@ class TaskRunner:
         try:
             active = task_store.active_tasks(connection)
             for task in active:
-                task_store.pause_task(connection, int(task["id"]))
+                task_store.transition(connection, int(task["id"]), task_store.PAUSED)
                 task_store.log(
                     connection,
                     task_id=int(task["id"]),
@@ -70,6 +70,7 @@ class TaskRunner:
 
         connection = connect(self.settings.db_path)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_free(connection, stage)
             task_id = task_store.create_task(connection, stage=stage, params=params)
             connection.commit()
@@ -93,6 +94,7 @@ class TaskRunner:
                 raise TaskRejected(str(exc)) from exc
             head, rest = steps[0], steps[1:]
             params = clean_params(head["stage"], head["params"])
+            connection.execute("BEGIN IMMEDIATE")
             self._require_free(connection, head["stage"])
             task_id = task_store.create_task(connection, stage=head["stage"], params=params)
             # 链首的 id 就是链号，四条任务凭它归到一起。
@@ -109,12 +111,15 @@ class TaskRunner:
         """继续一个暂停的任务：同一条记录、同一组参数，重新起线程。"""
         connection = connect(self.settings.db_path)
         try:
+            connection.execute("BEGIN IMMEDIATE")
             task = task_store.get_task(connection, task_id)
             if task is None:
                 raise TaskRejected(f"任务 #{task_id} 不存在")
             if task["status"] not in (task_store.PAUSED, task_store.FAILED):
                 raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，无需继续")
             self._require_free(connection, task["stage"])
+            task_store.transition(connection, task_id, task_store.QUEUED)
+            connection.commit()
         finally:
             connection.close()
 
@@ -137,8 +142,8 @@ class TaskRunner:
             with self._lock:
                 event = self._pauses.get(task_id)
             if event is None:
-                # 没有对应线程（后端重启过），直接改状态。
-                task_store.pause_task(connection, task_id)
+                # 没有对应线程时同步暂停任务及产物。
+                task_store.transition(connection, task_id, task_store.PAUSED)
                 connection.commit()
             else:
                 event.set()
@@ -175,9 +180,7 @@ class TaskRunner:
 
     def _require_free(self, connection, stage: str) -> None:
         for task in task_store.active_tasks(connection):
-            if task["stage"] == stage or (
-                stage in EXCLUSIVE or task["stage"] in EXCLUSIVE
-            ):
+            if task["stage"] == stage or (stage in EXCLUSIVE or task["stage"] in EXCLUSIVE):
                 raise TaskRejected(
                     f"{task['stage']} 任务 #{task['id']} 正在运行，请先等它结束或暂停"
                 )
@@ -229,6 +232,7 @@ class TaskRunner:
             params[link] = int(target_id)
         try:
             params = clean_params(step["stage"], params)
+            connection.execute("BEGIN IMMEDIATE")
             self._require_free(connection, step["stage"])
         except (ValueError, TaskRejected) as exc:
             task_store.log(
@@ -267,8 +271,9 @@ class TaskRunner:
         # 每个任务线程一条独立连接，sqlite 连接不跨线程共用。
         connection = connect(self.settings.db_path)
         try:
-            task_store.start_task(connection, task_id)
-            connection.commit()
+            task = task_store.get_task(connection, task_id)
+            if task is None or task["status"] != task_store.QUEUED:
+                return
             ctx = TaskContext(
                 task_id=task_id,
                 stage=stage,
@@ -278,10 +283,8 @@ class TaskRunner:
             )
             ctx.log(f"开始 {STAGES[stage].label}：{params}")
             try:
-                STAGES[stage].run(ctx)
-                self._verify(connection, task_id, stage)
+                execute(STAGES[stage].run, ctx, lambda: self._verify(connection, task_id, stage))
             except Paused as exc:
-                task_store.pause_task(connection, task_id)
                 task_store.log(
                     connection,
                     task_id=task_id,
@@ -292,12 +295,6 @@ class TaskRunner:
                 connection.commit()
                 return
             except Exception as exc:  # noqa: BLE001 - 失败要落库，不能只留在线程里
-                task_store.finish_task(
-                    connection,
-                    task_id,
-                    status=task_store.FAILED,
-                    error=f"{type(exc).__name__}: {exc}"[:2000],
-                )
                 task_store.log(
                     connection,
                     task_id=task_id,
@@ -307,7 +304,6 @@ class TaskRunner:
                 )
                 connection.commit()
                 return
-            task_store.finish_task(connection, task_id, status=task_store.SUCCEEDED)
             task_store.log(
                 connection, task_id=task_id, stage=stage, level="info", message="任务完成"
             )
@@ -316,4 +312,5 @@ class TaskRunner:
         finally:
             connection.close()
             with self._lock:
-                self._pauses.pop(task_id, None)
+                if self._pauses.get(task_id) is event:
+                    self._pauses.pop(task_id, None)

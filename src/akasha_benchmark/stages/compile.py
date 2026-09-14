@@ -25,7 +25,7 @@ from typing import Any
 from ..akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
 from ..config import AkashaConfig, load_config
 from ..datasets import DATASET_NAMES, CorpusDoc, DataDependency, get_adapter
-from ..store import data_store, dumps, run_store, transaction, utc_now
+from ..store import compile_store, data_store, dumps, transaction
 from ..task import TaskContext
 
 DEFAULT_QA_LIMIT = 20
@@ -155,11 +155,9 @@ def build_subset(
         )
 
     gold_set = set(gold_ids)
-    docs = [
-        {"doc_id": _safe_doc_id(doc_id), "is_gold": doc_id in gold_set} for doc_id in doc_ids
-    ]
+    docs = [{"doc_id": _safe_doc_id(doc_id), "is_gold": doc_id in gold_set} for doc_id in doc_ids]
     with transaction(connection):
-        run_store.replace_compile_subset(
+        compile_store.replace_compile_subset(
             connection, compile_id, adapter.name, [s["sample_id"] for s in picked], docs
         )
 
@@ -251,9 +249,7 @@ def _compile_pace(client: AkashaClient, space_id: str) -> dict[str, Any] | None:
     if not runs:
         return None
     total_ms = sum(int(r.get("runDurationMs") or 0) for r in runs)
-    pages = sum(
-        int((r.get("progress") or {}).get("text", {}).get("expected") or 0) for r in runs
-    )
+    pages = sum(int((r.get("progress") or {}).get("text", {}).get("expected") or 0) for r in runs)
     if not pages or not total_ms:
         return None
     return {
@@ -290,7 +286,7 @@ def run(ctx: TaskContext) -> None:
     if unknown:
         raise ValueError(f"未知数据集：{unknown}")
 
-    seed = int(params.get("seed") or default_seed())
+    seed = int(params["seed"]) if params.get("seed") is not None else default_seed()
     qa_limit = int(params.get("qa_limit") or DEFAULT_QA_LIMIT)
     negatives_ratio = float(params.get("negatives_ratio", DEFAULT_NEGATIVES_RATIO))
     if qa_limit < 1:
@@ -301,15 +297,19 @@ def run(ctx: TaskContext) -> None:
     config = load_config(ctx.db)
     config.require_credentials()
 
-    # 同 run_id 复用那条记录，已导入的文档跳过。
+    compile_id = ctx.target("compile")
     run_id = str(params.get("run_id") or "").strip() or f"run{uuid.uuid4().hex[:10]}"
-    existing = run_store.compile_run_by_run_id(ctx.db, run_id)
-    if existing:
-        compile_id = int(existing["id"])
-        run_store.update_compile_run(ctx.db, compile_id, status=run_store.STATUS_RUNNING)
-        ctx.db.commit()
-    else:
-        compile_id = run_store.create_compile_run(
+    ctx.freeze(
+        run_id=run_id,
+        datasets=datasets,
+        seed=seed,
+        qa_limit=qa_limit,
+        negatives_ratio=negatives_ratio,
+    )
+    if compile_id is None:
+        if compile_store.compile_run_by_run_id(ctx.db, run_id):
+            raise ValueError(f"编译名称 {run_id!r} 已存在，请换个名称或继续原任务")
+        compile_id = compile_store.create_compile_run(
             ctx.db,
             run_id=run_id,
             datasets=datasets,
@@ -317,20 +317,10 @@ def run(ctx: TaskContext) -> None:
             qa_limit=qa_limit,
             negatives_ratio=negatives_ratio,
         )
-        ctx.db.commit()
-    ctx.bind("compile", compile_id)
+        ctx.bind("compile", compile_id)
     ctx.log(f"编译 {run_id}（#{compile_id}），数据集 {', '.join(datasets)}")
 
-    try:
-        _execute(ctx, compile_id, run_id, datasets, seed, qa_limit, negatives_ratio, config)
-    except BaseException:
-        run_store.update_compile_run(
-            ctx.db,
-            compile_id,
-            status=run_store.STATUS_PAUSED if ctx.pause_requested else run_store.STATUS_FAILED,
-        )
-        ctx.db.commit()
-        raise
+    _execute(ctx, compile_id, run_id, datasets, seed, qa_limit, negatives_ratio, config)
 
 
 def _execute(
@@ -345,7 +335,7 @@ def _execute(
 ) -> None:
     # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档，
     # 而那种错配不报错，只会让每个检索指标都算错。
-    if not run_store.compile_docs(ctx.db, compile_id):
+    if not compile_store.compile_docs(ctx.db, compile_id):
         for dataset in datasets:
             ctx.checkpoint()
             # 编译三段共用一把刻度（抽子集 0、导入 1、等编译 2、完成 3），
@@ -378,7 +368,7 @@ def _execute(
                 "非 owner 会在授权闸门静默丢弃 chunk，入库前请提权。"
             )
 
-        record = run_store.get_compile_run(ctx.db, compile_id) or {}
+        record = compile_store.get_compile_run(ctx.db, compile_id) or {}
         space_id = record.get("space_id")
         if not space_id:
             # 随机 slug，把这次编译的空间与用户自己的空间分开。
@@ -391,7 +381,7 @@ def _execute(
             space_id = space.get("id")
             if not space_id:
                 raise RuntimeError(f"创建空间未返回 id：{space!r}")
-            run_store.update_compile_run(
+            compile_store.update_compile_run(
                 ctx.db,
                 compile_id,
                 space_id=space_id,
@@ -403,9 +393,7 @@ def _execute(
             ctx.log(f"创建空间 {slug}（{space_id}）")
         else:
             # 在发出任何写入之前拦住：换了账号或部署之后，已记下的 page_id 全部失效。
-            mismatch = run_store.workspace_mismatch(
-                ctx.db, compile_id, workspace.get("id")
-            )
+            mismatch = compile_store.workspace_mismatch(ctx.db, compile_id, workspace.get("id"))
             if mismatch:
                 raise RuntimeError(mismatch)
             ctx.log(f"复用本次编译的空间 {space_id}")
@@ -423,7 +411,7 @@ def _execute(
             # 一个 Run 都没有：page 停在「已上传、未编译」，没有源文本也没有 chunk。
             raise RuntimeError(
                 f"编译没有启动：Akasha 一个编译 Run 都没有（accepted={accepted} "
-                f"coalesced={coalesced}）。{len(run_store.compile_docs(ctx.db, compile_id))} "
+                f"coalesced={coalesced}）。{len(compile_store.compile_docs(ctx.db, compile_id))} "
                 "篇语料已上传但没被编译，请检查 Akasha 的编译 worker 是否在跑。"
             )
         if wait["timed_out"]:
@@ -435,14 +423,14 @@ def _execute(
 
         pace = _compile_pace(client, space_id)
         if pace:
-            run_store.update_compile_run(ctx.db, compile_id, pace_json=dumps(pace))
+            compile_store.update_compile_run(ctx.db, compile_id, pace_json=dumps(pace))
             ctx.log(
                 f"编译节奏（估算）：{pace['pages']} 篇用 "
                 f"{pace['total_ms'] / 1000:.1f}s，约 {pace['per_page_ms'] / 1000:.1f}s/篇"
             )
 
         quality = _quality_gate(client, space_id)
-        run_store.update_compile_run(ctx.db, compile_id, quality_json=dumps(quality))
+        compile_store.update_compile_run(ctx.db, compile_id, quality_json=dumps(quality))
         ctx.db.commit()
         ctx.log(f"质量闸门 {quality['gates']} -> {'通过' if quality['passed'] else '未通过'}")
         if not quality["passed"]:
@@ -451,24 +439,16 @@ def _execute(
             for line in reasons:
                 ctx.log(f"编译失败原因：{line}", "error")
             detail = f"；{reasons[0]}" if reasons else ""
-            raise RuntimeError(
-                f"编译质量闸门未通过：半成品索引产出的指标没有意义{detail}"
-            )
+            raise RuntimeError(f"编译质量闸门未通过：半成品索引产出的指标没有意义{detail}")
 
-    run_store.update_compile_run(
-        ctx.db, compile_id, status=run_store.STATUS_SUCCEEDED, finished_at=utc_now()
-    )
-    ctx.db.commit()
     ctx.progress(3, 3, "编译完成")
     ctx.log("编译完成，可以进入查询层")
 
 
-def _import_docs(
-    ctx: TaskContext, client: AkashaClient, compile_id: int, space_id: str
-) -> None:
+def _import_docs(ctx: TaskContext, client: AkashaClient, compile_id: int, space_id: str) -> None:
     """串行导入未导入的文档，逐条提交。失败的记下来并继续下一篇。"""
-    pending = run_store.compile_docs(ctx.db, compile_id, pending_only=True)
-    total = len(run_store.compile_docs(ctx.db, compile_id))
+    pending = compile_store.compile_docs(ctx.db, compile_id, pending_only=True)
+    total = len(compile_store.compile_docs(ctx.db, compile_id))
     done = total - len(pending)
     if not pending:
         ctx.log(f"{total} 篇语料均已导入，跳过")
@@ -486,7 +466,7 @@ def _import_docs(
         except AkashaError as exc:
             page_id, error = None, f"HTTP {exc.status}: {exc.body[:200]}"
 
-        run_store.record_page(
+        compile_store.record_page(
             ctx.db, compile_id, doc["dataset"], doc["doc_id"], page_id=page_id, error=error
         )
         ctx.db.commit()

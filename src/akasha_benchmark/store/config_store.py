@@ -30,11 +30,6 @@ _INTS = {"concurrency"}
 
 ROLES = ("judge", "attribution")
 
-# 显式列而不是 SELECT *：建表用 IF NOT EXISTS，老库里已删的列还在，
-# SELECT * 会把它们带回响应里。
-_PROVIDER_COLUMNS = "id, role, label, base_url, model, api_key, updated_at"
-_CONNECTION_COLUMNS = ", ".join(("id", *CONNECTION_FIELDS, "updated_at"))
-
 # 这两个字段的主机名要过 _prefer_ipv4。
 _HOST_URLS = {"base_url", "database_url"}
 
@@ -55,26 +50,8 @@ def _prefer_ipv4(url: str) -> str:
 
 
 def get_connection_row(connection: sqlite3.Connection) -> dict[str, Any]:
-    row = connection.execute(
-        f"SELECT {_CONNECTION_COLUMNS} FROM akasha_connection WHERE id = 1"
-    ).fetchone()
+    row = connection.execute("SELECT * FROM akasha_connection WHERE id = 1").fetchone()
     return dict(row) if row is not None else {}
-
-
-def normalize_hosts(connection: sqlite3.Connection) -> list[str]:
-    """把已存的 localhost 换成 127.0.0.1，返回改了哪几个字段。
-
-    改库里的值而不是读出来再换，配置页显示的与实际连的因此是同一个地址。
-    """
-    row = get_connection_row(connection)
-    changed = {
-        name: _prefer_ipv4(row[name])
-        for name in _HOST_URLS
-        if row.get(name) and _prefer_ipv4(row[name]) != row[name]
-    }
-    if changed:
-        update_connection(connection, **changed)
-    return sorted(changed)
 
 
 def sanitize_connection(payload: dict[str, Any]) -> dict[str, Any]:
@@ -154,10 +131,8 @@ def upsert_provider(
     return int(row["id"])
 
 
-def list_providers(
-    connection: sqlite3.Connection, role: str | None = None
-) -> list[dict[str, Any]]:
-    sql = f"SELECT {_PROVIDER_COLUMNS} FROM model_provider"
+def list_providers(connection: sqlite3.Connection, role: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM model_provider"
     params: tuple[Any, ...] = ()
     if role is not None:
         sql += " WHERE role = ?"
@@ -166,13 +141,9 @@ def list_providers(
 
 
 def get_provider(connection: sqlite3.Connection, provider_id: int) -> dict[str, Any] | None:
-    row = connection.execute(
-        f"SELECT {_PROVIDER_COLUMNS} FROM model_provider WHERE id = ?", (provider_id,)
-    ).fetchone()
+    row = connection.execute("SELECT * FROM model_provider WHERE id = ?", (provider_id,)).fetchone()
     return dict(row) if row else None
 
 
 def delete_provider(connection: sqlite3.Connection, provider_id: int) -> int:
-    return connection.execute(
-        "DELETE FROM model_provider WHERE id = ?", (provider_id,)
-    ).rowcount
+    return connection.execute("DELETE FROM model_provider WHERE id = ?", (provider_id,)).rowcount

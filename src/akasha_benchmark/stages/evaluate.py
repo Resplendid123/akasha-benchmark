@@ -1,7 +1,7 @@
-"""评测层：从库里的响应算指标，需要时执行 Judge。纯离线，不碰 Akasha。
+"""评测层：从库里的响应算指标，需要时执行 Judge。确定性指标在本地计算，Judge 调用模型端点。
 
 每个检索指标出两份：全样本，以及只算 ``answerMode == knowledge`` 的切片，
-两份的差值即生成端拒答的规模。
+两份均值须结合回答模式分布与 HTTP 失败数解读。
 
 指标能不能算由数据依赖决定：指标声明 requires、数据集声明 provides，
 闸门做集合比对。算不了的记进 ``dataset_eval``，不伪造 0 分。
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from typing import Any
 
 from ..datasets import DataDependency, get_adapter
@@ -21,12 +22,12 @@ from ..judge import (
 )
 from ..judge.client import (
     JudgeClient,
-    JudgeConfigError,
     JudgeProvider,
     parse_json_object,
 )
+from ..judge.providers import resolve_provider
 from ..metrics import attribution, multihop, qa, registry, retrieval
-from ..store import config_store, run_store
+from ..store import compile_store, eval_store, query_store, run_store
 from ..task import TaskContext
 
 DEFAULT_KS = (2, 5, 10)
@@ -87,20 +88,18 @@ def evaluate_dataset(
     adapter = get_adapter(dataset)
     provides = adapter.provides
     has_gold = DataDependency.GOLD_DOCS in provides
-    omitted = [
-        d.name for d in registry.omitted(provides) if d.kind == registry.KIND_DETERMINISTIC
-    ]
+    omitted = [d.name for d in registry.omitted(provides) if d.kind == registry.KIND_DETERMINISTIC]
 
     samples = {
-        s["sample_id"]: s for s in run_store.compile_samples(connection, compile_id, dataset)
+        s["sample_id"]: s for s in compile_store.compile_samples(connection, compile_id, dataset)
     }
-    responses = run_store.responses_of(connection, query_id, dataset)
+    responses = query_store.responses_of(connection, query_id, dataset)
     if not responses:
         raise ValueError(f"{dataset} 没有查询响应")
 
-    page_to_doc = run_store.page_to_doc(connection, compile_id, dataset) if has_gold else {}
+    page_to_doc = compile_store.page_to_doc(connection, compile_id, dataset) if has_gold else {}
     keep = _keep(selected)
-    run_store.clear_eval_results(connection, eval_id, dataset)
+    eval_store.clear_eval_results(connection, eval_id, dataset)
 
     per_sample: list[dict[str, Any]] = []
     http_failures = 0
@@ -108,9 +107,7 @@ def evaluate_dataset(
     for position, row in enumerate(responses, 1):
         sample = samples.get(row["sample_id"])
         if sample is None:
-            raise ValueError(
-                f"{dataset}: 样本 {row['sample_id']!r} 有响应但不在这次编译的子集里"
-            )
+            raise ValueError(f"{dataset}: 样本 {row['sample_id']!r} 有响应但不在这次编译的子集里")
         # 按 ID 匹配后再比一次问题文本，抓「ID 对得上而内容变了」。
         if row["question"] != sample["question"]:
             raise ValueError(f"{row['sample_id']}: 响应与子集的问题文本不一致，子集被重建过")
@@ -161,7 +158,7 @@ def evaluate_dataset(
         }
         per_sample.append(entry)
 
-        run_store.record_sample_eval(
+        eval_store.record_sample_eval(
             connection,
             eval_id,
             sample_id=row["sample_id"],
@@ -180,14 +177,14 @@ def evaluate_dataset(
 
     knowledge = [e for e in per_sample if e["answer_mode"] == "knowledge"]
     overall = _aggregate(per_sample)
-    run_store.record_metric_summary(
+    eval_store.record_metric_summary(
         connection, eval_id, dataset, "overall", overall, len(per_sample)
     )
-    # 两份口径都存，差值即生成端拒答的规模。
-    run_store.record_metric_summary(
+    # 保存全样本与 knowledge 子集的汇总，便于对照样本范围。
+    eval_store.record_metric_summary(
         connection, eval_id, dataset, "knowledge_only", _aggregate(knowledge), len(knowledge)
     )
-    run_store.record_dataset_eval(
+    eval_store.record_dataset_eval(
         connection,
         eval_id,
         dataset,
@@ -206,28 +203,6 @@ def evaluate_dataset(
         "overall": overall,
         "omitted_metrics": omitted,
     }
-
-
-def resolve_provider(
-    connection: sqlite3.Connection, provider_id: int | None, role: str
-) -> JudgeProvider:
-    """从库里取 provider 配置。没给 id 时取该角色的第一个，凑不齐抛
-    :class:`JudgeConfigError`。"""
-    record = config_store.get_provider(connection, provider_id) if provider_id else None
-    if record is None:
-        candidates = config_store.list_providers(connection, role)
-        record = candidates[0] if candidates else None
-    if record is None:
-        raise JudgeConfigError(f"没有配置 {role} 模型端点，请在配置页填写。")
-    if record["role"] != role:
-        raise JudgeConfigError(f"模型端点 {record['label']!r} 的角色不是 {role}")
-    if not (record["api_key"] or "").strip():
-        raise JudgeConfigError(f"模型端点 {record['label']!r} 没有 api key。")
-    return JudgeProvider(
-        base_url=record["base_url"],
-        model=record["model"],
-        api_key=record["api_key"],
-    )
 
 
 def _judge_task(
@@ -272,17 +247,16 @@ def _judge_one(
     ctx: TaskContext, eval_id: int, query_id: int, provider: JudgeProvider, metric: str
 ) -> None:
     # 逐指标问，否则判过 faithfulness 的样本会让 answer_relevancy 整批跳过。
-    already = run_store.judged_sample_ids(ctx.db, eval_id, metric)
-    rows = [r for r in run_store.sample_evals(ctx.db, eval_id) if r["sample_id"] not in already]
+    eval_store.restore_judge_metrics(ctx.db, eval_id, metric)
+    ctx.db.commit()
+    already = eval_store.judged_sample_ids(ctx.db, eval_id, metric)
+    rows = [r for r in eval_store.sample_evals(ctx.db, eval_id) if r["sample_id"] not in already]
     if already:
         ctx.log(f"{metric} 续跑：已判 {len(already)} 条，待判 {len(rows)} 条")
-    if not rows:
-        return
-
     with JudgeClient(provider) as client:
         for position, row in enumerate(rows, 1):
             ctx.checkpoint()
-            response = run_store.response_of(ctx.db, query_id, row["sample_id"])
+            response = query_store.response_of(ctx.db, query_id, row["sample_id"])
             body = (response or {}).get("response") or {}
             references = (row["detail"] or {}).get("reference_answers") or []
             task = _judge_task(
@@ -294,7 +268,7 @@ def _judge_one(
             )
             if task is None:
                 # 这一条在这个样本上无定义，记 None 并跳过。
-                run_store.record_judge_verdict(
+                eval_store.record_judge_verdict(
                     ctx.db,
                     eval_id,
                     sample_id=row["sample_id"],
@@ -307,7 +281,7 @@ def _judge_one(
                 prompt, parse = task
                 reply = client.complete(*prompt)
                 if reply.failure_kind:
-                    run_store.record_judge_verdict(
+                    eval_store.record_judge_verdict(
                         ctx.db,
                         eval_id,
                         sample_id=row["sample_id"],
@@ -322,7 +296,7 @@ def _judge_one(
                         score, reasoning = parse(parse_json_object(reply.content or ""))
                     except ValueError as exc:
                         # 模型没按 schema 输出，记 parse_error 而不是猜一个分数。
-                        run_store.record_judge_verdict(
+                        eval_store.record_judge_verdict(
                             ctx.db,
                             eval_id,
                             sample_id=row["sample_id"],
@@ -332,7 +306,7 @@ def _judge_one(
                             detail={"error": str(exc)[:300]},
                         )
                     else:
-                        run_store.record_judge_verdict(
+                        eval_store.record_judge_verdict(
                             ctx.db,
                             eval_id,
                             sample_id=row["sample_id"],
@@ -342,7 +316,7 @@ def _judge_one(
                             detail=reasoning,
                         )
                         if score is not None:
-                            run_store.record_sample_eval(
+                            eval_store.record_sample_eval(
                                 ctx.db,
                                 eval_id,
                                 sample_id=row["sample_id"],
@@ -357,11 +331,9 @@ def _judge_one(
             if position % 5 == 0 or position == len(rows):
                 ctx.progress(position, len(rows), metric)
 
-    summary = run_store.judge_summary(ctx.db, eval_id, metric)
-    for dataset, mean, count in run_store.judge_means_by_dataset(ctx.db, eval_id, metric):
-        run_store.record_metric_summary(
-            ctx.db, eval_id, dataset, "judge", {metric: mean}, count
-        )
+    summary = eval_store.judge_summary(ctx.db, eval_id, metric)
+    for dataset, mean, count in eval_store.judge_means_by_dataset(ctx.db, eval_id, metric):
+        eval_store.record_metric_summary(ctx.db, eval_id, dataset, "judge", {metric: mean}, count)
     ctx.db.commit()
     ctx.log(
         f"{metric} 均值 {summary['mean']}，已评分 {summary['scored']}，"
@@ -381,13 +353,13 @@ def run(ctx: TaskContext) -> None:
     if not query_id:
         raise ValueError("请选择一次查询")
 
-    query_run = run_store.get_query_run(ctx.db, query_id)
+    query_run = query_store.get_query_run(ctx.db, query_id)
     if query_run is None:
         raise ValueError(f"查询 #{query_id} 不存在")
     if query_run["status"] != run_store.STATUS_SUCCEEDED:
         raise ValueError("请选择已完成的查询记录")
 
-    available = run_store.response_datasets(ctx.db, query_id)
+    available = query_store.response_datasets(ctx.db, query_id)
     datasets = list(params.get("datasets") or available)
     unknown = sorted(set(datasets) - set(available))
     if unknown:
@@ -397,25 +369,24 @@ def run(ctx: TaskContext) -> None:
     if any(k < 1 for k in ks):
         raise ValueError("k 必须大于 0")
     metrics = resolve_metrics(list(params.get("metrics") or []))
-    judge_selected = any(
-        registry.get_metric(name).kind == registry.KIND_JUDGE for name in metrics
-    )
+    judge_selected = any(registry.get_metric(name).kind == registry.KIND_JUDGE for name in metrics)
 
     provider: JudgeProvider | None = None
     provider_id = params.get("judge_provider_id")
     provider_id = int(provider_id) if provider_id else None
     if judge_selected:
         provider = resolve_provider(ctx.db, provider_id, "judge")
+        provider_id = provider.provider_id
 
-    name = str(params.get("name") or "").strip() or f"{query_run['name']}-e"
-    existing = run_store.eval_run_by_name(ctx.db, name)
-    if existing:
-        if int(existing["query_id"]) != query_id:
-            raise ValueError(f"评测记录 {name!r} 属于另一次查询，请换个名称")
-        eval_id = int(existing["id"])
-        run_store.set_eval_status(ctx.db, eval_id, run_store.STATUS_RUNNING)
-    else:
-        eval_id = run_store.create_eval_run(
+    name = str(params.get("name") or "").strip() or f"{query_run['name']}-e-{uuid.uuid4().hex[:6]}"
+    eval_id = ctx.target("eval")
+    ctx.freeze(
+        name=name, datasets=datasets, ks=list(ks), metrics=metrics, judge_provider_id=provider_id
+    )
+    if eval_id is None:
+        if eval_store.eval_run_by_name(ctx.db, name):
+            raise ValueError(f"评测名称 {name!r} 已存在，请换个名称或继续原任务")
+        eval_id = eval_store.create_eval_run(
             ctx.db,
             name=name,
             query_id=query_id,
@@ -423,52 +394,38 @@ def run(ctx: TaskContext) -> None:
             metrics=metrics,
             judge_provider_id=provider_id if judge_selected else None,
         )
-    ctx.db.commit()
-    ctx.bind("eval", eval_id)
+        ctx.bind("eval", eval_id)
 
-    try:
-        for index, dataset in enumerate(datasets):
-            ctx.checkpoint()
-            ctx.progress(index, len(datasets), f"{dataset} 计算指标")
-            summary = evaluate_dataset(
-                ctx.db,
-                eval_id,
-                query_id,
-                int(query_run["compile_id"]),
-                dataset,
-                ks,
-                frozenset(metrics),
-                ctx,
-            )
-            ctx.log(
-                f"{dataset}: 样本 {summary['responses_evaluated']}，"
-                f"HTTP 失败 {summary['http_failures']}，"
-                f"EM {summary['overall'].get('em', 0.0):.3f} "
-                f"F1 {summary['overall'].get('f1', 0.0):.3f}"
-            )
-            if summary["omitted_metrics"]:
-                ctx.log(
-                    f"{dataset}: 缺 gold 标注，省略 {len(summary['omitted_metrics'])} 个指标"
-                    "（不伪造 0 分）"
-                )
-
-        if provider is not None:
-            judge_metrics = [
-                name
-                for name in metrics
-                if registry.get_metric(name).kind == registry.KIND_JUDGE
-            ]
-            ctx.log(f"执行 Judge：{provider.model}，指标 {judge_metrics}")
-            _judge(ctx, eval_id, query_id, provider, judge_metrics)
-    except BaseException:
-        run_store.set_eval_status(
+    for index, dataset in enumerate(datasets):
+        ctx.checkpoint()
+        ctx.progress(index, len(datasets), f"{dataset} 计算指标")
+        summary = evaluate_dataset(
             ctx.db,
             eval_id,
-            run_store.STATUS_PAUSED if ctx.pause_requested else run_store.STATUS_FAILED,
+            query_id,
+            int(query_run["compile_id"]),
+            dataset,
+            ks,
+            frozenset(metrics),
+            ctx,
         )
-        ctx.db.commit()
-        raise
+        ctx.log(
+            f"{dataset}: 样本 {summary['responses_evaluated']}，"
+            f"HTTP 失败 {summary['http_failures']}，"
+            f"EM {summary['overall'].get('em', 0.0):.3f} "
+            f"F1 {summary['overall'].get('f1', 0.0):.3f}"
+        )
+        if summary["omitted_metrics"]:
+            ctx.log(
+                f"{dataset}: 缺 gold 标注，省略 {len(summary['omitted_metrics'])} 个指标"
+                "（不伪造 0 分）"
+            )
 
-    run_store.set_eval_status(ctx.db, eval_id, run_store.STATUS_SUCCEEDED, finished=True)
-    ctx.db.commit()
+    if provider is not None:
+        judge_metrics = [
+            name for name in metrics if registry.get_metric(name).kind == registry.KIND_JUDGE
+        ]
+        ctx.log(f"执行 Judge：{provider.model}，指标 {judge_metrics}")
+        _judge(ctx, eval_id, query_id, provider, judge_metrics)
+
     ctx.progress(len(datasets), len(datasets), "评测完成")

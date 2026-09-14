@@ -1,3 +1,5 @@
+-- 数据库最终结构；初始化可重复执行，不负责迁移旧数据库。
+
 -- ------------------------------------------------------------ 配置层
 CREATE TABLE IF NOT EXISTS akasha_connection (
     id                       INTEGER PRIMARY KEY CHECK (id = 1),
@@ -163,7 +165,7 @@ CREATE TABLE IF NOT EXISTS sample_metric (
 
 CREATE INDEX IF NOT EXISTS sample_metric_lookup_idx ON sample_metric(eval_id, metric, value);
 
--- scope 取 overall / knowledge_only，两份口径的差值即生成端拒答的规模。
+-- scope 取 overall / knowledge_only，分别汇总全样本与 knowledge 子集。
 CREATE TABLE IF NOT EXISTS metric_summary (
     eval_id      INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
     dataset      TEXT NOT NULL,

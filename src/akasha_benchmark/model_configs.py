@@ -1,7 +1,7 @@
 """Akasha 四项模型配置的规范化与比对。
 
-编译时固化一份快照，查询前拿现在的配置与它比：换了 embedding 之后旧 chunk
-永远召回不到，而这种失效不报错。
+编译时固化一份快照，查询前与当前配置比对；embedding 不一致时拒绝执行，
+避免使用与当前 embedding 配置不匹配的编译产物。
 """
 
 from __future__ import annotations

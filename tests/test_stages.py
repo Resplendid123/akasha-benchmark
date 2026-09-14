@@ -7,8 +7,15 @@ import threading
 import pytest
 
 from akasha_benchmark.datasets import DataDependency, get_adapter
+from akasha_benchmark.metrics import registry
 from akasha_benchmark.stages import clean_params, compile, evaluate, normalize
-from akasha_benchmark.store import data_store, run_store
+from akasha_benchmark.store import (
+    compile_store,
+    data_store,
+    eval_store,
+    query_store,
+    run_store,
+)
 from akasha_benchmark.task import TaskContext
 
 
@@ -69,7 +76,7 @@ def test_normalize_rejects_duplicate_sample_ids(db, dataset_dir, monkeypatch):
 
 def test_subset_covers_every_gold(normalized):
     """先 QA 后 corpus：所选样本的 gold 必须全在子集语料内，否则 Recall 上限不是 1。"""
-    compile_id = run_store.create_compile_run(
+    compile_id = compile_store.create_compile_run(
         normalized, run_id="r", datasets=["hotpotqa"], seed=7, qa_limit=2, negatives_ratio=1.0
     )
     normalized.commit()
@@ -77,22 +84,22 @@ def test_subset_covers_every_gold(normalized):
         normalized, compile_id, "hotpotqa", seed=7, qa_limit=2, negatives_ratio=1.0
     )
 
-    docs = {d["doc_id"] for d in run_store.compile_docs(normalized, compile_id)}
-    samples = run_store.compile_samples(normalized, compile_id)
+    docs = {d["doc_id"] for d in compile_store.compile_docs(normalized, compile_id)}
+    samples = compile_store.compile_samples(normalized, compile_id)
     assert stats["samples"] == len(samples) == 2
     for sample in samples:
         assert set(sample["gold_doc_ids"]) <= docs
 
-    gold = {d["doc_id"] for d in run_store.compile_docs(normalized, compile_id) if d["is_gold"]}
+    gold = {d["doc_id"] for d in compile_store.compile_docs(normalized, compile_id) if d["is_gold"]}
     assert stats["gold"] == len(gold)
     assert stats["negatives"] == len(docs - gold)
 
 
-def test_subset_is_seed_stable_and_seed_sensitive(normalized):
+def test_subset_is_seed_stable(normalized):
     """同 seed 抽同一批 —— 「同子集换 embedding」的对照实验靠这一条。"""
 
     def docs_for(seed: int, run_id: str) -> set[str]:
-        compile_id = run_store.create_compile_run(
+        compile_id = compile_store.create_compile_run(
             normalized,
             run_id=run_id,
             datasets=["hotpotqa"],
@@ -104,13 +111,13 @@ def test_subset_is_seed_stable_and_seed_sensitive(normalized):
         compile.build_subset(
             normalized, compile_id, "hotpotqa", seed=seed, qa_limit=1, negatives_ratio=1.0
         )
-        return {d["doc_id"] for d in run_store.compile_docs(normalized, compile_id)}
+        return {d["doc_id"] for d in compile_store.compile_docs(normalized, compile_id)}
 
     assert docs_for(7, "a") == docs_for(7, "b")
 
 
 def test_subset_negatives_ratio_zero_keeps_only_gold(normalized):
-    compile_id = run_store.create_compile_run(
+    compile_id = compile_store.create_compile_run(
         normalized, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=2, negatives_ratio=0.0
     )
     normalized.commit()
@@ -118,7 +125,7 @@ def test_subset_negatives_ratio_zero_keeps_only_gold(normalized):
         normalized, compile_id, "hotpotqa", seed=1, qa_limit=2, negatives_ratio=0.0
     )
     assert stats["negatives"] == 0
-    assert all(d["is_gold"] for d in run_store.compile_docs(normalized, compile_id))
+    assert all(d["is_gold"] for d in compile_store.compile_docs(normalized, compile_id))
 
 
 def test_markdown_uses_heading_for_title(normalized):
@@ -136,21 +143,26 @@ def test_unsafe_doc_id_is_rejected():
 
 
 def _fixture_chain(connection, response: dict) -> tuple[int, int, int]:
-    compile_id = run_store.create_compile_run(
+    compile_id = compile_store.create_compile_run(
         connection, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=2, negatives_ratio=1.0
     )
     connection.commit()
     compile.build_subset(
         connection, compile_id, "hotpotqa", seed=1, qa_limit=2, negatives_ratio=1.0
     )
-    for doc in run_store.compile_docs(connection, compile_id):
-        run_store.record_page(
-            connection, compile_id, doc["dataset"], doc["doc_id"], page_id=f"p{doc['doc_id']}", error=None
+    for doc in compile_store.compile_docs(connection, compile_id):
+        compile_store.record_page(
+            connection,
+            compile_id,
+            doc["dataset"],
+            doc["doc_id"],
+            page_id=f"p{doc['doc_id']}",
+            error=None,
         )
-    run_store.update_compile_run(
+    compile_store.update_compile_run(
         connection, compile_id, space_id="s", status=run_store.STATUS_SUCCEEDED
     )
-    query_id = run_store.create_query_run(
+    query_id = query_store.create_query_run(
         connection,
         name="q",
         compile_id=compile_id,
@@ -158,9 +170,9 @@ def _fixture_chain(connection, response: dict) -> tuple[int, int, int]:
         concurrency=1,
         model_configs={},
     )
-    samples = run_store.compile_samples(connection, compile_id)
+    samples = compile_store.compile_samples(connection, compile_id)
     for sample in samples:
-        run_store.record_response(
+        query_store.record_response(
             connection,
             query_id,
             sample_id=sample["sample_id"],
@@ -171,15 +183,13 @@ def _fixture_chain(connection, response: dict) -> tuple[int, int, int]:
             error=None,
             response={
                 **response,
-                "retrievedSources": [
-                    {"sourcePageId": f"p{doc}"} for doc in sample["gold_doc_ids"]
-                ]
+                "retrievedSources": [{"sourcePageId": f"p{doc}"} for doc in sample["gold_doc_ids"]]
                 if response.get("answerMode") == "knowledge"
                 else [],
             },
         )
-    run_store.set_query_status(connection, query_id, run_store.STATUS_SUCCEEDED, finished=True)
-    eval_id = run_store.create_eval_run(
+    run_store.set_run_status(connection, "query", query_id, run_store.STATUS_SUCCEEDED)
+    eval_id = eval_store.create_eval_run(
         connection,
         name="e",
         query_id=query_id,
@@ -220,13 +230,13 @@ def test_evaluate_separates_fallback_from_retrieval_failure(normalized):
     )
     summaries = {
         (row["scope"], row["metric"]): row
-        for row in run_store.metric_summaries(normalized, eval_id)
+        for row in eval_store.metric_summaries(normalized, eval_id)
     }
     assert summaries[("overall", "recall@2")]["value"] == pytest.approx(0.0)
     # knowledge 切片里一条样本都没有，所以那一档没有指标行 —— 前端显示「—」
     # 而不是 0，两者的区别正是「这一档没有样本」与「这一档得分为 0」。
     assert ("knowledge_only", "recall@2") not in summaries
-    modes = run_store.dataset_evals(normalized, eval_id)[0]["answer_modes"]
+    modes = eval_store.dataset_evals(normalized, eval_id)[0]["answer_modes"]
     assert modes == {"no_match": pytest.approx(1.0)}
 
 
@@ -237,8 +247,8 @@ def test_evaluate_filters_to_selected_metrics(normalized):
     evaluate.evaluate_dataset(
         normalized, eval_id, query_id, compile_id, "hotpotqa", (2,), frozenset({"em"})
     )
-    sample = run_store.sample_evals(normalized, eval_id)[0]
-    metrics = run_store.sample_metrics_of(normalized, eval_id, sample["sample_id"])
+    sample = eval_store.sample_evals(normalized, eval_id)[0]
+    metrics = eval_store.sample_metrics_of(normalized, eval_id, sample["sample_id"])
     assert set(metrics) == {"em"}
     # 明细仍然保留全部链路 —— 那是归因要读的东西，与「这一轮报哪些指标」是两件事。
     assert "retrieval" in sample["detail"]
@@ -258,8 +268,6 @@ def test_evaluate_rejects_rebuilt_subset(normalized):
 
 def test_omitted_metrics_are_not_faked_as_zero():
     """narrativeqa 没有 gold 标注，整族检索指标必须省略而不是记 0。"""
-    from akasha_benchmark.metrics import registry
-
     adapter = get_adapter("narrativeqa")
     assert DataDependency.GOLD_DOCS not in adapter.provides
     omitted = {d.name for d in registry.omitted(adapter.provides)}
@@ -271,9 +279,7 @@ def test_omitted_metrics_are_not_faked_as_zero():
 def test_resolve_metrics_rejects_unknown():
     with pytest.raises(ValueError, match="未知指标"):
         evaluate.resolve_metrics(["recall", "bogus"])
-    assert evaluate.resolve_metrics([]) == sorted(
-        __import__("akasha_benchmark.metrics.registry", fromlist=["x"]).METRIC_REGISTRY
-    )
+    assert evaluate.resolve_metrics([]) == sorted(registry.METRIC_REGISTRY)
 
 
 # ------------------------------------------------------------ 参数白名单
@@ -296,3 +302,64 @@ def test_clean_params_rejects_wrong_types():
 
 def test_clean_params_coerces_ks_to_int():
     assert clean_params("evaluate", {"ks": ["2", "5"]}) == {"ks": [2, 5]}
+
+
+def test_evaluate_resume_restores_judge_scores_and_summary(normalized, monkeypatch):
+    from akasha_benchmark.judge.client import JudgeProvider
+    from akasha_benchmark.store import task_store
+    from akasha_benchmark.task import execute
+
+    compile_id, query_id, eval_id = _fixture_chain(
+        normalized, {"answerMode": "knowledge", "answer": "a"}
+    )
+    for sample in compile_store.compile_samples(normalized, compile_id):
+        eval_store.record_judge_verdict(
+            normalized,
+            eval_id,
+            sample_id=sample["sample_id"],
+            metric="faithfulness",
+            score=0.5,
+            failure_kind=None,
+            detail=None,
+        )
+    params = {"query_id": query_id, "name": "e", "metrics": ["em", "faithfulness"], "ks": [2]}
+    task_id = task_store.create_task(normalized, stage="evaluate", params=params)
+    task_store.set_task_target(normalized, task_id, "eval", eval_id)
+    normalized.commit()
+    monkeypatch.setattr(
+        evaluate, "resolve_provider", lambda *args: JudgeProvider("https://x", "m", "k")
+    )
+
+    class NoCalls:
+        def __init__(self, provider):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def complete(self, *args):
+            pytest.fail("续跑不应重复调用已完成的 Judge")
+
+    monkeypatch.setattr(evaluate, "JudgeClient", NoCalls)
+    ctx = TaskContext(
+        task_id=task_id,
+        stage="evaluate",
+        params=params,
+        connection=normalized,
+        pause_event=threading.Event(),
+    )
+    execute(evaluate.run, ctx)
+    for sample in eval_store.sample_evals(normalized, eval_id):
+        assert (
+            eval_store.sample_metrics_of(normalized, eval_id, sample["sample_id"])["faithfulness"]
+            == 0.5
+        )
+    summaries = [
+        r for r in eval_store.metric_summaries(normalized, eval_id) if r["scope"] == "judge"
+    ]
+    assert len(summaries) == 1
+    assert summaries[0]["value"] == 0.5
+    assert summaries[0]["sample_count"] == 2

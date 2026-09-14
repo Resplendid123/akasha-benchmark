@@ -109,27 +109,18 @@ def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
 
 
 def test_correct_answer_is_not_a_failure():
-    """答对的样本不能被归成失败。
-
-    归因取的是「按指标最差的 N 条」，那不等于「N 条失败」—— 真实失败不足 N 条
-    时健康样本也会进来。不先摘出去，后面每一条都在解释一个不存在的失败。
-    """
+    """最差 N 条可能包含正确答案，应排除这些样本的失败归因。"""
     # 检索一条 gold 都没命中，但答案 EM 命中：系统没依赖那篇 gold。
     ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 1.0}), [])
     assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
 
     # judge 判事实一致，同样算对。
-    ruling = attribution.classify(
-        _sample({"hit@5": 0.0, "em": 0.0, "answer_correctness": 1.0}), []
-    )
+    ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 0.0, "answer_correctness": 1.0}), [])
     assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
 
 
 def test_not_a_failure_outranks_every_failure_cause():
-    """它必须判在最前面，包括压在 generation_fallback 之前。
-
-    拒答且答对是矛盾的，但真出现时「答对」才是那条样本的事实。
-    """
+    """答案正确的判据优先于其他失败判据。"""
     for metrics, lineage, mode in (
         ({"hit@5": 0.0, "em": 1.0}, [{"question_terms_lost": ["grammy"]}], "knowledge"),
         ({"hit@5": 0.0, "em": 1.0, "truncated_gold": 1.0}, [], "knowledge"),
@@ -140,11 +131,7 @@ def test_not_a_failure_outranks_every_failure_cause():
 
 
 def test_high_f1_alone_does_not_clear_a_sample():
-    """F1 高不算答对。
-
-    F1=0.6 可能是答对了被散文稀释，也可能是答错了但词有重叠，分不开。
-    宁可漏判成别的分类，也不能把答错的说成没问题。
-    """
+    """高词汇重叠率不足以判定答案正确。"""
     ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 0.0, "f1": 0.9}), [])
     assert ruling["root_cause"] != attribution.CAUSE_NOT_A_FAILURE
 
@@ -180,9 +167,7 @@ def test_graph_edge_missing_when_coverage_incomplete():
 
 
 def test_gold_suspect_when_everything_retrieved_but_answer_wrong():
-    ruling = attribution.classify(
-        _sample({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}), []
-    )
+    ruling = attribution.classify(_sample({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}), [])
     assert ruling["root_cause"] == attribution.CAUSE_GOLD_SUSPECT
 
 

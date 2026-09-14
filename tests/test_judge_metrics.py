@@ -14,13 +14,12 @@ from akasha_benchmark.judge import (
     context_relevancy,
 )
 from akasha_benchmark.metrics import registry
+from akasha_benchmark.store import eval_store
 
 
 def test_all_judge_metrics_are_registered():
     """判据模块与 registry 必须对齐，否则勾了却没实现，或实现了却勾不到。"""
-    judge = {
-        d.name for d in registry.METRIC_DEFINITIONS if d.kind == registry.KIND_JUDGE
-    }
+    judge = {d.name for d in registry.METRIC_DEFINITIONS if d.kind == registry.KIND_JUDGE}
     assert judge == {
         "faithfulness",
         "answer_relevancy",
@@ -140,13 +139,6 @@ def test_answer_correctness_scores_each_band(verdict, expected):
     assert detail["verdict"] == verdict
 
 
-def test_answer_correctness_refusal_is_not_wrong():
-    """no_answer 不给分：拒答既不对也不错。记 0 会把它和「答错」混在一起，
-    而前者要查检索，后者要查生成。"""
-    assert answer_correctness.SCORES["no_answer"] is None
-    assert answer_correctness.SCORES["incorrect"] == 0.0
-
-
 def test_answer_correctness_rejects_unknown_verdict():
     with pytest.raises(ValueError, match="unknown verdict"):
         answer_correctness.parse_verdict({"verdict": "mostly right"})
@@ -161,125 +153,112 @@ def test_answer_correctness_skips_without_reference():
 # --- 存储：一个样本多条 judge 结论 ---
 
 
-def _eval_run(connection) -> int:
-    from akasha_benchmark.store import run_store
-
-    compile_id = run_store.create_compile_run(
-        connection, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=1, negatives_ratio=1.0
-    )
-    query_id = run_store.create_query_run(
-        connection, name="q", compile_id=compile_id, score_threshold=None,
-        concurrency=1, model_configs=None,
-    )
-    eval_id = run_store.create_eval_run(
-        connection, name="e", query_id=query_id, ks=[5], metrics=["faithfulness"],
-        judge_provider_id=None,
-    )
-    connection.commit()
-    return eval_id
-
-
-def test_verdicts_are_stored_per_metric(db):
-    """一个样本要能存多条 judge 结论。主键原来只有 (eval_id, sample_id)，
-    第二条指标会覆盖第一条。"""
-    from akasha_benchmark.store import run_store
-
-    eval_id = _eval_run(db)
+def test_verdicts_are_stored_per_metric(db, eval_id):
+    """同一样本的不同指标独立保存。"""
     for name, score in (("faithfulness", 0.5), ("answer_relevancy", 1.0)):
-        run_store.record_judge_verdict(
-            db, eval_id, sample_id="s1", metric=name, score=score,
-            failure_kind=None, detail=None,
+        eval_store.record_judge_verdict(
+            db,
+            eval_id,
+            sample_id="s1",
+            metric=name,
+            score=score,
+            failure_kind=None,
+            detail=None,
         )
     db.commit()
 
-    verdicts = {v["metric"]: v["score"] for v in run_store.judge_verdicts(db, eval_id)}
+    verdicts = {v["metric"]: v["score"] for v in eval_store.judge_verdicts(db, eval_id)}
     assert verdicts == {"faithfulness": 0.5, "answer_relevancy": 1.0}
 
 
-def test_resume_is_per_metric(db):
+def test_resume_is_per_metric(db, eval_id):
     """续跑要逐指标问：判过 faithfulness 的样本不能让另一个指标整批跳过。"""
-    from akasha_benchmark.store import run_store
-
-    eval_id = _eval_run(db)
-    run_store.record_judge_verdict(
-        db, eval_id, sample_id="s1", metric="faithfulness", score=1.0,
-        failure_kind=None, detail=None,
+    eval_store.record_judge_verdict(
+        db,
+        eval_id,
+        sample_id="s1",
+        metric="faithfulness",
+        score=1.0,
+        failure_kind=None,
+        detail=None,
     )
     db.commit()
 
-    assert run_store.judged_sample_ids(db, eval_id, "faithfulness") == {"s1"}
-    assert run_store.judged_sample_ids(db, eval_id, "answer_relevancy") == set()
+    assert eval_store.judged_sample_ids(db, eval_id, "faithfulness") == {"s1"}
+    assert eval_store.judged_sample_ids(db, eval_id, "answer_relevancy") == set()
     # 不带指标名时是全部，供汇总用。
-    assert run_store.judged_sample_ids(db, eval_id) == {"s1"}
+    assert eval_store.judged_sample_ids(db, eval_id) == {"s1"}
 
 
-def test_latency_mean_excludes_skipped(db):
+def test_latency_mean_excludes_skipped(db, eval_id):
     """跳过的条目没发过调用，不能进延迟均值 —— 那会把均值拉低。"""
-    from akasha_benchmark.store import run_store
-
-    eval_id = _eval_run(db)
-    run_store.record_judge_verdict(
-        db, eval_id, sample_id="s1", metric="faithfulness", score=1.0,
-        failure_kind=None, detail=None, latency_ms=2000,
+    eval_store.record_judge_verdict(
+        db,
+        eval_id,
+        sample_id="s1",
+        metric="faithfulness",
+        score=1.0,
+        failure_kind=None,
+        detail=None,
+        latency_ms=2000,
     )
     # 跳过：无定义，没有调用。
-    run_store.record_judge_verdict(
-        db, eval_id, sample_id="s2", metric="faithfulness", score=None,
-        failure_kind=None, detail={"skipped": "x"}, latency_ms=None,
+    eval_store.record_judge_verdict(
+        db,
+        eval_id,
+        sample_id="s2",
+        metric="faithfulness",
+        score=None,
+        failure_kind=None,
+        detail={"skipped": "x"},
+        latency_ms=None,
     )
     db.commit()
 
-    summary = run_store.judge_summary(db, eval_id, "faithfulness")
+    summary = eval_store.judge_summary(db, eval_id, "faithfulness")
     assert summary["latency_mean"] == 2000
     assert summary["total"] == 2
 
 
-def test_judge_reply_carries_latency():
-    """延迟在 complete() 外层统一计时 —— _complete 有八个返回点，逐个填会漏。"""
+@pytest.mark.parametrize("status", [200, 400], ids=["success", "failure"])
+def test_judge_reply_carries_latency(status):
     import httpx
 
     from akasha_benchmark.judge import JudgeClient, JudgeProvider
 
     provider = JudgeProvider(base_url="https://x/v1", model="m", api_key="k")
     transport = httpx.MockTransport(
-        lambda request: httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+        lambda request: httpx.Response(status, json={"choices": [{"message": {"content": "{}"}}]})
     )
     with JudgeClient(provider, client=httpx.Client(transport=transport)) as client:
         reply = client.complete("s", "u")
-    assert reply.failure_kind is None
+    assert (reply.failure_kind is None) == (status == 200)
     assert reply.latency_ms is not None and reply.latency_ms >= 0
 
 
-def test_judge_reply_carries_latency_on_failure():
-    """失败也要有延迟：调不通花了多久，是排查限流与超时的依据。"""
-    import httpx
-
-    from akasha_benchmark.judge import JudgeClient, JudgeProvider
-
-    provider = JudgeProvider(base_url="https://x/v1", model="m", api_key="k")
-    transport = httpx.MockTransport(lambda request: httpx.Response(400, text="bad"))
-    with JudgeClient(provider, client=httpx.Client(transport=transport)) as client:
-        reply = client.complete("s", "u")
-    assert reply.failure_kind is not None
-    assert reply.latency_ms is not None
-
-
-def test_summary_scopes_to_one_metric(db):
+def test_summary_scopes_to_one_metric(db, eval_id):
     """失败率要按指标算：一个指标全失败不该把另一个的失败率也拉高。"""
-    from akasha_benchmark.store import run_store
-
-    eval_id = _eval_run(db)
-    run_store.record_judge_verdict(
-        db, eval_id, sample_id="s1", metric="faithfulness", score=1.0,
-        failure_kind=None, detail=None,
+    eval_store.record_judge_verdict(
+        db,
+        eval_id,
+        sample_id="s1",
+        metric="faithfulness",
+        score=1.0,
+        failure_kind=None,
+        detail=None,
     )
-    run_store.record_judge_verdict(
-        db, eval_id, sample_id="s1", metric="answer_relevancy", score=None,
-        failure_kind="http:429", detail=None,
+    eval_store.record_judge_verdict(
+        db,
+        eval_id,
+        sample_id="s1",
+        metric="answer_relevancy",
+        score=None,
+        failure_kind="http:429",
+        detail=None,
     )
     db.commit()
 
-    assert run_store.judge_summary(db, eval_id, "faithfulness")["failure_rate"] == 0.0
-    assert run_store.judge_summary(db, eval_id, "answer_relevancy")["failure_rate"] == 1.0
+    assert eval_store.judge_summary(db, eval_id, "faithfulness")["failure_rate"] == 0.0
+    assert eval_store.judge_summary(db, eval_id, "answer_relevancy")["failure_rate"] == 1.0
     # 不分指标时是两条的合计。
-    assert run_store.judge_summary(db, eval_id)["total"] == 2
+    assert eval_store.judge_summary(db, eval_id)["total"] == 2

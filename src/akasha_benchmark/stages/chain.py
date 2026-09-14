@@ -12,7 +12,13 @@ import uuid
 from typing import Any
 
 from ..datasets import DATASET_NAMES
-from ..store import data_store, run_store
+from ..store import (
+    attribution_store,
+    compile_store,
+    data_store,
+    eval_store,
+    query_store,
+)
 from . import compile
 
 # 只用有 gold 标注的三组，否则检索族指标全省略，测不到指标计算那一段。
@@ -23,11 +29,13 @@ DEFAULT_METRICS = ("recall", "hit", "em", "f1", "citation_recall")
 
 def _check_query(connection, query_id: int) -> None:
     """查询响应要覆盖全部样本、都成功，且 knowledge 响应带着 retrievedSources。"""
-    run = run_store.get_query_run(connection, query_id)
+    run = query_store.get_query_run(connection, query_id)
     if run is None:
         raise RuntimeError("查询记录丢失")
-    responses = run_store.responses_of(connection, query_id)
-    expected = {s["sample_id"] for s in run_store.compile_samples(connection, int(run["compile_id"]))}
+    responses = query_store.responses_of(connection, query_id)
+    expected = {
+        s["sample_id"] for s in compile_store.compile_samples(connection, int(run["compile_id"]))
+    }
     if {r["sample_id"] for r in responses} != expected:
         raise RuntimeError("查询响应没有覆盖全部样本")
     failed = [r["sample_id"] for r in responses if not 200 <= r["http_status"] < 300]
@@ -45,22 +53,22 @@ def _check_query(connection, query_id: int) -> None:
 
 
 def _check_evaluate(connection, eval_id: int) -> None:
-    run = run_store.get_eval_run(connection, eval_id)
+    run = eval_store.get_eval_run(connection, eval_id)
     if run is None:
         raise RuntimeError("评测记录丢失")
-    query_run = run_store.get_query_run(connection, int(run["query_id"]))
+    query_run = query_store.get_query_run(connection, int(run["query_id"]))
     if query_run is None:
         raise RuntimeError("评测指向的查询记录丢失")
     expected = {
         s["sample_id"]
-        for s in run_store.compile_samples(connection, int(query_run["compile_id"]))
+        for s in compile_store.compile_samples(connection, int(query_run["compile_id"]))
     }
-    if {r["sample_id"] for r in run_store.sample_evals(connection, eval_id)} != expected:
+    if {r["sample_id"] for r in eval_store.sample_evals(connection, eval_id)} != expected:
         raise RuntimeError("评测没有覆盖全部样本")
 
 
 def _check_attribute(connection, attribution_id: int) -> None:
-    if not run_store.attribution_results(connection, attribution_id):
+    if not attribution_store.attribution_results(connection, attribution_id):
         raise RuntimeError("归因没有产出结论")
 
 
