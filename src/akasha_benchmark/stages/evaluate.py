@@ -1,12 +1,10 @@
 """评测层：从库里的响应算指标，需要时执行 Judge。纯离线，不碰 Akasha。
 
-每个检索指标出两份 —— 全样本，以及只算 ``answerMode == knowledge`` 的切片。
-``no_match`` / ``general`` 无条件返回空 ``retrievedSources``，所以全样本那份
-把「生成端拒答」也算进了检索指标里，两份的差值就是这个效应的规模。
+每个检索指标出两份：全样本，以及只算 ``answerMode == knowledge`` 的切片，
+两份的差值即生成端拒答的规模。
 
-指标能不能算由**数据依赖**决定而不是数据集名字：指标声明 requires、
-数据集声明 provides，闸门做集合比对。算不了的记进 ``dataset_eval``，
-**不伪造 0 分** —— 假分数会静默污染任何包含它的汇总。
+指标能不能算由数据依赖决定：指标声明 requires、数据集声明 provides，
+闸门做集合比对。算不了的记进 ``dataset_eval``，不伪造 0 分。
 """
 
 from __future__ import annotations
@@ -15,7 +13,12 @@ import sqlite3
 from typing import Any
 
 from ..datasets import DataDependency, get_adapter
-from ..judge import faithfulness
+from ..judge import (
+    answer_correctness,
+    answer_relevancy,
+    context_relevancy,
+    faithfulness,
+)
 from ..judge.client import (
     JudgeClient,
     JudgeConfigError,
@@ -27,7 +30,7 @@ from ..store import config_store, run_store
 from ..task import TaskContext
 
 DEFAULT_KS = (2, 5, 10)
-# 失败率超过这个值就判整轮失败：排除得太多时那个均值不代表整体。
+# judge 失败率超过这个值就判整轮失败：排除得太多时均值不代表整体。
 MAX_JUDGE_FAILURE_RATE = 0.1
 
 
@@ -36,7 +39,7 @@ def _mean(values: list[float]) -> float:
 
 
 def _scalars(source: dict[str, Any]) -> dict[str, float]:
-    """只取标量项。``reason_counts`` 之类的嵌套结构留在 detail 里。"""
+    """只取标量项，嵌套结构留在 detail 里。"""
     return {k: float(v) for k, v in source.items() if isinstance(v, (int, float, bool))}
 
 
@@ -48,10 +51,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def resolve_metrics(selected: list[str] | None) -> list[str]:
-    """校验勾选的指标名。空表示全量。
-
-    拼错的名字直接报错而不是忽略：静默跑全量会让报告比预期多出好几列。
-    """
+    """校验勾选的指标名，空表示全量。拼错的名字报错而不是忽略。"""
     if not selected:
         return sorted(registry.METRIC_REGISTRY)
     unknown = sorted(set(selected) - set(registry.METRIC_REGISTRY))
@@ -61,13 +61,13 @@ def resolve_metrics(selected: list[str] | None) -> list[str]:
 
 
 def _keep(selected: frozenset[str]):
-    """实际指标名带 k（``recall@5``），勾选名不带，比对前要剥掉。"""
+    """判某个实际指标名是否被勾选。实际名带 k（``recall@5``），比对前剥掉。"""
 
     def keep(name: str) -> bool:
         try:
             return registry.get_metric(name).name in selected
         except KeyError:
-            # registry 里没声明的项保留：让它悄悄消失比留着更糟。
+            # registry 里没声明的项保留，不让它悄悄消失。
             return True
 
     return keep
@@ -111,7 +111,7 @@ def evaluate_dataset(
             raise ValueError(
                 f"{dataset}: 样本 {row['sample_id']!r} 有响应但不在这次编译的子集里"
             )
-        # 按 ID 匹配后再比一次问题文本：ID 对得上而内容变了的情况抓不到别的办法。
+        # 按 ID 匹配后再比一次问题文本，抓「ID 对得上而内容变了」。
         if row["question"] != sample["question"]:
             raise ValueError(f"{row['sample_id']}: 响应与子集的问题文本不一致，子集被重建过")
 
@@ -152,7 +152,7 @@ def evaluate_dataset(
             metrics.update(_scalars(detail["attribution"]))
             metrics.update(_scalars(detail["multihop"]))
 
-        # 勾选过滤发生在写库前。detail 保留全部明细 —— 那是归因要读的链路。
+        # 勾选过滤只作用于指标；detail 保留全部明细，供归因读。
         metrics = {name: value for name, value in metrics.items() if keep(name)}
         entry = {
             "sample_id": row["sample_id"],
@@ -175,7 +175,7 @@ def evaluate_dataset(
         if position % 50 == 0 or position == len(responses):
             connection.commit()
             if ctx:
-                ctx.progress(position, len(responses), f"{dataset} {position}/{len(responses)}")
+                ctx.progress(position, len(responses), dataset)
     connection.commit()
 
     knowledge = [e for e in per_sample if e["answer_mode"] == "knowledge"]
@@ -183,7 +183,7 @@ def evaluate_dataset(
     run_store.record_metric_summary(
         connection, eval_id, dataset, "overall", overall, len(per_sample)
     )
-    # 两份口径都要存：差值就是生成端拒答的规模，而不是检索失败。
+    # 两份口径都存，差值即生成端拒答的规模。
     run_store.record_metric_summary(
         connection, eval_id, dataset, "knowledge_only", _aggregate(knowledge), len(knowledge)
     )
@@ -211,7 +211,8 @@ def evaluate_dataset(
 def resolve_provider(
     connection: sqlite3.Connection, provider_id: int | None, role: str
 ) -> JudgeProvider:
-    """从库里取 provider 配置，凑不齐就抛 :class:`JudgeConfigError`。"""
+    """从库里取 provider 配置。没给 id 时取该角色的第一个，凑不齐抛
+    :class:`JudgeConfigError`。"""
     record = config_store.get_provider(connection, provider_id) if provider_id else None
     if record is None:
         candidates = config_store.list_providers(connection, role)
@@ -229,54 +230,103 @@ def resolve_provider(
     )
 
 
-def _judge(ctx: TaskContext, eval_id: int, query_id: int, provider: JudgeProvider) -> None:
-    """跑 faithfulness。**失败该条排除，不记 0** —— 记 0 会让限流伪装成质量差。"""
-    already = run_store.judged_sample_ids(ctx.db, eval_id)
+def _judge_task(
+    metric: str, question: str, answer: str, reference: str, body: dict[str, Any]
+) -> tuple[tuple[str, str], Any] | None:
+    """把一条 judge 指标摊成 ``((system, user), 解析函数)``。
+
+    四个判据的差异收在这里，调用方只有一条路径。返回 ``None`` 表示这一条
+    在这个样本上无定义，应当跳过而不是记 0。
+    """
+    if metric == "faithfulness":
+        prompt = faithfulness.build_prompt(question, answer, body)
+        return (prompt, faithfulness.parse_verdict) if prompt else None
+    if metric == "answer_relevancy":
+        prompt = answer_relevancy.build_prompt(question, answer, body)
+        return (prompt, answer_relevancy.parse_verdict) if prompt else None
+    if metric == "context_relevancy":
+        built = context_relevancy.build_prompt(question, answer, body)
+        if not built:
+            return None
+        system, user, count = built
+        return (system, user), lambda payload: context_relevancy.parse_verdict(payload, count)
+    if metric == "answer_correctness":
+        prompt = answer_correctness.build_prompt(question, answer, reference)
+        return (prompt, answer_correctness.parse_verdict) if prompt else None
+    raise ValueError(f"没有实现 judge 指标 {metric!r}")
+
+
+def _judge(
+    ctx: TaskContext,
+    eval_id: int,
+    query_id: int,
+    provider: JudgeProvider,
+    metrics: list[str],
+) -> None:
+    """逐条 judge 指标跑。失败该条排除，不记 0。"""
+    for metric in metrics:
+        _judge_one(ctx, eval_id, query_id, provider, metric)
+
+
+def _judge_one(
+    ctx: TaskContext, eval_id: int, query_id: int, provider: JudgeProvider, metric: str
+) -> None:
+    # 逐指标问，否则判过 faithfulness 的样本会让 answer_relevancy 整批跳过。
+    already = run_store.judged_sample_ids(ctx.db, eval_id, metric)
     rows = [r for r in run_store.sample_evals(ctx.db, eval_id) if r["sample_id"] not in already]
     if already:
-        ctx.log(f"Judge 续跑：已判 {len(already)} 条，待判 {len(rows)} 条")
+        ctx.log(f"{metric} 续跑：已判 {len(already)} 条，待判 {len(rows)} 条")
+    if not rows:
+        return
 
     with JudgeClient(provider) as client:
         for position, row in enumerate(rows, 1):
             ctx.checkpoint()
             response = run_store.response_of(ctx.db, query_id, row["sample_id"])
             body = (response or {}).get("response") or {}
-            prompt = faithfulness.build_prompt(
-                (response or {}).get("question") or "", row["answer"] or "", body
+            references = (row["detail"] or {}).get("reference_answers") or []
+            task = _judge_task(
+                metric,
+                (response or {}).get("question") or "",
+                row["answer"] or "",
+                references[0] if references else "",
+                body,
             )
-            if prompt is None:
-                # 上下文为空（拒答会清空 retrievedSources），此时指标无定义。
+            if task is None:
+                # 这一条在这个样本上无定义，记 None 并跳过。
                 run_store.record_judge_verdict(
                     ctx.db,
                     eval_id,
                     sample_id=row["sample_id"],
+                    metric=metric,
                     score=None,
                     failure_kind=None,
-                    detail={"skipped": "no retrieved context"},
+                    detail={"skipped": "not applicable to this sample"},
                 )
             else:
+                prompt, parse = task
                 reply = client.complete(*prompt)
                 if reply.failure_kind:
                     run_store.record_judge_verdict(
                         ctx.db,
                         eval_id,
                         sample_id=row["sample_id"],
+                        metric=metric,
                         score=None,
                         failure_kind=reply.failure_kind,
+                        latency_ms=reply.latency_ms,
                         detail={"raw": (reply.raw or "")[:500]},
                     )
                 else:
                     try:
-                        score, reasoning = faithfulness.parse_verdict(
-                            parse_json_object(reply.content or "")
-                        )
+                        score, reasoning = parse(parse_json_object(reply.content or ""))
                     except ValueError as exc:
-                        # 模型没按 schema 输出。**不猜分数** —— 那会把
-                        # 「prompt 不听话」伪装成「答案不忠实」。
+                        # 模型没按 schema 输出，记 parse_error 而不是猜一个分数。
                         run_store.record_judge_verdict(
                             ctx.db,
                             eval_id,
                             sample_id=row["sample_id"],
+                            metric=metric,
                             score=None,
                             failure_kind="parse_error",
                             detail={"error": str(exc)[:300]},
@@ -286,6 +336,7 @@ def _judge(ctx: TaskContext, eval_id: int, query_id: int, provider: JudgeProvide
                             ctx.db,
                             eval_id,
                             sample_id=row["sample_id"],
+                            metric=metric,
                             score=score,
                             failure_kind=None,
                             detail=reasoning,
@@ -300,26 +351,27 @@ def _judge(ctx: TaskContext, eval_id: int, query_id: int, provider: JudgeProvide
                                 http_status=row["http_status"],
                                 answer=row["answer"] or "",
                                 detail=row["detail"],
-                                metrics={"faithfulness": score},
+                                metrics={metric: score},
                             )
             ctx.db.commit()
             if position % 5 == 0 or position == len(rows):
-                ctx.progress(position, len(rows), f"Judge {position}/{len(rows)}")
+                ctx.progress(position, len(rows), metric)
 
-    summary = run_store.judge_summary(ctx.db, eval_id)
-    for dataset, mean, count in run_store.judge_means_by_dataset(ctx.db, eval_id):
+    summary = run_store.judge_summary(ctx.db, eval_id, metric)
+    for dataset, mean, count in run_store.judge_means_by_dataset(ctx.db, eval_id, metric):
         run_store.record_metric_summary(
-            ctx.db, eval_id, dataset, "judge", {"faithfulness": mean}, count
+            ctx.db, eval_id, dataset, "judge", {metric: mean}, count
         )
     ctx.db.commit()
     ctx.log(
-        f"faithfulness 均值 {summary['mean']}，已评分 {summary['scored']}，"
+        f"{metric} 均值 {summary['mean']}，已评分 {summary['scored']}，"
         f"失败率 {summary['failure_rate']:.3f}"
     )
     if summary["failure_rate"] > MAX_JUDGE_FAILURE_RATE:
         raise RuntimeError(
-            f"Judge 失败率 {summary['failure_rate']:.3f} 超过 {MAX_JUDGE_FAILURE_RATE}。"
-            f"均值只覆盖成功的那部分，已不代表整体。失败类型：{summary['failures_by_kind']}"
+            f"{metric} 的 Judge 失败率 {summary['failure_rate']:.3f} 超过 "
+            f"{MAX_JUDGE_FAILURE_RATE}。均值只覆盖成功的那部分，已不代表整体。"
+            f"失败类型：{summary['failures_by_kind']}"
         )
 
 
@@ -401,8 +453,13 @@ def run(ctx: TaskContext) -> None:
                 )
 
         if provider is not None:
-            ctx.log(f"执行 Judge：{provider.model}")
-            _judge(ctx, eval_id, query_id, provider)
+            judge_metrics = [
+                name
+                for name in metrics
+                if registry.get_metric(name).kind == registry.KIND_JUDGE
+            ]
+            ctx.log(f"执行 Judge：{provider.model}，指标 {judge_metrics}")
+            _judge(ctx, eval_id, query_id, provider, judge_metrics)
     except BaseException:
         run_store.set_eval_status(
             ctx.db,

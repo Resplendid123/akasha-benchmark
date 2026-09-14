@@ -44,7 +44,7 @@ def list_datasets(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def delete_dataset(connection: sqlite3.Connection, name: str) -> int:
-    """删归一化产物。已被编译层引用时拒绝 —— 那会连带删掉编译与其下游。"""
+    """删归一化产物。已被编译层引用时拒绝，否则会连带删掉编译与其下游。"""
     used = connection.execute(
         "SELECT COUNT(*) AS n FROM compile_sample WHERE dataset = ?", (name,)
     ).fetchone()["n"]

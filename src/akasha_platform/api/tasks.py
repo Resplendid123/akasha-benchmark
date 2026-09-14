@@ -1,10 +1,7 @@
 """任务层：起、暂停、继续、清理，以及增量日志。
 
-「暂停」是协作式的：阶段跑到下一个可续跑的边界才停，所以停下的位置总是
-已落库的。「继续」用同一条任务记录重跑，阶段自己跳过已完成的部分。
-
-注意暂停编译的语义是「不再往下走了」—— 已经提交给 Akasha 的编译在它的
-BullMQ worker 里，不会因此停止。
+暂停是协作式的，停下的位置总是已落库的；继续用同一条任务记录重跑。
+注意暂停编译只是「不再往下走」，已提交给 Akasha 的编译不会因此停止。
 """
 
 from __future__ import annotations
@@ -48,11 +45,7 @@ def task_detail(request: Request, task_id: int, after_id: int = 0) -> dict[str, 
 
 @router.post("/chain")
 def start_chain(request: Request, args: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """起一条链路测试：编译到归因四条普通任务，前一条成功时自动接上后一条。
-
-    路由排在 ``/tasks/{stage}`` 之前无关紧要 —— 它不在 ``/tasks`` 下面，
-    正因为链路测试不是一个阶段。
-    """
+    """起一条链路测试：编译到归因四条普通任务，前一条成功时自动接上后一条。"""
     try:
         return runner_of(request).start_chain(args)
     except TaskRejected as exc:
@@ -88,7 +81,7 @@ def resume_task(request: Request, task_id: int) -> dict[str, Any]:
 
 @router.delete("/tasks/{task_id}")
 def cleanup_task(request: Request, task_id: int) -> dict[str, Any]:
-    """删一条任务记录。审计日志保留。在跑的任务不许删 —— 先暂停。"""
+    """删一条任务记录，审计日志保留。在跑的任务不许删，先暂停。"""
     try:
         return runner_of(request).cleanup(task_id)
     except TaskRejected as exc:
@@ -108,6 +101,6 @@ def cleanup_inactive(request: Request) -> dict[str, Any]:
 def audit(
     request: Request, stage: str | None = None, limit: int = Query(200, le=2000)
 ) -> list[dict[str, Any]]:
-    """审计日志。**只追加，清理任务不删它** —— 所以任务记录清掉之后仍然查得到。"""
+    """审计日志。只追加，清理任务不删它。"""
     with db(request) as connection:
         return task_store.audit_logs(connection, stage=stage, limit=limit)

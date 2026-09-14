@@ -1,7 +1,6 @@
 """任务与审计日志。
 
-审计日志只追加：清理任务删 ``task`` 行，但 ``audit_log`` 保留，
-所以「这批产物是谁在什么时候跑出来的」在清理之后仍然查得到。
+审计日志只追加：清理任务删 ``task`` 行，``audit_log`` 保留。
 """
 
 from __future__ import annotations
@@ -137,7 +136,7 @@ def active_tasks(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def delete_task(connection: sqlite3.Connection, task_id: int) -> int:
-    """删任务记录。在跑的不许删 —— 那会留下一个没人认领的线程还在写库。"""
+    """删任务记录。在跑的不许删，否则会留下一个没人认领的线程还在写库。"""
     row = connection.execute("SELECT status FROM task WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return 0

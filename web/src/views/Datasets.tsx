@@ -17,7 +17,7 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
 
   const names = data.datasets.map((d) => d.name)
   const targets = selected.length ? selected : names
-  // 全部就绪就不必再看下载那一栏；想重下由「重新下载」显式打开。
+  // 全部就绪时收起下载栏，由「重新下载」显式打开。
   const allReady = data.datasets.every((d) => d.files_ready)
 
   return (
@@ -134,7 +134,7 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
   )
 }
 
-/** 原始样例，一页一条。刻意不走适配器：这里要回答的是「上游给的是什么」。 */
+/** 原始样例，一页一条，不走适配器。 */
 function RawPreview({ dataset, kind }: { dataset: string; kind: 'qa' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
   const limit = 1

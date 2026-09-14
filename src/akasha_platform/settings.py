@@ -28,8 +28,7 @@ class Settings:
     def validate_binding(self) -> None:
         """绑非回环地址且没有令牌时拒绝启动。
 
-        这个服务能启动长任务、持有 Akasha 管理员凭据、并读一个只读数据库。
-        把它暴露到 0.0.0.0 而不设认证等于把这三样一起交出去。
+        这个服务持有 Akasha 管理员凭据并能启动长任务，不能不设认证就暴露出去。
         """
         if not self.is_loopback() and not self.auth_token:
             raise RuntimeError(
@@ -57,7 +56,6 @@ def load_settings() -> Settings:
         host=env("HOST", "127.0.0.1"),
         port=int(env("PORT", "8848")),
         db_path=Path(env("DB", str(DEFAULT_DB_PATH))),
-        # 绑非回环但没给令牌时不悄悄生成一个 —— 那样用户不知道令牌是什么,
-        # 服务却「看起来」启动成功了。让 validate_binding 报错。
+        # 缺令牌时不代生成一个，交给 validate_binding 报错。
         auth_token=env("AUTH_TOKEN"),
     )

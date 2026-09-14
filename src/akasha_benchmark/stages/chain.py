@@ -1,11 +1,9 @@
 """链路测试：用极小样本把编译到归因四层各跑成一条真实任务。
 
-不是第七个阶段 —— 它就是 compile/query/evaluate/attribute 四条普通任务，
-由运行器按顺序推进，所以任务列表里看到的是四行常规阶段，
-每一层的进度、日志、产物归属都和手动起的任务一样。
+不是第七个阶段，而是 compile/query/evaluate/attribute 四条普通任务，
+由运行器按顺序推进，进度、日志、产物归属都和手动起的任务一样。
 
-每一步收尾时校验一次契约（``VERIFY``）。契约不成立就让那条任务失败并断链,
-这样「链路测试通过」不是一句日志，而是四条任务都成功。
+每一步收尾时校验一次契约（``VERIFY``），不成立就让那条任务失败并断链。
 """
 
 from __future__ import annotations
@@ -15,10 +13,9 @@ from typing import Any
 
 from ..datasets import DATASET_NAMES
 from ..store import data_store, run_store
-from . import compile_stage
+from . import compile
 
-# 链路测试只用有 gold 标注的三组：narrativeqa 没有 gold，检索族指标全省略，
-# 那样测不到指标计算这一段。
+# 只用有 gold 标注的三组，否则检索族指标全省略，测不到指标计算那一段。
 DATASETS = ("hotpotqa", "2wikimultihopqa", "musique")
 MAX_SAMPLES = 3
 DEFAULT_METRICS = ("recall", "hit", "em", "f1", "citation_recall")
@@ -67,7 +64,7 @@ def _check_attribute(connection, attribution_id: int) -> None:
         raise RuntimeError("归因没有产出结论")
 
 
-# 每一步成功之后校验它的产物。键是阶段名，值收 (连接, 产物 id)。
+# 阶段名 -> 校验函数，签名是 (连接, 产物 id)。
 VERIFY = {
     "query": _check_query,
     "evaluate": _check_evaluate,
@@ -106,7 +103,7 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
                 "datasets": [dataset],
                 "qa_limit": samples,
                 "negatives_ratio": 1.0,
-                "seed": params.get("seed") or compile_stage.default_seed(),
+                "seed": params.get("seed") or compile.default_seed(),
             },
         },
         {"stage": "query", "link": "compile_id", "params": {"name": f"{run_id}-q"}},
@@ -118,7 +115,7 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
                 "name": f"{run_id}-a",
                 "metric": "recall@5",
                 "sample_limit": samples,
-                # 归因模型可选：规则判据在没配模型时也出结果。
+                # 模型可选：规则判据在没配模型时也出结果。
                 "use_model": bool(params.get("use_model", False)),
                 "provider_id": params.get("provider_id"),
             },

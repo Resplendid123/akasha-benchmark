@@ -1,9 +1,8 @@
 """阶段与任务运行器之间的契约。
 
 阶段拿到一个 :class:`TaskContext`，用它写日志、报进度、检查暂停。
-「暂停」是协作式的：在每个可续跑的边界调 :meth:`TaskContext.checkpoint`,
-它在被请求暂停时抛 :class:`Paused`。这样暂停总是停在一个已落库的位置上,
-继续时接着跑而不是重来。
+暂停是协作式的：阶段在每个可续跑的边界调 :meth:`TaskContext.checkpoint`，
+它在被请求暂停时抛 :class:`Paused`，所以暂停总停在已落库的位置上。
 """
 
 from __future__ import annotations
@@ -16,8 +15,7 @@ from typing import Any, Protocol
 class Paused(BaseException):
     """请求暂停时由 checkpoint 抛出。
 
-    继承 BaseException 而不是 Exception：阶段里到处都有
-    ``except Exception`` 的逐项容错，那些不该把暂停吞掉。
+    继承 BaseException 而不是 Exception，免得被阶段里的 ``except Exception`` 吞掉。
     """
 
 
@@ -72,20 +70,6 @@ class TaskContext:
 
         task_store.set_task_target(self.db, self.task_id, kind, target_id)
         self.db.commit()
-
-    def derive(self, params: dict[str, Any]) -> TaskContext:
-        """换一组参数，其余照旧。链路测试串联各阶段时用它。
-
-        暂停信号是同一个 —— 否则暂停链路测试只会停在它自己的 checkpoint 上,
-        而里面那个阶段还在跑。
-        """
-        return TaskContext(
-            task_id=self.task_id,
-            stage=self.stage,
-            params=params,
-            connection=self.db,
-            pause_event=self._pause,
-        )
 
 
 class Stage(Protocol):

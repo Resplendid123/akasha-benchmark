@@ -1,7 +1,7 @@
 """编译 / 查询 / 评测 / 归因四层的存取。
 
-每层一张主表加若干产物表，产物表全部 ``ON DELETE CASCADE``：
-删主表那一行就是这一层的清理。
+每层一张主表加若干产物表，产物表全部 ``ON DELETE CASCADE``，
+所以删主表那一行就是这一层的清理。
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ def update_compile_run(connection: sqlite3.Connection, compile_id: int, **fields
         "workspace_id",
         "model_configs_json",
         "quality_json",
+        "pace_json",
         "status",
         "finished_at",
     }
@@ -86,7 +87,7 @@ def replace_compile_subset(
     sample_ids: list[str],
     docs: list[dict[str, Any]],
 ) -> None:
-    """写入一个数据集的子集。重抽样先删旧行，否则残留会被一起导入。"""
+    """写入一个数据集的子集。重抽样先删旧行，免得残留被一起导入。"""
     connection.execute(
         "DELETE FROM compile_sample WHERE compile_id = ? AND dataset = ?", (compile_id, dataset)
     )
@@ -164,7 +165,7 @@ def record_page(
 def page_to_doc(
     connection: sqlite3.Connection, compile_id: int, dataset: str
 ) -> dict[str, str]:
-    """``page_id -> doc_id``。评测把响应里的 sourcePageId 反查回语料文档靠它。"""
+    """``page_id -> doc_id``，供评测把响应里的 sourcePageId 反查回语料文档。"""
     return {
         row["page_id"]: row["doc_id"]
         for row in connection.execute(
@@ -201,19 +202,14 @@ def workspace_mismatch(
 ) -> str | None:
     """这次编译的空间是否还在当前连接解析出的 workspace 里。不一致时返回原因。
 
-    判据必须是**服务端刚解析出的** workspace（``users/me`` 的响应），不是任何配置项：
-    自建部署走 ``workspaceRepo.findFirst()``，所以它由那边决定。
-
-    不比的代价是实际的。改了 base_url 或换了账号之后，这一层的 page_id 只在原来的
-    workspace 里有意义 —— 查询打到一个解析不到的空间上**不会报错**，只会每条都召回
-    不到，给出一份 recall 全 0 的报告。而那看起来像检索烂到极点，不像配置指向了别处。
+    ``resolved_workspace_id`` 取 ``users/me`` 的响应，不是配置项。
+    不一致时查询不报错，只会每条都召回不到。
     """
     run = get_compile_run(connection, compile_id)
     if run is None:
         return f"编译 #{compile_id} 不存在"
     recorded = run["workspace_id"]
-    # 编译时没记下 workspace（历史数据）时不拦：没有可比的东西，
-    # 而凭空拒绝执行比漏一道检查更糟。
+
     if not recorded or not resolved_workspace_id:
         return None
     if recorded == resolved_workspace_id:
@@ -227,7 +223,7 @@ def workspace_mismatch(
 
 
 def compile_ready(connection: sqlite3.Connection, compile_id: int) -> dict[str, Any]:
-    """能不能拿这次编译去查询。半成品索引会产出一份看着合理的坏报告。"""
+    """能不能拿这次编译去查询，返回 ``{ready, reasons}``。"""
     run = get_compile_run(connection, compile_id)
     if run is None:
         return {"ready": False, "reasons": ["编译记录不存在"]}
@@ -317,7 +313,7 @@ def delete_query_run(connection: sqlite3.Connection, query_id: int) -> int:
 def freeze_query_samples(
     connection: sqlite3.Connection, query_id: int, samples: list[dict[str, Any]]
 ) -> None:
-    """固化这一轮要问哪些样本。续跑据此算待办，不受后续抽样改动影响。"""
+    """固化这一轮要问哪些样本，续跑据此算待办。"""
     connection.executemany(
         "INSERT OR IGNORE INTO query_sample (query_id, sample_id, dataset) VALUES (?, ?, ?)",
         [(query_id, s["sample_id"], s["dataset"]) for s in samples],
@@ -334,7 +330,7 @@ def query_samples(connection: sqlite3.Connection, query_id: int) -> list[dict[st
 
 
 def pending_query_samples(connection: sqlite3.Connection, query_id: int) -> list[dict[str, Any]]:
-    """待问的样本 = 固化选择 - 已落库响应。这就是续跑的依据。"""
+    """待问的样本 = 固化选择 - 已落库响应，即续跑的依据。"""
     return [
         dict(r)
         for r in connection.execute(
@@ -425,7 +421,7 @@ def response_of(
 
 
 def delete_failed_responses(connection: sqlite3.Connection, query_id: int) -> int:
-    """删失败行让它们重试。成功的保留，所以重跑不会重复消耗。"""
+    """删失败行让它们重试，成功的保留。"""
     return connection.execute(
         "DELETE FROM query_response WHERE query_id = ? "
         "AND (http_status < 200 OR http_status >= 300)",
@@ -523,7 +519,7 @@ def delete_eval_run(connection: sqlite3.Connection, eval_id: int) -> int:
 
 
 def clear_eval_results(connection: sqlite3.Connection, eval_id: int, dataset: str) -> None:
-    """重算一个数据集前先清它的旧结果，否则汇总会把两轮混在一起。"""
+    """重算一个数据集前先清它的旧结果，免得汇总把两轮混在一起。"""
     for table in ("sample_metric", "sample_eval", "metric_summary", "dataset_eval"):
         connection.execute(
             f"DELETE FROM {table} WHERE eval_id = ? AND dataset = ?", (eval_id, dataset)
@@ -705,7 +701,7 @@ def samples_ranked_by(
     ascending: bool = True,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """按某个指标排序的样本。归因层的「最差 N 条」入口。"""
+    """按某个指标排序的样本，即归因层的「最差 N 条」。"""
     sql = """
         SELECT sm.sample_id, sm.dataset, sm.value, se.answer_mode, se.answer
         FROM sample_metric sm
@@ -729,27 +725,42 @@ def record_judge_verdict(
     score: float | None,
     failure_kind: str | None,
     detail: dict[str, Any] | None,
+    metric: str = "faithfulness",
+    latency_ms: int | None = None,
 ) -> None:
     connection.execute(
         """
-        INSERT INTO judge_verdict (eval_id, sample_id, score, failure_kind, detail_json)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(eval_id, sample_id) DO UPDATE SET
+        INSERT INTO judge_verdict
+            (eval_id, sample_id, metric, score, failure_kind, latency_ms, detail_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(eval_id, sample_id, metric) DO UPDATE SET
             score = excluded.score,
             failure_kind = excluded.failure_kind,
+            latency_ms = excluded.latency_ms,
             detail_json = excluded.detail_json
         """,
-        (eval_id, sample_id, score, failure_kind, dumps(detail) if detail else None),
+        (
+            eval_id,
+            sample_id,
+            metric,
+            score,
+            failure_kind,
+            latency_ms,
+            dumps(detail) if detail else None,
+        ),
     )
 
 
-def judged_sample_ids(connection: sqlite3.Connection, eval_id: int) -> set[str]:
-    return {
-        row["sample_id"]
-        for row in connection.execute(
-            "SELECT sample_id FROM judge_verdict WHERE eval_id = ?", (eval_id,)
-        )
-    }
+def judged_sample_ids(
+    connection: sqlite3.Connection, eval_id: int, metric: str | None = None
+) -> set[str]:
+    """已判过的样本。``metric`` 为空时不分指标；续跑要逐指标问。"""
+    sql = "SELECT sample_id FROM judge_verdict WHERE eval_id = ?"
+    params: list[Any] = [eval_id]
+    if metric is not None:
+        sql += " AND metric = ?"
+        params.append(metric)
+    return {row["sample_id"] for row in connection.execute(sql, params)}
 
 
 def judge_verdicts(connection: sqlite3.Connection, eval_id: int) -> list[dict[str, Any]]:
@@ -763,53 +774,64 @@ def judge_verdicts(connection: sqlite3.Connection, eval_id: int) -> list[dict[st
 
 
 def judge_means_by_dataset(
-    connection: sqlite3.Connection, eval_id: int
+    connection: sqlite3.Connection, eval_id: int, metric: str | None = None
 ) -> list[tuple[str, float, int]]:
-    """各数据集的 judge 均值。只算有分数的那些，跳过与失败的不进分母。"""
+    """各数据集的 judge 均值。跳过与失败的不进分母。"""
+    sql = """
+        SELECT se.dataset, AVG(jv.score) AS mean, COUNT(*) AS n
+        FROM judge_verdict jv
+        JOIN sample_eval se ON se.eval_id = jv.eval_id AND se.sample_id = jv.sample_id
+        WHERE jv.eval_id = ? AND jv.score IS NOT NULL
+    """
+    params: list[Any] = [eval_id]
+    if metric is not None:
+        sql += " AND jv.metric = ?"
+        params.append(metric)
     return [
         (row["dataset"], row["mean"], row["n"])
         for row in connection.execute(
-            """
-            SELECT se.dataset, AVG(jv.score) AS mean, COUNT(*) AS n
-            FROM judge_verdict jv
-            JOIN sample_eval se ON se.eval_id = jv.eval_id AND se.sample_id = jv.sample_id
-            WHERE jv.eval_id = ? AND jv.score IS NOT NULL
-            GROUP BY se.dataset ORDER BY se.dataset
-            """,
-            (eval_id,),
+            sql + " GROUP BY se.dataset ORDER BY se.dataset", params
         )
     ]
 
 
-def judge_summary(connection: sqlite3.Connection, eval_id: int) -> dict[str, Any]:
-    """judge 汇总。**失败该条排除，不记 0** —— 记 0 会让限流伪装成质量差。
-
-    所以另叠失败率：排除得太多时那个均值就不代表整体了。
-    """
+def judge_summary(
+    connection: sqlite3.Connection, eval_id: int, metric: str | None = None
+) -> dict[str, Any]:
+    """judge 汇总。失败该条排除、不记 0，另给失败率说明均值覆盖了多少。"""
+    scope = "" if metric is None else " AND metric = ?"
+    extra: list[Any] = [] if metric is None else [metric]
     row = connection.execute(
-        """
+        f"""
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN score IS NOT NULL THEN 1 ELSE 0 END) AS scored,
                SUM(CASE WHEN failure_kind IS NOT NULL THEN 1 ELSE 0 END) AS failed,
                AVG(score) AS mean
-        FROM judge_verdict WHERE eval_id = ?
+        FROM judge_verdict WHERE eval_id = ?{scope}
         """,
-        (eval_id,),
+        (eval_id, *extra),
     ).fetchone()
     total = row["total"] or 0
     kinds = {
         r["failure_kind"]: r["n"]
         for r in connection.execute(
             "SELECT failure_kind, COUNT(*) AS n FROM judge_verdict "
-            "WHERE eval_id = ? AND failure_kind IS NOT NULL GROUP BY failure_kind",
-            (eval_id,),
+            f"WHERE eval_id = ? AND failure_kind IS NOT NULL{scope} GROUP BY failure_kind",
+            (eval_id, *extra),
         )
     }
+    # 只算真发过调用的条目：跳过的没有 latency。
+    latency = connection.execute(
+        "SELECT AVG(latency_ms) AS mean FROM judge_verdict "
+        f"WHERE eval_id = ? AND latency_ms IS NOT NULL{scope}",
+        (eval_id, *extra),
+    ).fetchone()
     return {
         "total": total,
         "scored": row["scored"] or 0,
         "failed": row["failed"] or 0,
         "mean": row["mean"],
+        "latency_mean": latency["mean"],
         "failure_rate": (row["failed"] or 0) / total if total else 0.0,
         "failures_by_kind": kinds,
     }
@@ -892,17 +914,20 @@ def record_attribution(
     evidence: dict[str, Any],
     narrative: str | None,
     rule_based: bool,
+    latency_ms: int | None = None,
 ) -> None:
     connection.execute(
         """
         INSERT INTO attribution_result
-            (attribution_id, sample_id, dataset, root_cause, evidence_json, narrative, rule_based)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (attribution_id, sample_id, dataset, root_cause, evidence_json,
+             narrative, rule_based, latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(attribution_id, sample_id) DO UPDATE SET
             root_cause = excluded.root_cause,
             evidence_json = excluded.evidence_json,
             narrative = excluded.narrative,
-            rule_based = excluded.rule_based
+            rule_based = excluded.rule_based,
+            latency_ms = excluded.latency_ms
         """,
         (
             attribution_id,
@@ -912,6 +937,7 @@ def record_attribution(
             dumps(evidence),
             narrative,
             int(rule_based),
+            latency_ms,
         ),
     )
 

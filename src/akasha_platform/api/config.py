@@ -1,8 +1,4 @@
-"""配置层：Akasha 连接、它那边的模型配置、本地 judge / 归因端点。
-
-配置全部收在这一处。原先编译模型配置在编译层，那让「改一个模型要去哪」
-取决于它属于哪一层 —— 而用户想的是「我要改配置」。
-"""
+"""配置层：Akasha 连接、它那边的模型配置、本地 judge / 归因端点。"""
 
 from __future__ import annotations
 
@@ -11,7 +7,9 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from akasha_benchmark.akasha_client import AkashaClient, AkashaError
+from akasha_benchmark.judge import JudgeClient, JudgeConfigError
 from akasha_benchmark.model_configs import FEATURES, drift
+from akasha_benchmark.stages.evaluate import resolve_provider
 from akasha_benchmark.store import config_store, loads, run_store
 
 from ._common import config_of, db, writable
@@ -21,7 +19,7 @@ router = APIRouter(prefix="/api")
 
 @router.get("/connection")
 def get_connection(request: Request) -> dict[str, Any]:
-    """那一份 Akasha 连接配置。密码原样回显 —— 库里存的是明文，UI 直接读写。"""
+    """那一份 Akasha 连接配置，连同各次编译的空间。密码原样回显。"""
     with db(request) as connection:
         row = config_store.get_connection_row(connection)
         compiles = [
@@ -39,7 +37,7 @@ def get_connection(request: Request) -> dict[str, Any]:
 
 @router.put("/connection")
 def put_connection(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """改连接配置。**只写提交了的字段**，没出现的保持原值，显式传空串即清空。"""
+    """改连接配置。只写提交了的字段，没出现的保持原值，传空串即清空。"""
     try:
         fields = config_store.sanitize_connection(payload)
     except ValueError as exc:
@@ -51,10 +49,10 @@ def put_connection(request: Request, payload: dict[str, Any] = Body(...)) -> dic
 
 @router.post("/connection/test")
 def test_connection(request: Request) -> dict[str, Any]:
-    """登录 + 取当前用户 + 拉模型配置。
+    """登录 + 取当前用户 + 拉模型配置，并预检 owner 角色与各次编译的 workspace。
 
-    OWNER 那一项不是可选检查：非 OWNER 会在第三道授权闸门**静默丢弃 chunk**，
-    症状看起来像召回质量差 —— 在这里报出来比跑完一批编译再从指标里猜便宜得多。
+    owner 那一项不是可选检查：非 owner 会在授权闸门静默丢弃 chunk，
+    症状看起来像召回质量差。
     """
     config = config_of(request)
     try:
@@ -76,8 +74,7 @@ def test_connection(request: Request) -> dict[str, Any]:
     workspace = (me or {}).get("workspace") or {}
     role = user.get("role")
 
-    # 拿刚解析出的 workspace 去比已有的编译。这是一次**预检** —— 同一道判据
-    # compile / query 在登录后也会走，但在这里先说出来，用户不必等起了任务才发现。
+    # 同一道判据 compile / query 在登录后也会走，这里先说出来。
     with db(request) as connection:
         blocked = []
         for row in run_store.list_compile_runs(connection):
@@ -90,7 +87,7 @@ def test_connection(request: Request) -> dict[str, Any]:
     return {
         "ok": True,
         "user": {"id": user.get("id"), "email": user.get("email"), "role": role},
-        # workspace 由服务端解析（自建部署走 workspaceRepo.findFirst()），只读。
+        # workspace 由服务端解析，只读。
         "workspace": {"id": workspace.get("id"), "name": workspace.get("name")},
         "is_owner": role == "owner",
         # 这些编译在当前连接下用不了。
@@ -107,10 +104,7 @@ def test_connection(request: Request) -> dict[str, Any]:
 
 @router.get("/model-configs")
 def get_model_configs(request: Request) -> dict[str, Any]:
-    """Akasha 的 compiler / embedding / answer / image 四项配置。
-
-    同时给出各次编译的快照比对：「现在的配置与那次编译是否一致」一个响应里就能看出来。
-    """
+    """Akasha 的四项模型配置，连同各次编译的快照比对。"""
     config = config_of(request)
     try:
         config.require_credentials()
@@ -142,11 +136,9 @@ def get_model_configs(request: Request) -> dict[str, Any]:
 def put_model_config(
     request: Request, feature: str, payload: dict[str, Any] = Body(...)
 ) -> dict[str, Any]:
-    """改 Akasha 的某一项模型配置。**改的是那个部署，不是本平台。**
+    """改 Akasha 的某一项模型配置。改的是那个部署，不是本平台。
 
-    ``provider`` 不进表单：Akasha 的 CHECK 约束只允许 ``openai-compatible``
-    一个取值，让人填一个没有选择的字段只会填错。这里补上，免得 PUT 因为
-    缺必填字段被拒。
+    ``provider`` 不进表单（只有一个合法取值），在这里补上，免得 PUT 缺必填字段。
     """
     if feature not in FEATURES:
         raise HTTPException(422, f"未知配置项 {feature!r}；可用：{list(FEATURES)}")
@@ -176,7 +168,7 @@ def put_model_config(
 
 @router.get("/providers")
 def list_providers(request: Request, role: str | None = None) -> list[dict[str, Any]]:
-    """judge / 归因端点。**响应里没有 api_key**，只有它是否已设置。"""
+    """judge / 归因端点。响应里没有 api_key，只有它是否已设置。"""
     if role is not None and role not in config_store.ROLES:
         raise HTTPException(422, f"role 必须是 {list(config_store.ROLES)} 之一")
     with db(request) as connection:
@@ -194,11 +186,8 @@ def list_providers(request: Request, role: str | None = None) -> list[dict[str, 
 def put_provider(
     request: Request, role: str, payload: dict[str, Any] = Body(...)
 ) -> dict[str, Any]:
-    """存一个端点。
-
-    带 ``id`` 是改那一条（可以改 label）；不带是按 label 认行。``api_key`` 为空时
-    保留现有密钥。
-    """
+    """存一个端点。带 ``id`` 是改那一条（可改 label），不带是按 label 认行。
+    ``api_key`` 为空时保留现有密钥。"""
     if role not in config_store.ROLES:
         raise HTTPException(422, f"role 必须是 {list(config_store.ROLES)} 之一")
     label = str(payload.get("label") or "default").strip()
@@ -217,7 +206,7 @@ def put_provider(
         by_id = {int(row["id"]): row for row in rows}
         if provider_id is not None and provider_id not in by_id:
             raise HTTPException(404, f"{role} 端点 #{provider_id} 不存在")
-        # 改名撞上另一条：拒绝，否则那一条会被覆盖掉。
+        # 改名撞上另一条时拒绝，否则那一条会被覆盖掉。
         clash = next((r for r in rows if r["label"] == label and int(r["id"]) != provider_id), None)
         if clash is not None and provider_id is not None:
             raise HTTPException(409, f"{role} 下已经有一个叫 {label!r} 的端点")
@@ -238,6 +227,40 @@ def put_provider(
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, str(exc)) from exc
     return {"id": provider_id, "role": role, "label": label, "api_key_set": bool(api_key)}
+
+
+@router.post("/providers/{provider_id}/probe")
+def probe_provider(request: Request, provider_id: int) -> dict[str, Any]:
+    """真调一次这个端点，回模型说了什么或它为什么失败。
+
+    密钥从库里取而不经前端。失败不抛 500：调不通是这个接口要报告的结果。
+    """
+    with db(request) as connection:
+        record = config_store.get_provider(connection, provider_id)
+        if record is None:
+            raise HTTPException(404, f"端点 #{provider_id} 不存在")
+        try:
+            provider = resolve_provider(connection, provider_id, record["role"])
+        except JudgeConfigError as exc:
+            return {"ok": False, "failure": "config", "detail": str(exc)}
+
+    with JudgeClient(provider) as client:
+        # prompt 里必须出现 "json"：有些 provider 以此为 json_object 格式的前提，
+        # 裸一句 hi 会被它们判 400，而那是探测本身的问题。
+        reply = client.complete(
+            "You reply with a single JSON object.",
+            'hi — reply as JSON: {"reply": "<your greeting>"}',
+        )
+
+    return {
+        "ok": reply.failure_kind is None,
+        "failure": reply.failure_kind,
+        "status": reply.status,
+        "reply": (reply.content or "")[:400],
+        # 失败时留一段原文，provider 的报错通常只在这里说得清楚。
+        "detail": None if reply.failure_kind is None else (reply.raw or "")[:600],
+        "provider": provider.redacted(),
+    }
 
 
 @router.delete("/providers/{provider_id}")

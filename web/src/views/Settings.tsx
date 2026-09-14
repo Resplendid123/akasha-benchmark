@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
 import { api, getToken, setToken } from '../api'
-import type { Connection, ConnectionTest, ModelConfig, Provider } from '../types'
+import type {
+  Connection,
+  ConnectionTest,
+  ModelConfig,
+  Provider,
+  ProviderProbe,
+} from '../types'
 import { Failed, Field, Loading, Pass, SecretField, useAction, useAsync } from '../ui'
 
 /** 配置层：Akasha 连接、它那边的模型配置、本地 judge / 归因端点。 */
@@ -17,7 +23,7 @@ export function Settings() {
   )
 }
 
-/** 令牌不对时 health 是 401，所以请求失败也要显示这一段 —— 否则没有地方改它。 */
+/** 访问令牌。health 返回 401 时也要显示这一段，否则没有地方改它。 */
 function AccessToken() {
   const [saved, setSaved] = useState(getToken())
   const [value, setValue] = useState(saved)
@@ -62,7 +68,7 @@ function AccessToken() {
   )
 }
 
-// 数值字段各自的下限。间隔可以是 0（不等待），超时与并发不行。
+// 各数值字段的下限。间隔可以是 0，超时与并发不行。
 const NUMBER_FIELDS = [
   ['timeout_seconds', '请求超时（秒）', 1],
   ['concurrency', '默认并发', 1],
@@ -73,7 +79,7 @@ const NUMBER_FIELDS = [
 
 type Form = Record<string, string>
 
-/** 数值也按字符串存：清空输入框要能留着空，不能悄悄变成 0。 */
+/** 数值也按字符串存，这样清空输入框能留着空而不变成 0。 */
 function toForm(data: Connection): Form {
   const { compiles: _compiles, updated_at: _updated, ...rest } = data
   return Object.fromEntries(Object.entries(rest).map(([key, value]) => [key, String(value)]))
@@ -97,7 +103,7 @@ function ConnectionForm() {
   if (error) return <Failed error={error} />
   if (!data) return null
 
-  // 改过之后原来的保存结果与测试结论都不再对应当前表单。
+  // 表单一改就清掉旧的保存结果与测试结论，它们不再对应当前表单。
   const set = (key: string, value: string) => {
     setForm((f) => ({ ...f, [key]: value }))
     save.reset()
@@ -245,17 +251,14 @@ const REBUILD = ['compiler', 'embedding']
 
 const BLANK_CONFIG = { model: '', baseUrl: '', apiKey: '' }
 
-/** 四项配置一张表，与 judge / 归因同一套：点「编辑」在下方展开表单。
- *
- * 没有新建与删除 —— 这四项是 Akasha 固定的 feature，只能改，不能增删。
- */
+/** 四项配置一张表，点「编辑」在下方展开表单。没有新建与删除，只能改。 */
 function ModelConfigs() {
   const { data, error, loading, reload } = useAsync(() => api.modelConfigs(), [])
   const [editing, setEditing] = useState<string | null>(null)
   const [form, setForm] = useState(BLANK_CONFIG)
   const save = useAction<{ impact: string; requires_new_compile: boolean }>()
 
-  // 保存后会 reload：只在首次加载时让位给 Loading，否则表格会连同刚出的结果一起闪掉。
+  // 只在首次加载时让位给 Loading，否则保存后的 reload 会让结果一起闪掉。
   if (loading && !data) return <Loading what="模型配置" />
   if (error)
     return (
@@ -288,7 +291,7 @@ function ModelConfigs() {
     save.reset()
   }
 
-  // 密钥留空且模型与 base_url 没动，这次保存什么也不会改。
+  // 密钥留空且模型与 base_url 没动时，这次保存改不了任何东西。
   const dirty =
     form.apiKey !== '' ||
     form.model !== (entry?.model ?? '') ||
@@ -311,7 +314,7 @@ function ModelConfigs() {
             <tr>
               <th>配置项</th>
               <th>模型</th>
-              <th>base_url</th>
+              <th>base_url(/v1)</th>
               <th>密钥</th>
               <th />
             </tr>
@@ -417,7 +420,7 @@ function ModelConfigs() {
   )
 }
 
-/** 现在的配置与各次编译的快照是否一致。四项放一张表里才看得出差在哪一项。 */
+/** 现在的配置与各次编译的快照逐项比对。 */
 function ConfigDrift({
   features,
   compiles,
@@ -457,10 +460,109 @@ function ConfigDrift({
 
 const BLANK = { label: '', base_url: '', model: '', api_key: '' }
 
+/** 一行端点。探测与删除的状态逐行独立，所以拆成组件。 */
+function ProviderRow({
+  provider,
+  selected,
+  onEdit,
+  onDeleted,
+}: {
+  provider: Provider
+  selected: boolean
+  onEdit: () => void
+  onDeleted: () => void
+}) {
+  const probe = useAction<ProviderProbe>()
+  const remove = useAction<unknown>()
+
+  return (
+    <>
+      <tr className={selected ? 'selected' : ''}>
+        <td>{provider.label}</td>
+        <td className="small mono">{provider.model}</td>
+        <td className="small mono muted truncate">{provider.base_url}</td>
+        <td>
+          <Pass ok={provider.api_key_set} yes="已设置" no="缺失" />
+        </td>
+        <td>
+          <div className="row tight">
+            <button className="action small" onClick={onEdit}>
+              编辑
+            </button>
+            <button
+              className="action small"
+              disabled={probe.busy}
+              title="向这个端点发一句 hi，真实调用模型"
+              onClick={() => probe.run(() => api.probeProvider(provider.id))}
+            >
+              {probe.busy ? '探测中…' : '探测'}
+            </button>
+            <button
+              className="action small danger"
+              disabled={remove.busy}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `删除端点「${provider.label}」？\n\n引用它的评测与归因记录会失去关联。`,
+                  )
+                )
+                  return
+                remove.run(async () => {
+                  const result = await api.deleteProvider(provider.id)
+                  onDeleted()
+                  return result
+                })
+              }}
+            >
+              删除
+            </button>
+          </div>
+        </td>
+      </tr>
+      {(probe.result || probe.error || remove.error) && (
+        <tr>
+          <td colSpan={5}>
+            {remove.error && <Failed error={remove.error} />}
+            {probe.error && <Failed error={probe.error} />}
+            {probe.result && <ProbeResult result={probe.result} onClose={probe.reset} />}
+          </td>
+        </tr>
+      )}
+    </>
+  )
+}
+
+/** 探测结果。失败时摊开 provider 回的原文。 */
+function ProbeResult({ result, onClose }: { result: ProviderProbe; onClose: () => void }) {
+  return (
+    <div className={`note ${result.ok ? 'ok' : 'bad'}`}>
+      <div className="spread">
+        <strong>
+          {result.ok ? 'Success' : 'Fail'}
+          {result.status !== null && <span className="small mono muted"> HTTP {result.status}</span>}
+          {result.failure && <span className="small mono"> {result.failure}</span>}
+        </strong>
+        <button className="action small" onClick={onClose}>
+          收起
+        </button>
+      </div>
+      {result.ok && result.reply && (
+        <pre className="block" style={{ marginTop: 6 }}>
+          {result.reply}
+        </pre>
+      )}
+      {!result.ok && result.detail && (
+        <pre className="block" style={{ marginTop: 6 }}>
+          {result.detail}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 /** 表单默认收起，由「新建端点」或表格里的「编辑」打开。
  *
- * 编辑必须带上 id：后端按 (role, label) 做 upsert，只按 label 提交会让「改个名字」
- * 变成新增一条，原来那条还留着。
+ * 编辑时提交 id：后端按 (role, label) upsert，不带 id 会把改名变成新增。
  */
 function Providers({ role, title }: { role: 'judge' | 'attribution'; title: string }) {
   const { data, error, loading, reload } = useAsync<Provider[]>(() => api.providers(role), [role])
@@ -468,7 +570,6 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
   const [mode, setMode] = useState<number | 'new' | null>(null)
   const [form, setForm] = useState(BLANK)
   const save = useAction<{ id: number }>()
-  const remove = useAction<unknown>()
 
   const providers = data ?? []
   const editing = typeof mode === 'number' ? mode : null
@@ -480,13 +581,11 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
     setMode(null)
     setForm(BLANK)
     save.reset()
-    remove.reset()
   }
   const create = () => {
     setMode('new')
     setForm(BLANK)
     save.reset()
-    remove.reset()
   }
   const edit = (provider: Provider) => {
     setMode(provider.id)
@@ -497,10 +596,9 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
       api_key: '',
     })
     save.reset()
-    remove.reset()
   }
 
-  // 新建时标签不能撞已有的，否则那一条会被悄悄覆盖。
+  // 新建时标签不能撞已有的，否则会覆盖那一条。
   const label = form.label.trim() || 'default'
   const taken = providers.some((p) => p.label === label && p.id !== editing)
 
@@ -515,7 +613,6 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
 
       {error && <Failed error={error} />}
       {save.error && <Failed error={save.error} />}
-      {remove.error && <Failed error={remove.error} />}
 
       {providers.length > 0 && (
         <table>
@@ -523,44 +620,23 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
             <tr>
               <th>标签</th>
               <th>模型</th>
-              <th>base_url</th>
+              <th>base_url(/v1)</th>
               <th>密钥</th>
               <th />
             </tr>
           </thead>
           <tbody>
             {providers.map((provider) => (
-              <tr key={provider.id} className={provider.id === editing ? 'selected' : ''}>
-                <td>{provider.label}</td>
-                <td className="small mono">{provider.model}</td>
-                <td className="small mono muted truncate">{provider.base_url}</td>
-                <td>
-                  <Pass ok={provider.api_key_set} yes="已设置" no="缺失" />
-                </td>
-                <td>
-                  <div className="row tight">
-                    <button className="action small" onClick={() => edit(provider)}>
-                      编辑
-                    </button>
-                    <button
-                      className="action small danger"
-                      disabled={remove.busy}
-                      onClick={() => {
-                        if (!window.confirm(`删除端点「${provider.label}」？\n\n引用它的评测与归因记录会失去关联。`))
-                          return
-                        remove.run(async () => {
-                          const result = await api.deleteProvider(provider.id)
-                          if (editing === provider.id) close()
-                          reload()
-                          return result
-                        })
-                      }}
-                    >
-                      删除
-                    </button>
-                  </div>
-                </td>
-              </tr>
+              <ProviderRow
+                key={provider.id}
+                provider={provider}
+                selected={provider.id === editing}
+                onEdit={() => edit(provider)}
+                onDeleted={() => {
+                  if (editing === provider.id) close()
+                  reload()
+                }}
+              />
             ))}
           </tbody>
         </table>

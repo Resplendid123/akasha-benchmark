@@ -7,17 +7,17 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 
-# Akasha 的全局前缀（main.ts 的 setGlobalPrefix），不随部署变，所以不做成配置项。
+# Akasha 的全局前缀，不随部署变，所以不做成配置项。
 API_PREFIX = "/api"
 
 
 @dataclass(frozen=True)
 class AkashaConfig:
-    # 见 config_store._prefer_ipv4：localhost 在 Windows 上每个请求多等 2s。
+    # 用 127.0.0.1 而不是 localhost，见 config_store._prefer_ipv4。
     base_url: str = "http://127.0.0.1:3000"
     email: str = ""
     password: str = ""
-    # 只读 PG。仅归因层的链路视图需要，不填则跳过那一段判据。
+    # 只读 PG，仅归因层的链路视图需要，不填则跳过那一段判据。
     database_url: str = ""
     timeout_seconds: float = 180.0
     concurrency: int = 1
@@ -34,7 +34,7 @@ class AkashaConfig:
             raise ValueError(f"Akasha 连接缺少 {missing}，请在配置页填写。")
 
     def redacted(self) -> dict[str, Any]:
-        """可以落库/记日志的视图，不含密钥。"""
+        """可以落库或记日志的视图，不含密钥。"""
         return {
             "base_url": self.base_url,
             "email": self.email,
@@ -47,7 +47,7 @@ _FIELDS = frozenset(f.name for f in fields(AkashaConfig))
 
 
 def load_config(connection: sqlite3.Connection | None) -> AkashaConfig:
-    """读那一份连接配置。``None`` 时返回默认值，缺项由 require_credentials 报。"""
+    """读那一份连接配置。``None`` 时返回默认值。"""
     if connection is None:
         return AkashaConfig()
     from .store import config_store

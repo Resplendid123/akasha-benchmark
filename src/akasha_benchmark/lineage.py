@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 # artifact：一个原始 page 贡献给了哪些编译产物。
-# page_type 取值 entity / source_summary；canonical_key 是实体合并的键。
+# page_type 取 entity / source_summary；canonical_key 是实体合并的键。
 ARTIFACTS_OF_SOURCE = """
 SELECT DISTINCT kp.id, kp.title, kp.page_type, kp.compile_scope,
        kp.canonical_key, kp.stale_at
@@ -16,8 +16,7 @@ WHERE kps.source_page_id = %(page)s
 ORDER BY kp.title
 """
 
-# 参与召回的文本。embedding_profile 是那条静默失效的线索：换 embedding 后
-# 旧 chunk 的 profile 对不上，这些 chunk 永远召回不到。
+# 参与召回的文本。换 embedding 后旧 chunk 的 embedding_profile 对不上，召回不到。
 CHUNKS_OF_ARTIFACTS = """
 SELECT kc.id, kc.knowledge_page_id, kp.title, kc.chunk_role,
        kc.retrieval_channel, kc.embedding_profile, kc.text
@@ -35,8 +34,7 @@ WHERE ksc.source_page_id = %(page)s
 ORDER BY ksc.id
 """
 
-# 图边。relation 是自由生成的（555 条边散在 377 种取值上，createdBy 与
-# created_by 并存），所以图遍历无法按关系类型做 —— 这里只如实列出。
+# 图边。relation 是自由生成的，取值不成枚举，所以只如实列出、不按类型遍历。
 EDGES_OF_ARTIFACTS = """
 SELECT e.id, e.relation, e.stale_at,
        e.from_knowledge_page_id, f.title AS from_title, f.canonical_key AS from_key,
@@ -49,26 +47,13 @@ WHERE e.from_knowledge_page_id = ANY(%(ids)s)
 ORDER BY e.relation
 """
 
-# snippets[].id 是裸 UUID 不带类型前缀，且 snippet 里没有 kind，所以光看响应
-# 分不出这条来自原文块还是编译产物。用 knowledge_chunks.id 反查补上。
-CHUNK_KINDS = """
-SELECT kc.id, kc.chunk_role, kc.retrieval_channel, kp.page_type, kp.title
-FROM knowledge_chunks kc
-JOIN knowledge_pages kp ON kp.id = kc.knowledge_page_id
-WHERE kc.id = ANY(%(ids)s)
-"""
-
 
 class LineageUnavailable(RuntimeError):
     """没配只读数据库，或 psycopg 没装。"""
 
 
 class BadPageId(ValueError):
-    """page_id 不是合法的 UUID。
-
-    单独一个异常类型，是为了让路由回 400 而不是 500 —— 后者会把 Postgres 的
-    原始错误文本（含参数值）透到响应里，而那是个信息泄露面。
-    """
+    """page_id 不是合法的 UUID。让路由回 400，不把 Postgres 的原始错误文本透出去。"""
 
 
 def _rows(cursor) -> list[dict[str, Any]]:
@@ -94,38 +79,20 @@ class LineageReader:
             raise LineageUnavailable(
                 "psycopg is not installed; run `uv sync`"
             ) from exc
-        # read_only 由连接层保证，不靠「我们只写了 SELECT」这种约定。
+        # read_only 由连接层保证，不靠「只写了 SELECT」这种约定。
         return psycopg.connect(self.database_url, autocommit=False)
 
     @staticmethod
     def _check_page_id(page_id: str) -> str:
-        """page_id 必须是 UUID。
-
-        在打到数据库**之前**挡住，否则 Postgres 会抛
-        ``invalid input syntax for type uuid``，而那条错误文本里带着参数值,
-        直接透给调用方就是一个信息泄露面。
-        """
+        """在打到数据库之前校验 UUID，避免把 Postgres 的错误文本连参数值一起透出。"""
         try:
             UUID(page_id)
         except (ValueError, AttributeError, TypeError) as exc:
             raise BadPageId(f"{page_id!r} is not a valid page id (expected a UUID)") from exc
         return page_id
 
-    def artifacts(self, page_id: str) -> list[dict[str, Any]]:
-        """一个原始 page 编成了哪些 artifact。"""
-        page_id = self._check_page_id(page_id)
-        with self._connect() as connection:
-            connection.read_only = True
-            with connection.cursor() as cursor:
-                cursor.execute(ARTIFACTS_OF_SOURCE, {"page": page_id})
-                return _rows(cursor)
-
     def lineage(self, page_id: str, *, chunk_chars: int = 2000) -> dict[str, Any]:
-        """一条完整链路：artifact -> chunk -> 图边 -> 原文。
-
-        这是「必须一屏走完」的那个视图—— 跨五张表六跳，
-        否则归因就得像那次一样手写 SQL。
-        """
+        """一条完整链路：artifact -> chunk -> 图边 -> 原文。跨五张表六跳。"""
         page_id = self._check_page_id(page_id)
         with self._connect() as connection:
             connection.read_only = True
@@ -164,14 +131,3 @@ class LineageReader:
                 "edges": len(edges),
             },
         }
-
-    def chunk_kinds(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """给 snippet 的裸 UUID 补上 page_type 与 chunk_role。"""
-        if not chunk_ids:
-            return {}
-        chunk_ids = [self._check_page_id(cid) for cid in chunk_ids]
-        with self._connect() as connection:
-            connection.read_only = True
-            with connection.cursor() as cursor:
-                cursor.execute(CHUNK_KINDS, {"ids": chunk_ids})
-                return {row["id"]: row for row in _rows(cursor)}

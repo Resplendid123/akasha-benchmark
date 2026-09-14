@@ -1,9 +1,7 @@
 # Akasha-Benchmark
 
 评测 Akasha 的检索、引用归因与答案质量，提供数据集浏览、实验运行、指标报告和逐样本归因界面。
-编译与查询通过 HTTP 访问 Akasha；归因的链路视图可选连接只读 PostgreSQL，不修改 Akasha 源码。
-
-前后端分离：**所有操作都在前端点，后端执行**。项目不保留脚本或命令行入口。
+编译与查询通过 HTTP 访问 Akasha
 
 ## 启动
 
@@ -12,7 +10,7 @@
 ```bash
 make sync          # uv sync + npm install
 make serve         # 后端 :8848，建表在启动时自动完成
-make web           # 另一个终端，前端 :5173
+make web           # 前端 :5173
 ```
 
 打开 `http://127.0.0.1:5173`，Vite 把 `/api` 代理到 `http://127.0.0.1:8848`。
@@ -62,13 +60,9 @@ make web           # 另一个终端，前端 :5173
 
 ## 文档与验证
 
-- [原始数据集](docs/datasets.md) · [归一化字段](docs/normalized_datasets.md)
-- [接口约定](docs/akasha_api.md) · [指标定义](docs/metrics.md) · [代码架构](docs/architecture.md)
+· [代码架构](docs/architecture.md)
 
 ```bash
 make test                          # 离线测试
 npm --prefix web run typecheck
 ```
-
-端到端验证走界面的「测试」页：它会真实建空间、编译、查询、评测、归因，并逐段校验契约。
-产物保留在平台里 —— 一次真实的链路记录比一份「通过」的报告有用。

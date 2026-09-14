@@ -1,7 +1,7 @@
 """归一化层：原始 JSON 经适配器转成 sample / corpus_doc 进 SQLite。
 
-**不碰 Akasha。** 这一层离线执行，产物是后续每一层的输入。
-校验在写库前后各一道：前面校验原始文件形状与行数，后面校验入库产物自洽。
+离线执行，不碰 Akasha。校验在写库前后各一道：先校验原始文件的形状与行数，
+再校验入库产物自洽。
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ def normalize_dataset(
     resolved = resolve(name, dataset_dir)
     adapter = resolved.adapter
 
-    # 先建 corpus 索引：适配器解析 gold 时靠它反查 doc_id。
+    # 先建 corpus 索引，适配器解析 gold 时靠它反查 doc_id。
     corpus = load_corpus(adapter.name, resolved.corpus_path)
     rows = load_json(resolved.qa_path)
     if not isinstance(rows, list):
         raise ValueError(f"{resolved.qa_path.name}: expected a JSON array")
 
-    # 行数与实测快照不一致说明数据换版了，身份规则要重新确认。
+    # 行数与快照不一致说明数据换版，身份规则要重新确认。
     expected = adapter.expected_qa_rows()
     if expected is not None and len(rows) != expected:
         raise ValueError(
@@ -59,7 +59,7 @@ def normalize_dataset(
         if ctx and (index + 1) % 200 == 0:
             ctx.progress(index + 1, len(rows), f"{name} 解析 {index + 1}/{len(rows)}")
 
-    # 元信息、样本、语料同一事务写入：中断不会留下「有元信息没样本」的状态。
+    # 三者同一事务写入，中断不会留下「有元信息没样本」的状态。
     with transaction(connection):
         data_store.upsert_dataset(
             connection,
@@ -85,10 +85,10 @@ def normalize_dataset(
 
 
 def validate_dataset(connection: sqlite3.Connection, name: str) -> list[str]:
-    """入库产物验收。返回问题列表，空表示通过。
+    """入库产物验收，返回问题列表，空表示通过。
 
-    gold 指向语料里不存在的 doc_id 是身份规则出错的信号 —— 它不会让任何
-    阶段报错，只会让检索指标永远差一截，所以必须在这里查出来。
+    其中「gold 指向语料里不存在的 doc_id」是身份规则出错的信号：它不报错，
+    只会让检索指标永远差一截。
     """
     problems: list[str] = []
     record = data_store.get_dataset(connection, name)

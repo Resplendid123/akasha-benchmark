@@ -1,9 +1,6 @@
-"""数据集层与归一化层。
+"""数据集层与归一化层。同一批数据的两个形态，所以放一个路由里：
 
-两层看的是同一批数据的两个形态，所以放一个路由里：
-
-* 数据集层 —— **原始样例**，直接读 ``dataset/*.json``，不经库也不经适配器。
-  这是「归一化之前长什么样」的唯一入口。
+* 数据集层 —— 原始样例，直接读 ``dataset/*.json``，不经库也不经适配器。
 * 归一化层 —— 库里的 sample / corpus_doc，以及适配器状态。
 """
 
@@ -30,13 +27,7 @@ MAX_PAGE = 200
 
 @router.get("/datasets")
 def datasets(request: Request) -> dict[str, Any]:
-    """四组数据集的原始文件状态与归一化状态。
-
-    适配器声明身份规则（哪个字段当 doc_id、gold 怎么解析）与它拥有哪些标注
-    （provides）—— 后者决定哪些指标算得出来。分派只按数据集名，
-    绝不按「row 里有没有某个字段」来猜：那样数据换版会静默走错分支，
-    而症状是一个看着合理的指标，不是一个报错。
-    """
+    """四组数据集的原始文件状态与归一化状态，连同各自的身份规则与 provides。"""
     with db(request) as connection:
         normalized = {row["name"]: row for row in data_store.list_datasets(connection)}
 
@@ -87,10 +78,9 @@ def raw_samples(
     limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
     offset: int = 0,
 ) -> dict[str, Any]:
-    """**原始样例**，直接读数据文件。``kind`` 取 ``qa`` 或 ``corpus``。
+    """原始样例，直接读数据文件，``kind`` 取 ``qa`` 或 ``corpus``。
 
-    刻意不走适配器：这一栏要回答的是「上游给的是什么」，而适配器的产物
-    已经是解释过一轮的结果。两者并排才看得出归一化做了什么。
+    不走适配器：这一栏答的是「上游给的是什么」，与归一化产物并排才看得出差别。
     """
     if kind not in ("qa", "corpus"):
         raise HTTPException(422, "kind 必须是 qa 或 corpus")
@@ -114,7 +104,7 @@ def raw_samples(
         "total": len(rows),
         "offset": offset,
         "limit": limit,
-        # 原样返回，不裁字段 —— 裁了就看不到上游还有哪些字段没用上。
+        # 原样返回，不裁字段，否则看不到上游还有哪些字段没用上。
         "rows": rows[offset : offset + limit],
     }
 
@@ -151,11 +141,7 @@ def normalized_samples(
 
 @router.get("/datasets/{name}/samples/{sample_id}")
 def normalized_sample(request: Request, name: str, sample_id: str) -> dict[str, Any]:
-    """一条样本连同它的 gold 文档正文。
-
-    gold 一起给，因为「这条样本的 gold 到底是什么」是判断标注质量的入口 ——
-    归因层判 gold_annotation_suspect 时看的就是这个。
-    """
+    """一条样本连同它的 gold 文档正文，供判断标注质量。"""
     with db(request) as connection:
         sample = data_store.get_sample(connection, sample_id)
         if sample is None or sample["dataset"] != name:
@@ -170,7 +156,7 @@ def normalized_sample(request: Request, name: str, sample_id: str) -> dict[str, 
     return {
         **sample,
         "gold_docs": gold,
-        # gold 指向语料里不存在的 doc_id 是身份规则出错的信号，必须报出来。
+        # 非空即身份规则出错：gold 指向了语料里不存在的 doc_id。
         "missing_gold_doc_ids": missing,
     }
 
@@ -210,11 +196,9 @@ def normalized_corpus(
 def metrics(request: Request, datasets: str | None = None) -> dict[str, Any]:
     """指标声明，以及给定数据集组合下哪些能勾。
 
-    判据是数据集声明的 ``provides`` 与指标声明的 ``requires`` 做集合比对，
-    不是数据集名字 —— 所以新增指标不必碰任何枚举。
-
-    交集是「对所选每一组都算得出来」，并集是「至少一组能算」。勾了只对部分组
-    成立的指标不会报错：缺依赖的那组会省略它，而不是伪造 0 分。
+    ``computable_for_all`` 是交集（每一组都算得出来），
+    ``computable_for_some`` 是并集。勾了只对部分组成立的指标不报错，
+    缺依赖的那组省略它。
     """
     definitions = [
         {

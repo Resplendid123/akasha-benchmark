@@ -1,22 +1,16 @@
 """Akasha 的 HTTP 客户端，只覆盖入库与查询用到的端点。
 
-认证：``POST /api/auth/login`` 会 set 一个 httpOnly 的 ``authToken`` cookie
-（``auth.controller.ts:222``），响应体是空的。JWT 策略同时接受该 cookie
-和 bearer header（``jwt.strategy.ts:28``），所以 httpx 的 cookie jar 就够了。
-自建部署用 ``workspaceRepo.findFirst()`` 定位 workspace
-（``domain.middleware.ts:18``），不需要伪造 Host 头。
+认证：``POST /api/auth/login`` set 一个 httpOnly 的 ``authToken`` cookie，
+响应体为空，所以 httpx 的 cookie jar 就够了。workspace 由服务端解析。
 
-以下请求/响应形状都是照服务端源码核对过的：
+各端点的请求/响应形状：
 
 * ``POST /api/pages/import`` —— multipart，字段 ``file`` + ``spaceId``，
-  返回创建的 page 对象（含 ``id``）（``import.controller.ts:93-121``）
+  返回创建的 page 对象（含 ``id``）
 * ``POST /api/llm-wiki/query`` —— ``{query, spaceIds[], type?, scoreThreshold?,
-  chatContext?}``（``query-knowledge.dto.ts``）；响应里**没有**
-  ``retrievalDiagnostics`` 和 ``retrievalScope``，controller 解构时排除了它们
-  （``llm-wiki.controller.ts:174``）
+  chatContext?}``；响应里没有 ``retrievalDiagnostics`` 与 ``retrievalScope``
 * ``POST /api/llm-wiki/admin/diagnostics/quality`` ——
   ``{summary, spaces[], topIssues[]}``，计数字段是 camelCase
-  （``knowledge-quality.service.ts:20-46``）
 """
 
 from __future__ import annotations
@@ -31,17 +25,12 @@ import httpx
 
 from .config import AkashaConfig
 
-# knowledge_space_compile_run 的状态取值（admin-diagnostics.dto.ts）。
-# 轮询编译时靠这两个集合判断「还在跑」还是「已终态」。
-TERMINAL_RUN_STATUSES = frozenset(
-    {"succeeded", "partial", "failed", "superseded", "cancelled"}
-)
+# knowledge_space_compile_run 里表示「还在跑」的状态取值。
 ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "compiling", "aggregate_pending", "aggregating"}
 )
 
-# 只重试瞬时故障。502/503/504 是 dev server 重启或代理抖动，429 是限流，
-# 都与请求内容无关，重发就能过。4xx 不在其列 —— 那是请求本身的问题。
+# 只重试瞬时故障：5xx 是服务端重启或代理抖动，429 是限流。4xx 不重试。
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 RETRYABLE_EXCEPTIONS = (httpx.TransportError,)
 MAX_RETRIES = 5
@@ -52,10 +41,8 @@ RETRY_MAX_DELAY = 30.0
 def _rewind_files(files: Any) -> None:
     """把 multipart 里的文件句柄拨回开头，供重试重新读取。
 
-    ``httpx`` 的 files 可以是 dict 或 (name, value) 列表，value 又可以是
-    裸句柄或 ``(filename, handle, content_type)`` 元组，所以这里逐层剥。
-    不可 seek 的对象（比如生成器）跳过 —— 那种情况下重试本就不安全，
-    交给上层的 4xx/5xx 判断去处理。
+    files 可以是 dict 或 (name, value) 列表，value 可以是裸句柄或
+    ``(filename, handle, content_type)`` 元组，所以逐层剥。不可 seek 的跳过。
     """
     values = files.values() if isinstance(files, dict) else [v for _, v in files]
     for value in values:
@@ -69,24 +56,10 @@ def _rewind_files(files: Any) -> None:
 
 
 def unwrap_envelope(body: Any) -> Any:
-    """剥掉全局响应信封 ``{data, success, status}``。
+    """剥掉全局响应信封 ``{data, success, status}``。这里用到的端点全都套着它。
 
-    ``main.ts:160`` 给所有路由挂了 ``TransformHttpResponseInterceptor``，它把每个
-    handler 的返回值包成 ``{data, success: true, status}``
-    （``http-response.interceptor.ts:33-38``）。只有标了 ``@SkipTransform()`` 的
-    handler 例外，而那三个（mcp / health / robots.txt）本评测都不用 —— 也就是说
-    **这里用到的每一个端点都套着信封**。
-
-    不剥的后果不是报错，而是静默读空：``users/me`` 取不到 role 会让 OWNER 闸门
-    永远拒绝执行，导入取不到 ``id`` 会让每篇都记成失败，而质量诊断取不到
-    ``summary`` 会让四项闸门全部读成 ``None`` —— ``all(value == 0)`` 于是假通过，
-    带着一个半成品索引继续往下跑。
-
-    login 是特例：handler 没有返回值，所以信封里没有 ``data`` 键，只有
-    ``{success, status}``，剥出来是 ``None``。
-
-    判据要收紧到信封自身的形状，不能只看有没有 ``data`` —— 某个端点的正常载荷里
-    完全可以有一个叫 ``data`` 的字段，那种不能动。
+    判据收紧到信封自身的形状，而不是只看有没有 ``data`` —— 正常载荷里也可能
+    有一个叫 ``data`` 的字段。login 的信封没有 ``data`` 键，剥出来是 ``None``。
     """
     if not isinstance(body, dict):
         return body
@@ -98,7 +71,7 @@ def unwrap_envelope(body: Any) -> Any:
 
 
 class AkashaError(RuntimeError):
-    """非 2xx 响应。带足够上下文，不用重跑一次就能定位问题。"""
+    """非 2xx 响应，带上方法、URL、状态码与响应体。"""
 
     def __init__(self, method: str, url: str, status: int, body: str) -> None:
         super().__init__(f"{method} {url} -> HTTP {status}: {body[:500]}")
@@ -165,8 +138,7 @@ class AkashaClient:
             body: Any = response.json() if response.content else None
         except ValueError:
             body = response.text
-        # 全局拦截器给所有端点套了信封，在这里统一剥掉，各阶段就能按文档里
-        # 记的形状直接读字段。见 unwrap_envelope 的说明。
+        # 统一剥信封，各阶段就能按模块开头记的形状直接读字段。
         body = unwrap_envelope(body)
 
         if raise_for_status and not response.is_success:
@@ -184,21 +156,13 @@ class AkashaClient:
     ) -> tuple[httpx.Response, int]:
         """发一次请求，瞬时故障按退避重试，返回 ``(response, latency_ms)``。
 
-        重试只针对 :data:`RETRYABLE_STATUSES` 和连接层异常 —— 这些是 dev server
-        重启（``nest start --watch``）或反向代理抖动的表现，与请求内容无关。
-        4xx 一律不重试：那是请求本身的问题，重试只会放大。
-
-        不重试的代价在长任务上很实际：编译 400 页要轮询上千次，途中任何一次
-        502 都会让整个 ingest 进程退出，而服务端的编译还在 BullMQ 里继续跑，
-        于是产物写不出来、进度也无人接管。
-
-        ``retry=False`` 关掉重试，留给结果有歧义的写入端点用 —— 见 :meth:`import_page`。
+        只重试 :data:`RETRYABLE_STATUSES` 与连接层异常，4xx 一律不重试。
+        ``retry=False`` 关掉重试，留给结果有歧义的写入端点。
         """
         max_retries = MAX_RETRIES if retry else 0
         attempt = 0
         while True:
-            # multipart 的文件句柄在上一次尝试里已被读到末尾，重试前必须回到开头，
-            # 否则重发的是空 body，服务端会收下一个空文件。
+            # 上一次尝试已把文件句柄读到末尾，重试前拨回开头，否则重发空 body。
             if files and attempt:
                 _rewind_files(files)
             self._throttle()
@@ -209,9 +173,7 @@ class AkashaClient:
                 )
             except RETRYABLE_EXCEPTIONS as exc:
                 self._last_request_at = time.monotonic()
-                # 重试用尽后原样抛出，不包成 AkashaError —— 调用方（run_queries）
-                # 按 httpx.RequestError 捕获传输层失败并落盘，换了异常类型
-                # 那条通路就断了，一次网络抖动会让整个阶段带 traceback 崩掉。
+                # 原样抛出，不包成 AkashaError：查询层按 httpx.RequestError 捕获它。
                 if attempt >= max_retries:
                     raise
                 delay = self._retry_delay(attempt)
@@ -241,7 +203,7 @@ class AkashaClient:
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
-        """指数退避，带抖动，并设上限。抖动避免多个请求在同一刻齐步重试。"""
+        """指数退避，带抖动并设上限，避免多个请求齐步重试。"""
         base = min(RETRY_BASE_DELAY * (2**attempt), RETRY_MAX_DELAY)
         return base * (0.75 + random.random() * 0.5)
 
@@ -256,7 +218,6 @@ class AkashaClient:
     def login(self) -> None:
         """登录并拿到 authToken cookie。"""
         self.config.require_credentials()
-        # 成功时只 set cookie，响应体是空的。
         self.request(
             "POST",
             "auth/login",
@@ -276,8 +237,7 @@ class AkashaClient:
     # --- Space 管理 ---
 
     def create_space(self, name: str, slug: str, description: str = "") -> dict[str, Any]:
-        # slug 必须是纯字母数字（CreateSpaceDto 的 @IsAlphanumeric），长度 2-100。
-        # 与导入同理不重试：建 Space 是写入，重试可能建出第二个。
+        # slug 必须是纯字母数字，长度 2-100。不重试：重试可能建出第二个 Space。
         return self.post(
             "spaces/create",
             {"name": name, "slug": slug, "description": description},
@@ -291,18 +251,11 @@ class AkashaClient:
     ) -> dict[str, Any]:
         """导入一段 Markdown 正文，返回创建的 page（含 ``id``）。
 
-        正文由 ``CorpusDoc.to_markdown()`` 从库里的语料渲染，不落临时文件。
+        ``filename`` 只承担 doc_id 的职责：导入服务取首个 Markdown heading 当
+        page title 并从正文移除，所以 title 重复也不影响身份追踪。
 
-        ``filename`` 只承担 doc_id 的职责：导入服务会取首个 Markdown heading 当
-        page title 并从正文移除，两者互不干扰，所以 title 重复也不影响身份追踪。
-
-        **不重试**（``retry=False``）。5xx 的结果是有歧义的：服务端可能已经建好 page,
-        只是代理在响应前挂了。重试于是建出第二个 page —— 语料里多一篇没人引用的
-        重复，它不在 ``page_map`` 里，续跑也发现不了，只会悄悄抬高语料规模并污染
-        检索指标。
-
-        不重试的代价很小：导入失败会被记下并继续跑下一篇，而编译层可续跑,
-        重跑一次就会把缺的补上（缺篇能被发现，重复不能）。
+        不重试：5xx 的结果有歧义，重试可能建出第二个 page。缺篇能被发现
+        （``page_id`` 为空），重复不能。
         """
         return self.post(
             "pages/import",
@@ -322,6 +275,19 @@ class AkashaClient:
 
     def quality_diagnostics(self, space_ids: list[str]) -> dict[str, Any]:
         return self.post("llm-wiki/admin/diagnostics/quality", {"spaceIds": space_ids})
+
+    def run_diagnostics(self, space_ids: list[str], *, limit: int = 50) -> dict[str, Any]:
+        """编译 Run 明细。``runDurationMs`` 与 ``progress`` 用于估算每篇的耗时。"""
+        return self.post(
+            "llm-wiki/admin/diagnostics/runs", {"spaceIds": space_ids, "limit": limit}
+        )
+
+    def page_log(self, space_ids: list[str], *, limit: int = 100) -> dict[str, Any]:
+        """逐页编译日志，``errorCode`` / ``errorSummary`` 在这里。"""
+        return self.post(
+            "llm-wiki/admin/diagnostics/page-log",
+            {"spaceIds": space_ids, "limit": limit},
+        )
 
     # --- 模型配置 ---
 
@@ -345,11 +311,7 @@ class AkashaClient:
         score_threshold: float | None = None,
         chat_context: list[str] | None = None,
     ) -> Response:
-        """跑一条知识查询。返回原始 Response，好让失败也能照样落盘。
-
-        注意 ``retrievalDiagnostics`` 不在响应体里，评测得从
-        ``knowledge_query_audit.metadata`` 取。
-        """
+        """跑一条知识查询。返回原始 Response，失败也能照样落盘。"""
         payload: dict[str, Any] = {"query": query, "spaceIds": space_ids, "type": query_type}
         if score_threshold is not None:
             payload["scoreThreshold"] = score_threshold

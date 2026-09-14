@@ -1,23 +1,18 @@
 """faithfulness：答案里的每条陈述能否由检索到的上下文支撑。
 
-**依赖是空集** —— 不需要 gold 文档，也不需要参考答案。所以它对四组都成立，
-而这正是它的价值所在：narrativeqa 现在整族检索指标省略（无 gold 标注），
-faithfulness 能填上那个洞，且它恰恰最需要 —— 46% 的参考答案措辞在原文里
-根本不存在，F1 的绝对值在这组上信息量最低。
+依赖是空集，所以对四组都成立 —— narrativeqa 无 gold 标注、检索族指标全省略，
+这一项能填上那个洞。
 
-口径：把答案拆成原子陈述，逐条判「上下文是否支撑」，得分 = 被支撑的条数 / 总条数。
-拆句与判定在同一次调用里做完 —— 分两次调用要花两倍的钱，而这个指标本来就
-只用于同配置比较。
+口径：把答案拆成原子陈述，逐条判上下文是否支撑，得分 = 被支撑数 / 总条数。
+拆句与判定在同一次调用里做完。
 
-**上下文取 ``retrievedSources`` 与 ``snippets``，不取 ``citations``**：后者已被
-「被引 ∩ 有证据」裁剪过，拿它当上下文会把「引用漏了但检索到了」误判成不忠实。
+上下文取 ``snippets`` 与 ``retrievedSources`` 而不取 ``citations``：后者已被裁剪，
+拿它当上下文会把「引用漏了但检索到了」误判成不忠实。
 """
 
 from __future__ import annotations
 
 from typing import Any
-
-PROMPT_VERSION = "faithfulness-v1"
 
 SYSTEM = """You are a strict evaluator of grounding in retrieval-augmented answers.
 
@@ -49,8 +44,7 @@ CONTEXT:
 ANSWER:
 {answer}"""
 
-# 单条上下文的截断长度。编译产物是扩写过的（中位 2.19 倍），全塞进去会撑爆
-# 上下文窗口而且大部分是无关内容。
+# 单条上下文的截断长度：编译产物是扩写过的，全塞进去会撑爆上下文窗口。
 MAX_SNIPPET_CHARS = 1200
 MAX_SNIPPETS = 20
 
@@ -59,7 +53,7 @@ def build_context(response: dict[str, Any]) -> str:
     """从响应体拼出判定用的上下文。
 
     优先用 ``snippets``（带正文），退到 ``retrievedSources``（只有标题）。
-    两者都空时返回空串 —— 此时 faithfulness 无定义，调用方要跳过而不是记 0。
+    都空时返回空串，此时这个指标无定义，调用方应跳过而不是记 0。
     """
     parts: list[str] = []
     for snippet in (response.get("snippets") or [])[:MAX_SNIPPETS]:
@@ -76,12 +70,7 @@ def build_context(response: dict[str, Any]) -> str:
 
 
 def score_claims(claims: list[dict[str, Any]]) -> float | None:
-    """被支撑的条数占比。
-
-    没有任何陈述时返回 ``None`` 而不是 0.0 或 1.0：一个拒答（``no_match``）
-    既不忠实也不不忠实，这个指标在它上面无定义。记 0 会把「没找到资料」
-    算成「胡说」，记 1 会把它算成「完美」，两者都是错的。
-    """
+    """被支撑的条数占比。没有任何陈述时返回 ``None``（拒答上这个指标无定义）。"""
     if not claims:
         return None
     supported = sum(1 for c in claims if c.get("verdict") == "supported")
@@ -91,8 +80,7 @@ def score_claims(claims: list[dict[str, Any]]) -> float | None:
 def parse_verdict(payload: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
     """把模型输出解析成 ``(分数, 结构化理由)``。
 
-    ``verdict`` 取值不在预期集合里直接抛 ValueError —— 由调用方记成
-    ``parse_error``。静默当成 unsupported 会把「prompt 不听话」伪装成「答案不忠实」。
+    ``verdict`` 取值不在预期集合里就抛 ValueError，不静默当成 unsupported。
     """
     claims = payload.get("claims")
     if not isinstance(claims, list):
@@ -125,7 +113,7 @@ def parse_verdict(payload: dict[str, Any]) -> tuple[float | None, dict[str, Any]
 
 
 def build_prompt(question: str, answer: str, response: dict[str, Any]) -> tuple[str, str] | None:
-    """拼出 ``(system, user)``。上下文为空时返回 ``None``，表示这条应当跳过。"""
+    """拼出 ``(system, user)``。上下文为空时返回 ``None``，该条跳过。"""
     context = build_context(response)
     if not context:
         return None

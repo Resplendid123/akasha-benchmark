@@ -1,12 +1,7 @@
 """corpus 加载、doc_id 赋予，以及适配器解析 gold 要用的反查表。
 
-四组 corpus 文件的身份字段并不统一：hotpotqa 和 narrativeqa 带 ``idx``，
-2wiki 和 musique 只有 ``{title, text}``。这个差异只在本模块收口，
-规则见 :data:`CORPUS_ID_RULES`。
-
-**语料一律不去重。** musique 有 647 个 title 重复、涉及 2465 行，
-但它们是同名文档的不同段落，去重会直接丢掉 gold。
-去重前后的条数都写进 manifest，这个选择随时可查。
+四组 corpus 的身份字段不统一，规则收在 :data:`CORPUS_ID_RULES`。
+语料一律不去重：musique 的重复 title 是同名文档的不同段落，去重会丢 gold。
 """
 
 from __future__ import annotations
@@ -47,8 +42,7 @@ class CorpusIndex:
             else:
                 self.pair_to_id[key] = doc.doc_id
 
-        # (title, text) 仍重复的话，就没有任何键能定位到行了，
-        # 此时必须报错，不能静默挑一个。
+        # (title, text) 仍重复时没有任何键能定位到行，报错而不是挑一个。
         if collisions:
             title, text = collisions[0]
             raise ValueError(
@@ -59,10 +53,6 @@ class CorpusIndex:
 
     def __len__(self) -> int:
         return len(self.docs)
-
-    @property
-    def unique_title_count(self) -> int:
-        return len(self.title_to_ids)
 
     def id_for_title(self, title: str) -> str:
         """按 title 定位唯一 doc_id。有歧义或找不到都抛异常。"""
@@ -86,17 +76,6 @@ class CorpusIndex:
                 f"text[:80]={text[:80]!r}"
             ) from None
 
-    def dedup_stats(self) -> dict[str, int]:
-        """给 manifest 用的统计。只报告，不执行去重。"""
-        return {
-            "rows": len(self.docs),
-            "unique_titles": len(self.title_to_ids),
-            "unique_title_text_pairs": len(self.pair_to_id),
-            "rows_in_duplicate_title_groups": sum(
-                len(ids) for ids in self.title_to_ids.values() if len(ids) > 1
-            ),
-        }
-
 
 def assign_doc_id(dataset: str, row: dict[str, Any], row_index: int) -> str:
     """按该数据集声明的规则赋 doc_id。"""
@@ -109,13 +88,11 @@ def assign_doc_id(dataset: str, row: dict[str, Any], row_index: int) -> str:
             )
         return str(row["idx"])
     if rule == "row_idx":
-        # 之所以用行号当身份，前提就是这份 corpus 没有 idx。
-        # 它突然有了，说明数据换版了，行号身份不再可信。
+        # 用行号当身份的前提是这份 corpus 没有 idx；有了说明数据换版。
         if "idx" in row:
             raise ValueError(
-                f"{dataset}: corpus row {row_index} unexpectedly has an 'idx' field. "
-                f"The identity rule is {rule!r} because this corpus had none. "
-                "Re-check the data before trusting row numbers as identity."
+                f"{dataset}: corpus row {row_index} unexpectedly has an 'idx' field "
+                f"while the identity rule is {rule!r}; re-check the data version"
             )
         return str(row_index)
     raise ValueError(f"{dataset}: unknown corpus identity rule {rule!r}")

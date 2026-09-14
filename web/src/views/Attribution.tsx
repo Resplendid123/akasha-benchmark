@@ -1,6 +1,14 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { AttributionRun, CompileRun, EvalRun, MetricsView, Provider } from '../types'
+import type {
+  AttributionResult,
+  AttributionRun,
+  CompileRun,
+  EvalRun,
+  MetricsView,
+  Provider,
+  Snippet,
+} from '../types'
 import {
   CauseTag,
   CleanupButton,
@@ -9,7 +17,9 @@ import {
   Field,
   Loading,
   ModeTag,
+  Pager,
   StatusTag,
+  Timing,
   useAction,
   useAsync,
   usePoll,
@@ -84,13 +94,14 @@ export function Attribution({
       {current && current.attributions.length > 0 && (
         <>
           <h3>归因记录</h3>
-          <table>
+          <table className="records-table">
             <thead>
               <tr>
                 <th>名称</th>
                 <th>状态</th>
                 <th>依据指标</th>
                 <th className="num">样本数</th>
+                <th>耗时</th>
                 <th />
               </tr>
             </thead>
@@ -106,7 +117,10 @@ export function Attribution({
                   <td className="mono small">{run.metric}</td>
                   <td className="num">{run.sample_limit}</td>
                   <td>
-                    <div className="row tight">
+                    <Timing startedAt={run.created_at} finishedAt={run.finished_at} />
+                  </td>
+                  <td className="table-actions-cell">
+                    <div className="table-actions">
                       <button
                         className="action small"
                         onClick={() => setOpen(open === run.id ? null : run.id)}
@@ -160,7 +174,7 @@ function NewAttribution({
   const [providerId, setProviderId] = useState<number | ''>('')
   const start = useAction<unknown>()
 
-  // 只能选这一轮真的算过的指标 —— 没算过的没有逐样本值，排不出最差 N 条。
+  // 只列这一轮算过的指标，没算过的没有逐样本值可排。
   const candidates = (metrics.data?.definitions ?? [])
     .filter((d) => evalRun.metrics.includes(d.name))
     .flatMap((d) => (d.per_k ? evalRun.ks.map((k) => `${d.name}@${k}`) : [d.name]))
@@ -247,17 +261,78 @@ function NewAttribution({
   )
 }
 
+// 逐样本表的每页行数。
+const PAGE = 15
+
+/** 模型的归因结论。``disagreement`` 单独标红，它表示根因可能判错了。 */
+function ModelVerdict({ result }: { result: AttributionResult }) {
+  const model = (result.evidence?.model ?? {}) as {
+    contributing_factors?: unknown
+    disagreement?: unknown
+    confidence?: unknown
+  }
+  const error = result.evidence?.model_error ? String(result.evidence.model_error) : ''
+  const factors = Array.isArray(model.contributing_factors)
+    ? model.contributing_factors.map(String)
+    : []
+  const disagreement = model.disagreement ? String(model.disagreement) : ''
+
+  return (
+    <div className={`note ${disagreement ? 'warn' : 'plain'}`} style={{ marginTop: 10 }}>
+      <div className="spread">
+        <strong className="small mono">{result.sample_id}</strong>
+        {model.confidence !== undefined && model.confidence !== null && (
+          <span className="small muted">置信度 {String(model.confidence)}</span>
+        )}
+      </div>
+
+      {error && (
+        <div className="small" style={{ color: 'var(--bad)', marginTop: 4 }}>
+          模型调用失败：{error}。下面只有规则结论。
+        </div>
+      )}
+
+      {result.narrative && <div style={{ marginTop: 4 }}>{result.narrative}</div>}
+
+      {disagreement && (
+        <div style={{ marginTop: 6 }}>
+          <span className="tag warn">模型有异议</span>{' '}
+          <span className="small">{disagreement}</span>
+        </div>
+      )}
+
+      {factors.length > 0 && (
+        <div className="small muted" style={{ marginTop: 6 }}>
+          并存因素：{factors.join('、')}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Conclusions({ attributionId, evalId }: { attributionId: number; evalId: number }) {
   const { data, error, loading } = useAsync(() => api.attribution(attributionId), [attributionId])
   const [openSample, setOpenSample] = useState<string | null>(null)
+  const [offset, setOffset] = useState(0)
 
   if (loading) return <Loading what="归因结论" />
   if (error) return <Failed error={error} />
   if (!data) return null
 
+  // 只切显示不切数据，根因计数与平均延迟都在全集上算。
+  const shown = data.results.slice(offset, offset + PAGE)
+
   return (
     <div className="panel" style={{ marginTop: 14 }}>
-      <h3 style={{ marginTop: 0 }}>{data.name} 的根因</h3>
+      <div className="panel-head">
+        <h3>{data.name} 的根因</h3>
+        <Timing
+          startedAt={data.created_at}
+          finishedAt={data.finished_at}
+          latencyMs={data.latency_mean}
+          perLabel="条"
+        />
+      </div>
 
       <div className="row tight" style={{ marginBottom: 10 }}>
         {Object.entries(data.count_by_root_cause).map(([cause, count]) => (
@@ -266,6 +341,14 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
           </span>
         ))}
       </div>
+
+      {(data.count_by_root_cause.not_a_failure ?? 0) > 0 && (
+        <div className="note small">
+          有 {data.count_by_root_cause.not_a_failure} 条答案其实是对的 —— 它们进到最差 N
+          只是因为检索指标低。真实失败是 {data.results.length -
+            (data.count_by_root_cause.not_a_failure ?? 0)} 条。
+        </div>
+      )}
 
       {(data.count_by_root_cause.generation_fallback ?? 0) > 0 && (
         <div className="note warn small">
@@ -284,7 +367,7 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
           </tr>
         </thead>
         <tbody>
-          {data.results.map((result) => (
+          {shown.map((result) => (
             <tr key={result.sample_id} className={openSample === result.sample_id ? 'selected' : ''}>
               <td className="mono small">{result.sample_id}</td>
               <td>
@@ -293,6 +376,13 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
               <td className="small muted">{result.remedy}</td>
               <td>
                 <span className="tag">{result.rule_based ? '规则' : '规则+模型'}</span>
+                {/* 模型对规则分类有异议时在表里就标出来。 */}
+                {Boolean((result.evidence?.model as { disagreement?: unknown })?.disagreement) && (
+                  <span className="tag warn">有异议</span>
+                )}
+                {Boolean(result.evidence?.model_error) && (
+                  <span className="tag bad">模型失败</span>
+                )}
               </td>
               <td>
                 <button
@@ -308,15 +398,20 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
           ))}
         </tbody>
       </table>
+      <Pager
+        total={data.results.length}
+        offset={offset}
+        limit={PAGE}
+        onChange={(next) => {
+          setOffset(next)
+          // 翻页时收起展开的样本，它不在新页上。
+          setOpenSample(null)
+        }}
+      />
 
-      {data.results
-        .filter((result) => result.narrative && openSample === result.sample_id)
-        .map((result) => (
-          <div className="note plain" key={result.sample_id}>
-            <strong>模型叙述</strong>
-            <div style={{ marginTop: 4 }}>{result.narrative}</div>
-          </div>
-        ))}
+      {shown
+        .filter((result) => result.narrative || result.evidence?.model || result.evidence?.model_error)
+        .map((result) => <ModelVerdict key={result.sample_id} result={result} />)}
 
       {openSample && (
         <SampleChain
@@ -369,25 +464,119 @@ function SampleChain({
         </dd>
       </dl>
 
+      {data.judge_verdicts.length > 0 && (
+        <div className="row tight" style={{ marginTop: 8 }}>
+          {data.judge_verdicts.map((verdict) => (
+            <span
+              key={verdict.metric}
+              className={`tag ${verdict.failure_kind ? 'bad' : verdict.score === null ? '' : 'ok'}`}
+              title={verdict.failure_kind ?? JSON.stringify(verdict.detail)}
+            >
+              {verdict.metric} {verdict.failure_kind ?? verdict.score?.toFixed(2) ?? '无定义'}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <Chain
+        question={question}
+        goldPages={goldPages}
+        response={data.response ?? {}}
+        goldDocIds={(data.detail.gold_doc_ids as string[] | undefined) ?? []}
+      />
+
+      <h4 style={{ marginTop: 14 }}>原始数据</h4>
       <Collapsible title="判据证据">
         <pre className="block">{JSON.stringify(evidence, null, 2)}</pre>
       </Collapsible>
       <Collapsible title="逐样本指标">
         <pre className="block">{JSON.stringify(data.metrics, null, 2)}</pre>
       </Collapsible>
-      {data.judge_verdict && (
-        <Collapsible title={`faithfulness ${data.judge_verdict.score ?? '—'}`}>
-          <pre className="block">{JSON.stringify(data.judge_verdict.detail, null, 2)}</pre>
+      {data.judge_verdicts.map((verdict) => (
+        <Collapsible key={verdict.metric} title={`${verdict.metric} 判据明细`}>
+          <pre className="block">{JSON.stringify(verdict.detail, null, 2)}</pre>
         </Collapsible>
-      )}
+      ))}
       <Collapsible title="完整响应">
         <pre className="block tall">{JSON.stringify(data.response, null, 2)}</pre>
       </Collapsible>
+    </div>
+  )
+}
 
-      <h4>gold 文档的编译链路</h4>
+/** 检索信号的中文名。graph-neighbor 用强调色，它是图边的净贡献。 */
+const REASONS: Record<string, { text: string; kind: string }> = {
+  semantic: { text: '语义', kind: '' },
+  lexical: { text: '词面', kind: '' },
+  'exact-title': { text: '标题精确', kind: '' },
+  'graph-neighbor': { text: '图扩展', kind: 'accent' },
+  'sidecar-prefiltered': { text: '预筛', kind: '' },
+}
+
+/** 完整链路：原文 → artifact → 检索到的 chunk → 回答，一屏走完。 */
+function Chain({
+  question,
+  goldPages,
+  response,
+  goldDocIds,
+}: {
+  question: string
+  goldPages: [string, string | null][]
+  response: Record<string, unknown>
+  goldDocIds: string[]
+}) {
+  const snippets = (response.snippets as Snippet[] | undefined) ?? []
+  const retrieved = (response.retrievedSources as { title?: string; id?: string }[] | undefined) ?? []
+  const citations = (response.citations as { sourcePageId?: string }[] | undefined) ?? []
+  const goldPageIds = new Set(goldPages.map(([, page]) => page).filter(Boolean))
+  const cited = new Set(citations.map((c) => c.sourcePageId).filter(Boolean))
+
+  const isGold = (snippet: Snippet) =>
+    (snippet.sourceWindows ?? []).some((w) => w.sourcePageId && goldPageIds.has(w.sourcePageId))
+  const graphOnly = snippets.filter((s) => (s.retrievalReasons ?? []).includes('graph-neighbor'))
+
+  return (
+    <>
+      <h4 style={{ marginTop: 14 }}>完整链路</h4>
+      <div className="chain-summary small">
+        <span>
+          gold <strong>{goldDocIds.length}</strong> 篇
+        </span>
+        <span>→</span>
+        <span>
+          已编译 <strong>{goldPageIds.size}</strong> 篇
+        </span>
+        <span>→</span>
+        <span>
+          检索 <strong>{snippets.length || retrieved.length}</strong> 条
+          {snippets.length > 0 && (
+            <span className="muted">（命中 gold {snippets.filter(isGold).length}）</span>
+          )}
+        </span>
+        <span>→</span>
+        <span>
+          引用 <strong>{citations.length}</strong> 条
+        </span>
+        {graphOnly.length > 0 && (
+          <span className="muted">
+            其中图扩展 <strong>{graphOnly.length}</strong> 条
+          </span>
+        )}
+      </div>
+
+      <h5>1 · 原文与编译产物</h5>
       {goldPages.length === 0 && <p className="small muted">这个数据集没有 gold 标注。</p>}
       {goldPages.map(([docId, pageId]) => (
-        <Collapsible key={docId} title={`${docId}${pageId ? '' : '（未导入）'}`}>
+        <Collapsible
+          key={docId}
+          title={
+            <>
+              {docId}
+              {!pageId && <span className="tag bad">未导入</span>}
+              {pageId && cited.has(pageId) && <span className="tag ok">被引用</span>}
+            </>
+          }
+        >
           {pageId ? (
             <LineageView pageId={pageId} question={question} />
           ) : (
@@ -395,6 +584,33 @@ function SampleChain({
           )}
         </Collapsible>
       ))}
-    </div>
+
+      <h5>2 · 检索到的 chunk（{snippets.length}）</h5>
+      {snippets.length === 0 && (
+        <p className="small muted">
+          响应里没有 snippets。
+          {retrieved.length > 0 && `只有 ${retrieved.length} 条 retrievedSources（无正文）。`}
+        </p>
+      )}
+      {snippets.map((snippet, index) => (
+        <Collapsible
+          key={index}
+          title={
+            <>
+              <span className="mono small">#{index + 1}</span> {snippet.title || '（无标题）'}
+              {isGold(snippet) && <span className="tag ok">gold</span>}
+              {(snippet.retrievalReasons ?? []).map((reason) => (
+                <span key={reason} className={`tag ${REASONS[reason]?.kind ?? ''}`}>
+                  {REASONS[reason]?.text ?? reason}
+                </span>
+              ))}
+            </>
+          }
+        >
+          <pre className="block">{snippet.text || '（无正文）'}</pre>
+        </Collapsible>
+      ))}
+
+    </>
   )
 }

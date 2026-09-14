@@ -26,7 +26,7 @@ export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
 
   const ready = data.datasets.filter((d) => d.files_ready)
   const targets = selected.length ? selected : ready.map((d) => d.name)
-  // 能归一化的都已入库，就不必再看这一栏；想重做由「重新归一化」显式打开。
+  // 都已入库时收起这一栏，由「重新归一化」显式打开。
   const allDone = ready.length > 0 && ready.every((d) => d.normalized)
 
   return (
@@ -171,7 +171,7 @@ export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
   )
 }
 
-/** 归一化后的样本与语料。样本是一张表，一页五条；语料每条是整段正文，一页一条。 */
+/** 归一化后的样本与语料。样本一页五条，语料一页一条。 */
 function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
   const [term, setTerm] = useState('')

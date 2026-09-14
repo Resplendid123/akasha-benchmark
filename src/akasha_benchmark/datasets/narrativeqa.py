@@ -1,16 +1,8 @@
 """narrativeqa 适配器。293 个问题、10 篇长文档，无 evidence 标注。
 
-**故意不声明** ``GOLD_DOCS``：这份数据没有 gold 文档，检索指标在它上面
-是无定义的。对它请求检索指标会抛异常，而不是把 0.0 混进平均值。
-
-身份：没有原生 QA ID，所以 ``dataset_sample_id`` 用它在**全量**数据文件里的
-行号字符串。这条口径只在 :data:`SAMPLE_ID_RULES` 注册一次，预处理与评测
-两侧都从那里读，所以抽子集不会让样本被重新编号。
-
-QA 文件有 94MB，因为每一行都内联了整篇 ``document.text``
-（约 210KB x 293 行，而实际只有 10 篇不同的文档）。解析时只留
-``document.id`` / ``kind`` 并丢掉正文，加载成本才降下来；
-同样的内容 corpus 文件里已经切好块了。
+不声明 ``GOLD_DOCS``：检索指标在这组上无定义，请求它们会抛异常而不是记 0.0。
+``dataset_sample_id`` 用全量文件里的行号字符串，口径见 :data:`SAMPLE_ID_RULES`。
+解析时丢掉每行内联的 ``document.text``（同样内容 corpus 已切块）。
 """
 
 from __future__ import annotations
@@ -22,11 +14,6 @@ from .corpus import CorpusIndex
 from .models import CanonicalSample, DataDependency, make_sample_id
 
 
-def document_id_of(doc_id: str) -> str:
-    """``"4b30ab…865_17"`` 取 ``"4b30ab…865"``。corpus 的 idx 形如 ``{document_id}_{chunk_seq}``。"""
-    return doc_id.rsplit("_", 1)[0]
-
-
 class NarrativeQAAdapter(DatasetAdapter):
     name: ClassVar[str] = "narrativeqa"
     aliases: ClassVar[tuple[str, ...]] = (
@@ -36,7 +23,6 @@ class NarrativeQAAdapter(DatasetAdapter):
     )
     qa_filename: ClassVar[str] = "narrativeqa.json"
     corpus_filename: ClassVar[str] = "narrativeqa_corpus.json"
-    # 不含 GOLD_DOCS，原因见模块 docstring。
     provides: ClassVar[frozenset[DataDependency]] = frozenset({DataDependency.REFERENCE_ANSWERS})
 
     def expected_qa_rows(self) -> int:
@@ -61,7 +47,7 @@ class NarrativeQAAdapter(DatasetAdapter):
             raise ValueError(f"{self.name}: row {row_index} has no document.id")
         document_id = document["id"]
 
-        # document.id 是文档级的（只有 10 个不同值），绝不能当行身份。
+        # document.id 是文档级的（只有 10 个不同值），不能当行身份。
         native_id = str(row_index)
         return CanonicalSample(
             dataset=self.name,

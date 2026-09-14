@@ -8,25 +8,22 @@ import type {
   DatasetEntry,
   EvalDetail,
   EvalSampleDetail,
-  EvalSamples,
   Lineage,
   MetricsView,
   ModelConfigsView,
   Paged,
   Provider,
+  ProviderProbe,
   RawSamples,
   ResponseList,
-  Sample,
   SampleDetail,
   SampleList,
   Stage,
   Task,
   TaskDetail,
-  WorstList,
 } from './types'
 
-// 令牌只在绑非回环地址时才需要。放 sessionStorage 而不是 localStorage：
-// 关掉标签页就没了，少一个长期留在磁盘上的凭据。
+// 令牌只在绑非回环地址时需要。放 sessionStorage：关掉标签页就没了。
 const TOKEN_KEY = 'akasha-platform-token'
 
 export const setToken = (token: string) => sessionStorage.setItem(TOKEN_KEY, token)
@@ -108,6 +105,8 @@ export const api = {
   saveProvider: (role: 'judge' | 'attribution', payload: Record<string, unknown>) =>
     put<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, payload),
   deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
+  // 真调一次这个端点，发一句 hi。
+  probeProvider: (id: number) => post<ProviderProbe>(`/api/providers/${id}/probe`),
 
   // --- 数据集层与归一化层 ---
   datasets: () => request<{ datasets: DatasetEntry[]; dataset_dir: string }>('/api/datasets'),
@@ -128,7 +127,6 @@ export const api = {
 
   // --- 编译层 ---
   compiles: () => request<{ compiles: CompileRun[] }>('/api/compiles'),
-  compile: (id: number) => request<CompileRun>(`/api/compiles/${id}`),
   compileDocs: (
     id: number,
     params: { dataset?: string; gold_only?: boolean; limit?: number; offset?: number } = {},
@@ -136,19 +134,10 @@ export const api = {
     request<Paged & { docs: CompileDoc[]; imported: number }>(
       `/api/compiles/${id}/docs${query(params)}`,
     ),
-  compileSamples: (
-    id: number,
-    params: { dataset?: string; limit?: number; offset?: number } = {},
-  ) =>
-    request<Paged & { samples: Sample[] }>(`/api/compiles/${id}/samples${query(params)}`),
   deleteCompile: (id: number) =>
     del<{ deleted: number; space_id: string | null; note: string }>(`/api/compiles/${id}`),
 
   // --- 查询层 ---
-  queryRun: (id: number) =>
-    request<CompileRun['queries'][number] & { selected: number; pending: number }>(
-      `/api/queries/${id}`,
-    ),
   responses: (
     id: number,
     params: { dataset?: string; answer_mode?: string; limit?: number; offset?: number } = {},
@@ -161,10 +150,6 @@ export const api = {
 
   // --- 评测层 ---
   evalRun: (id: number) => request<EvalDetail>(`/api/evals/${id}`),
-  evalSamples: (id: number, params: { dataset?: string; answer_mode?: string } = {}) =>
-    request<EvalSamples>(`/api/evals/${id}/samples${query(params)}`),
-  worst: (id: number, metric: string, dataset?: string, limit = 20) =>
-    request<WorstList>(`/api/evals/${id}/worst${query({ metric, dataset, limit })}`),
   evalSample: (id: number, sampleId: string) =>
     request<EvalSampleDetail>(`/api/evals/${id}/samples/${encodeURIComponent(sampleId)}`),
   deleteEval: (id: number) => del<{ deleted: number }>(`/api/evals/${id}`),
@@ -182,7 +167,7 @@ export const api = {
     request<TaskDetail>(`/api/tasks/${id}${query({ after_id: afterId })}`),
   startTask: (stage: string, args: Record<string, unknown>) =>
     post<Task>(`/api/tasks/${stage}`, args),
-  // 链路测试起的是四条普通阶段任务，返回链首那条。
+  // 起四条普通阶段任务，返回链首那条。
   startChain: (args: Record<string, unknown>) => post<Task>('/api/chain', args),
   pauseTask: (id: number) => post<Task>(`/api/tasks/${id}/pause`),
   resumeTask: (id: number) => post<Task>(`/api/tasks/${id}/resume`),

@@ -10,6 +10,7 @@ import {
   ModeTag,
   Pager,
   StatusTag,
+  Timing,
   num,
   useAction,
   useAsync,
@@ -84,14 +85,14 @@ export function Query({
       {compile && compile.queries.length > 0 && (
         <>
           <h3>查询记录</h3>
-          <table>
+          <table className="records-table">
             <thead>
               <tr>
                 <th>名称</th>
                 <th>状态</th>
                 <th className="num">响应</th>
                 <th className="num">失败</th>
-                <th className="num">平均延迟</th>
+                <th>耗时</th>
                 <th>阈值</th>
                 <th />
               </tr>
@@ -114,10 +115,17 @@ export function Query({
                     </td>
                     <td className="num">{responses}</td>
                     <td className="num">{failures || '—'}</td>
-                    <td className="num">{mean ? `${Math.round(mean)}ms` : '—'}</td>
-                    <td className="small muted">{run.score_threshold ?? '服务端默认'}</td>
                     <td>
-                      <div className="row tight">
+                      <Timing
+                        startedAt={run.created_at}
+                        finishedAt={run.finished_at}
+                        latencyMs={mean}
+                        perLabel="条"
+                      />
+                    </td>
+                    <td className="small muted">{run.score_threshold ?? '服务端默认'}</td>
+                    <td className="table-actions-cell">
+                      <div className="table-actions">
                         <button
                           className="action small"
                           onClick={() => setOpenQuery(openQuery === run.id ? null : run.id)}
@@ -210,27 +218,28 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
         </Field>
       </div>
 
-
-      <button
-        className="action primary"
-        disabled={start.busy || selected.length === 0}
-        onClick={() =>
-          start.run(async () => {
-            const task = await api.startTask('query', {
-              compile_id: compile.id,
-              datasets: selected,
-              concurrency,
-              ...(name.trim() ? { name: name.trim() } : {}),
-              ...(limit === '' ? {} : { sample_limit: limit }),
-              ...(threshold === '' ? {} : { score_threshold: threshold }),
+      <div className="panel-actions">
+        <button
+          className="action primary"
+          disabled={start.busy || selected.length === 0}
+          onClick={() =>
+            start.run(async () => {
+              const task = await api.startTask('query', {
+                compile_id: compile.id,
+                datasets: selected,
+                concurrency,
+                ...(name.trim() ? { name: name.trim() } : {}),
+                ...(limit === '' ? {} : { sample_limit: limit }),
+                ...(threshold === '' ? {} : { score_threshold: threshold }),
+              })
+              onStarted()
+              return task
             })
-            onStarted()
-            return task
-          })
-        }
-      >
-        {start.busy ? '启动中…' : '开始查询'}
-      </button>
+          }
+        >
+          {start.busy ? '启动中…' : '开始查询'}
+        </button>
+      </div>
     </div>
   )
 }

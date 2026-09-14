@@ -1,13 +1,7 @@
-"""多跳专项：图扩展的净价值，以及随跳数的衰减。
+"""多跳专项：图扩展的净价值。
 
-这部分是通用 RAG 基准测不出来的。Akasha 的编译器把实体物化成独立 artifact
-并跨文档合并，所以两个 hop 可能被编译器直接连成一条 graph edge，
-而不是靠两次独立检索各自找到。``snippets[].retrievalReasons`` 暴露了每个
-snippet 是哪个信号产出的，图扩展的净贡献因此可以直接量化。
-
-snippet 对应哪些页，走 ``sourceWindows[].sourcePageId``
-（``KnowledgeSourceWindow extends KnowledgeCitation``）—— 这是把「检索原因」
-和「是否命中 gold」关联起来的唯一路径。
+``snippets[].retrievalReasons`` 给出每个 snippet 由哪个信号产出，
+``sourceWindows[].sourcePageId`` 给出它对应哪些页。
 """
 
 from __future__ import annotations
@@ -17,8 +11,6 @@ from collections.abc import Sequence
 from typing import Any
 
 GRAPH_NEIGHBOR = "graph-neighbor"
-# 已知的信号取值，取自 knowledge-retrieval.service.ts。
-KNOWN_REASONS = ("semantic", "lexical", "exact-title", GRAPH_NEIGHBOR, "sidecar-prefiltered")
 
 
 def snippet_doc_ids(snippet: dict[str, Any], page_to_doc: dict[str, str]) -> set[str]:
@@ -65,8 +57,7 @@ def evaluate_sample(
             gold_from_other |= hits
 
     total = len(snippets)
-    # 只能靠图扩展才拿到的 gold —— 这是 graph edge 的净增量价值，
-    # 即语义/词法召回本来就能找到的部分之外，图额外贡献了什么。
+    # 只能靠图扩展才拿到的 gold，即图边的净增量。
     graph_exclusive_gold = gold_only_from_graph - gold_from_other
 
     return {
@@ -83,48 +74,3 @@ def evaluate_sample(
         "reason_gold_counts": dict(reason_gold_counts),
         "reason_gold_doc_counts": {r: len(d) for r, d in sorted(reason_gold_docs.items())},
     }
-
-
-def aggregate(per_sample: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """数值项取均值；按信号的计数项累加后再算命中率。"""
-    if not per_sample:
-        return {}
-    numeric_keys = [
-        "snippet_count",
-        "graph_neighbor_snippets",
-        "graph_neighbor_share",
-        "graph_neighbor_gold_snippets",
-        "graph_neighbor_precision",
-        "graph_exclusive_gold_count",
-        "graph_exclusive_gold_share",
-    ]
-    result: dict[str, Any] = {
-        key: sum(row[key] for row in per_sample) / len(per_sample) for key in numeric_keys
-    }
-
-    reason_totals: Counter[str] = Counter()
-    reason_gold_totals: Counter[str] = Counter()
-    for row in per_sample:
-        reason_totals.update(row["reason_counts"])
-        reason_gold_totals.update(row["reason_gold_counts"])
-
-    result["reason_totals"] = dict(sorted(reason_totals.items()))
-    result["reason_gold_totals"] = dict(sorted(reason_gold_totals.items()))
-    # 各信号「产出的 snippet 里有多少命中 gold」，即信号自身的质量。
-    result["reason_gold_rate"] = {
-        reason: reason_gold_totals[reason] / count
-        for reason, count in sorted(reason_totals.items())
-        if count
-    }
-    return result
-
-
-def stratify(
-    rows: Sequence[dict[str, Any]], key: str
-) -> dict[str, list[dict[str, Any]]]:
-    """按某个 metadata 字段给逐样本结果分组，用于出随跳数的衰减曲线。"""
-    buckets: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        value = str((row.get("metadata") or {}).get(key, "unknown"))
-        buckets.setdefault(value, []).append(row)
-    return dict(sorted(buckets.items()))

@@ -1,17 +1,15 @@
 """编译层：抽子集 -> 建空间 -> 导入 -> 编译 -> 质量闸门。
 
-抽样顺序必须**先 QA 后 corpus**。随机抽语料的话大部分 gold 会落在子集外，
-Recall 会因为跟检索器毫无关系的原因被钉在 0 附近。
+抽样顺序是先 QA 后 corpus，否则大部分 gold 会落在子集外：
 
     1. 固定种子抽 N 条 QA
     2. 这些 QA 的 gold 全集作为语料必选集
     3. 从剩余语料随机补负样本
 
-narrativeqa 走另一条路：它没有 gold 标注，293 个问题只覆盖 10 篇文档，
-所以整篇整篇地取文档（连同全部 chunk），再取属于这些文档的问题。
+narrativeqa 没有 gold 标注，改成整篇取文档，再取属于这些文档的问题。
 
 一次编译一个空间，``run_id`` 固化这次的配置与模型快照。导入逐条提交，
-所以暂停后继续时跳过已导入的文档，而不是重来。
+所以暂停后继续时跳过已导入的文档。
 """
 
 from __future__ import annotations
@@ -36,15 +34,15 @@ DEFAULT_NARRATIVEQA_DOCS = 2
 
 
 def default_seed() -> int:
-    """当天日期，形如 20260908。同一天起的编译抽同一批，跨天换一批。"""
+    """当天日期，形如 20260908。同一天起的编译抽同一批。"""
     return int(datetime.now(UTC).strftime("%Y%m%d"))
 
 
 def _largest_remainder(weights: dict[str, int], total: int) -> dict[str, int]:
-    """按比例分配名额，各层之和精确等于 total，小层也分得到。"""
+    """按比例分配名额，各层之和精确等于 total。"""
     pool = sum(weights.values())
     if pool == 0:
-        return {k: 0 for k in weights}
+        return dict.fromkeys(weights, 0)
     exact = {k: total * v / pool for k, v in weights.items()}
     floors = {k: int(v) for k, v in exact.items()}
     order = sorted(weights, key=lambda k: (-(exact[k] - floors[k]), k))
@@ -64,7 +62,7 @@ def _stratified(
     quotas = _largest_remainder({k: len(v) for k, v in strata.items()}, limit)
     picked: list[dict[str, Any]] = []
     for name in sorted(strata):
-        # 先排序再抽，结果不依赖查询返回顺序。
+        # 先排序再抽，结果因此不依赖查询返回顺序。
         available = sorted(strata[name], key=lambda s: s["sample_id"])
         picked.extend(rng.sample(available, min(quotas[name], len(available))))
 
@@ -78,7 +76,7 @@ def _stratified(
 
 
 def _safe_doc_id(doc_id: str) -> str:
-    """doc_id 会当导入的 filename 用，所以任何可能跳出目录的取值都拒掉。"""
+    """拒掉不能当导入 filename 用的 doc_id。"""
     if not doc_id or doc_id in {".", ".."} or set(doc_id) & set('/\\:*?"<>|'):
         raise ValueError(f"doc_id {doc_id!r} 不能作为文件名")
     return doc_id
@@ -105,8 +103,7 @@ def build_subset(
     if not samples:
         raise ValueError(f"{adapter.name} 没有样本")
 
-    # 随机源是 (数据集, seed)，不含 run_id：同 seed 要能抽出同一批文档，
-    # 「同子集换 embedding」的对照实验才凑得出来。
+    # 随机源是 (数据集, seed) 而不含 run_id，同 seed 因此抽出同一批文档。
     rng = random.Random(f"{adapter.name}:{seed}")
 
     if adapter.has(DataDependency.GOLD_DOCS):
@@ -125,7 +122,7 @@ def build_subset(
         negatives = sorted(rng.sample(pool, min(wanted, len(pool))))
         doc_ids = sorted(set(gold_ids) | set(negatives))
     else:
-        # narrativeqa：整篇取文档，优先取 chunk 最少的 —— chunk 数直接决定编译成本。
+        # narrativeqa：整篇取文档，优先取 chunk 最少的（chunk 数决定编译成本）。
         strategy = "whole_documents"
         chunks: dict[str, list[str]] = defaultdict(list)
         for doc in corpus:
@@ -144,7 +141,7 @@ def build_subset(
             picked = sorted(rng.sample(picked, qa_limit), key=lambda s: s["sample_id"])
         gold_ids, negatives = [], []
 
-    # 验收：每条样本的所有 gold 必须在子集语料内，否则 Recall 的上限就不是 1。
+    # 验收：每条样本的 gold 都要在子集语料内，否则 Recall 的上限不是 1。
     subset_ids = set(doc_ids)
     uncovered = {
         s["sample_id"]: sorted(set(s["gold_doc_ids"]) - subset_ids)
@@ -177,7 +174,7 @@ def build_subset(
 
 
 def markdown_of(connection: sqlite3.Connection, dataset: str, doc_id: str) -> str:
-    """导入 Akasha 的正文。heading 承担 title，文件名承担 doc_id，两者独立。"""
+    """渲染导入 Akasha 的正文。heading 承担 title，文件名承担 doc_id。"""
     doc = data_store.corpus_doc(connection, dataset, doc_id)
     if doc is None:
         raise ValueError(f"{dataset}/{doc_id} 不在语料里")
@@ -185,12 +182,17 @@ def markdown_of(connection: sqlite3.Connection, dataset: str, doc_id: str) -> st
 
 
 def _wait_for_compile(
-    ctx: TaskContext, client: AkashaClient, space_id: str, config: AkashaConfig
+    ctx: TaskContext,
+    client: AkashaClient,
+    space_id: str,
+    config: AkashaConfig,
+    *,
+    expect_runs: int = 0,
 ) -> dict[str, Any]:
-    """轮询到全部编译 Run 终态。
+    """轮询到全部编译 Run 终态，返回 ``{status_counts, no_runs, timed_out}``。
 
-    编译并发不在我们手里：真正在编译的是 Akasha 的 BullMQ worker，
-    观察到的约 40 秒/篇是那边的吞吐，客户端调不动。
+    空的 ``statusCounts`` 与「全部终态」分开报：两者的 ``active`` 都是 0，
+    但前者是压根没编译。``expect_runs`` 为 0 且看不到 Run 时立即返回。
     """
     deadline = time.monotonic() + config.poll_timeout_seconds
     while True:
@@ -198,20 +200,72 @@ def _wait_for_compile(
         summary = client.run_diagnostics_summary([space_id])
         counts: dict[str, int] = summary.get("statusCounts") or {}
         active = sum(n for name, n in counts.items() if name in ACTIVE_RUN_STATUSES)
-        if active == 0:
-            return {"status_counts": counts, "timed_out": False}
+        if counts and active == 0:
+            return {"status_counts": counts, "no_runs": False, "timed_out": False}
+        if not counts and expect_runs == 0:
+            return {"status_counts": counts, "no_runs": True, "timed_out": False}
         if time.monotonic() > deadline:
-            return {"status_counts": counts, "timed_out": True}
-        ctx.log(f"编译中：{counts}")
+            return {"status_counts": counts, "no_runs": not counts, "timed_out": True}
+        ctx.log(f"编译中：{counts}" if counts else "等待编译 Run 出现")
         time.sleep(config.poll_interval_seconds)
 
 
-def _quality_gate(client: AkashaClient, space_id: str) -> dict[str, Any]:
-    """入库完整性闸门。
+def _page_failures(client: AkashaClient, space_id: str) -> list[str]:
+    """按 errorCode 聚合失败页面，逐条描述成一行。"""
+    try:
+        log = client.page_log([space_id])
+    except AkashaError as exc:
+        return [f"读逐页日志失败：HTTP {exc.status}"]
 
-    四项计数取不到值时**不算通过** —— ``all(v == 0)`` 对空集合返回 True,
-    那会让一个半成品索引静默过闸。所以要求四项都拿到值且都为 0。
+    entries = log.get("items") or []
+    failed = [e for e in entries if e.get("status") == "failed"]
+    if not failed:
+        return []
+
+    grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for entry in failed:
+        key = (
+            str(entry.get("errorCode") or "unknown"),
+            str(entry.get("errorSummary") or ""),
+        )
+        grouped[key].append(str(entry.get("title") or entry.get("sourcePageId") or "?"))
+
+    lines = []
+    for (code, summary), titles in sorted(grouped.items()):
+        sample = "、".join(titles[:3]) + ("…" if len(titles) > 3 else "")
+        lines.append(f"{len(titles)} 篇 {code}：{summary}（例如 {sample}）")
+    return lines
+
+
+def _compile_pace(client: AkashaClient, space_id: str) -> dict[str, Any] | None:
+    """每篇编译耗时的估算，取 Run 的墙钟时长除以页数。
+
+    是估算而不是实测：单篇的起止时间拿不到，并发度大于 1 时这个值偏高。
     """
+    try:
+        report = client.run_diagnostics([space_id])
+    except AkashaError:
+        return None
+
+    runs = report.get("items") or []
+    if not runs:
+        return None
+    total_ms = sum(int(r.get("runDurationMs") or 0) for r in runs)
+    pages = sum(
+        int((r.get("progress") or {}).get("text", {}).get("expected") or 0) for r in runs
+    )
+    if not pages or not total_ms:
+        return None
+    return {
+        "runs": len(runs),
+        "pages": pages,
+        "total_ms": total_ms,
+        "per_page_ms": round(total_ms / pages),
+    }
+
+
+def _quality_gate(client: AkashaClient, space_id: str) -> dict[str, Any]:
+    """入库完整性闸门。要求四项计数都拿到值且都为 0，取不到值不算通过。"""
     report = client.quality_diagnostics([space_id])
     summary = report.get("summary") or {}
     gates = {
@@ -247,7 +301,7 @@ def run(ctx: TaskContext) -> None:
     config = load_config(ctx.db)
     config.require_credentials()
 
-    # 续跑：同 run_id 复用那条记录，已导入的文档跳过。
+    # 同 run_id 复用那条记录，已导入的文档跳过。
     run_id = str(params.get("run_id") or "").strip() or f"run{uuid.uuid4().hex[:10]}"
     existing = run_store.compile_run_by_run_id(ctx.db, run_id)
     if existing:
@@ -289,12 +343,14 @@ def _execute(
     negatives_ratio: float,
     config: AkashaConfig,
 ) -> None:
-    # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档,
+    # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档，
     # 而那种错配不报错，只会让每个检索指标都算错。
     if not run_store.compile_docs(ctx.db, compile_id):
-        for index, dataset in enumerate(datasets):
+        for dataset in datasets:
             ctx.checkpoint()
-            ctx.progress(index, len(datasets), f"{dataset} 抽子集")
+            # 编译三段共用一把刻度（抽子集 0、导入 1、等编译 2、完成 3），
+            # 免得各段用各自的总量让进度条来回跳。细节放 note 里。
+            ctx.progress(0, 3, f"抽子集 {dataset}")
             stats = build_subset(
                 ctx.db,
                 compile_id,
@@ -315,7 +371,7 @@ def _execute(
         me = client.current_user()
         user = (me or {}).get("user") or {}
         workspace = (me or {}).get("workspace") or {}
-        # 非 OWNER 会在授权闸门静默丢弃 chunk，症状看起来像召回质量差而不是报错。
+        # 非 owner 会在授权闸门静默丢弃 chunk，症状看起来像召回质量差。
         if user.get("role") != "owner":
             raise RuntimeError(
                 f"当前账号角色是 {user.get('role')!r}，不是 owner。"
@@ -325,7 +381,7 @@ def _execute(
         record = run_store.get_compile_run(ctx.db, compile_id) or {}
         space_id = record.get("space_id")
         if not space_id:
-            # 随机 slug：这个空间属于本次编译，与用户自己的空间分开。
+            # 随机 slug，把这次编译的空间与用户自己的空间分开。
             slug = f"bench{uuid.uuid4().hex[:16]}"
             space = client.create_space(
                 name=f"bench {run_id}"[:100],
@@ -346,9 +402,7 @@ def _execute(
             ctx.db.commit()
             ctx.log(f"创建空间 {slug}（{space_id}）")
         else:
-            # 续跑：这个空间只在它当初那个 workspace 里解析得到。换了账号或部署之后
-            # 往这里导入，已记下的 page_id 全部失效，而这不报错 —— 必须在发出任何
-            # 写入之前拦住。
+            # 在发出任何写入之前拦住：换了账号或部署之后，已记下的 page_id 全部失效。
             mismatch = run_store.workspace_mismatch(
                 ctx.db, compile_id, workspace.get("id")
             )
@@ -358,13 +412,20 @@ def _execute(
 
         _import_docs(ctx, client, compile_id, space_id)
 
-        ctx.progress(0, None, "等待编译")
+        # 等编译的总量拿不到，用「导入完 = 2/3」这一档，收尾时推到 3/3。
+        ctx.progress(2, 3, "等待编译")
         result = client.compile_spaces([space_id])
-        ctx.log(
-            f"已请求编译：accepted={result.get('acceptedRunCount')} "
-            f"coalesced={result.get('coalescedRunCount')}"
-        )
-        wait = _wait_for_compile(ctx, client, space_id, config)
+        accepted = int(result.get("acceptedRunCount") or 0)
+        coalesced = int(result.get("coalescedRunCount") or 0)
+        ctx.log(f"已请求编译：accepted={accepted} coalesced={coalesced}")
+        wait = _wait_for_compile(ctx, client, space_id, config, expect_runs=accepted + coalesced)
+        if wait["no_runs"]:
+            # 一个 Run 都没有：page 停在「已上传、未编译」，没有源文本也没有 chunk。
+            raise RuntimeError(
+                f"编译没有启动：Akasha 一个编译 Run 都没有（accepted={accepted} "
+                f"coalesced={coalesced}）。{len(run_store.compile_docs(ctx.db, compile_id))} "
+                "篇语料已上传但没被编译，请检查 Akasha 的编译 worker 是否在跑。"
+            )
         if wait["timed_out"]:
             raise RuntimeError(
                 f"编译轮询超时（{config.poll_timeout_seconds}s），"
@@ -372,27 +433,40 @@ def _execute(
             )
         ctx.log(f"编译终态：{wait['status_counts']}")
 
+        pace = _compile_pace(client, space_id)
+        if pace:
+            run_store.update_compile_run(ctx.db, compile_id, pace_json=dumps(pace))
+            ctx.log(
+                f"编译节奏（估算）：{pace['pages']} 篇用 "
+                f"{pace['total_ms'] / 1000:.1f}s，约 {pace['per_page_ms'] / 1000:.1f}s/篇"
+            )
+
         quality = _quality_gate(client, space_id)
         run_store.update_compile_run(ctx.db, compile_id, quality_json=dumps(quality))
         ctx.db.commit()
         ctx.log(f"质量闸门 {quality['gates']} -> {'通过' if quality['passed'] else '未通过'}")
         if not quality["passed"]:
-            raise RuntimeError("编译质量闸门未通过：半成品索引产出的指标没有意义")
+            # 闸门报的是后果，原因要从逐页日志取。
+            reasons = _page_failures(client, space_id)
+            for line in reasons:
+                ctx.log(f"编译失败原因：{line}", "error")
+            detail = f"；{reasons[0]}" if reasons else ""
+            raise RuntimeError(
+                f"编译质量闸门未通过：半成品索引产出的指标没有意义{detail}"
+            )
 
     run_store.update_compile_run(
         ctx.db, compile_id, status=run_store.STATUS_SUCCEEDED, finished_at=utc_now()
     )
     ctx.db.commit()
+    ctx.progress(3, 3, "编译完成")
     ctx.log("编译完成，可以进入查询层")
 
 
 def _import_docs(
     ctx: TaskContext, client: AkashaClient, compile_id: int, space_id: str
 ) -> None:
-    """串行导入未导入的文档。逐条提交，所以暂停后继续不会重复导入。
-
-    导入失败记下来继续下一篇：缺篇能被发现（page_id 为空），重复不能。
-    """
+    """串行导入未导入的文档，逐条提交。失败的记下来并继续下一篇。"""
     pending = run_store.compile_docs(ctx.db, compile_id, pending_only=True)
     total = len(run_store.compile_docs(ctx.db, compile_id))
     done = total - len(pending)
@@ -421,7 +495,7 @@ def _import_docs(
             failures += 1
             ctx.log(f"{doc['dataset']}/{doc['doc_id']}: {error}", "warn")
         if done % 10 == 0 or done == total:
-            ctx.progress(done, total, f"导入 {done}/{total}")
+            ctx.progress(1, 3, f"导入语料 {done}/{total}")
 
     if failures:
         raise RuntimeError(f"{failures} 篇语料导入失败，page_map 不完整")

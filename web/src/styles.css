@@ -84,6 +84,11 @@ code, pre, .mono { font-family: var(--mono); }
 h2 { font-size: 19px; margin: 0 0 4px; letter-spacing: -0.01em; }
 h3 { font-size: 15px; margin: 22px 0 8px; }
 h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
+/* 链路的分段标题：比 h4 更轻，因为它是 h4 之下的一层。 */
+h5 {
+  font-size: 12px; margin: 12px 0 5px; color: var(--muted);
+  font-weight: 600; text-transform: none;
+}
 .lede { color: var(--muted); margin: 0 0 18px; max-width: 82ch; }
 
 .panel {
@@ -146,6 +151,38 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 tbody tr:hover { background: var(--panel-2); }
 tbody tr.selected { background: var(--accent-soft); }
 
+/* 记录表共用一套节奏：剩余宽度按内容比例摊给各数据列，操作列只占按钮那么宽
+   并钉在右侧。
+
+   剩余宽度不能集中给某一列：给第一列，第一二列之间被推开一道大缝；给操作列，
+   缝就跑到最后一列与按钮之间。摊开之后每列都宽松一点，哪儿都没有大缝。 */
+.records-table { table-layout: auto; }
+.records-table td { white-space: nowrap; }
+/* 记录列表里一律左对齐。这里的数字是 1-3 位的计数，右对齐换不来可读性，
+   只会让同一行里左右混排。右对齐留给明细表 —— 那里要纵向比量级。 */
+.records-table th.num,
+.records-table td.num { text-align: left; }
+.records-table th:last-child,
+.records-table td.table-actions-cell {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+}
+.records-table td.table-actions-cell { vertical-align: middle; }
+.table-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+.table-actions > .action { flex: 0 0 auto; }
+.tasks-table th:nth-child(6),
+.tasks-table td:nth-child(6) { white-space: nowrap; }
+@media (max-width: 900px) {
+  .records-table { display: block; overflow-x: auto; }
+}
+
 /* --- 语义色：三档，文字都取深色调 --- */
 
 .tag {
@@ -167,6 +204,7 @@ tbody tr.selected { background: var(--accent-soft); }
 }
 .note.warn { border-left-color: var(--warn); background: var(--warn-soft); color: #6b4705; }
 .note.bad { border-left-color: var(--bad); background: var(--bad-soft); color: #7d1f25; }
+.note.ok { border-left-color: var(--ok); background: var(--ok-soft); color: #1c5437; }
 .note.plain { border-left-color: var(--border-strong); background: var(--panel-2); color: var(--muted); }
 .note strong { font-weight: 600; }
 .note ul { margin: 6px 0 0; padding-left: 20px; }
@@ -263,6 +301,19 @@ pre.block.tall { max-height: 520px; }
 }
 .metric-grid label { font-size: 13px; }
 .metric-grid label.unavailable { color: #a4acb9; cursor: not-allowed; }
+
+/* 链路概览：一行读完「gold → 编译 → 检索 → 引用」，断在哪一步一眼看到。 */
+.chain-summary {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; margin: 6px 0 10px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+}
+.chain-summary strong { font-family: var(--mono); }
+
+/* 指标分族：一族一块，标题行带全选。 */
+.metric-family { margin-bottom: 12px; }
+.metric-family > .spread { margin-bottom: 4px; }
+.metric-family + .metric-family { border-top: 1px solid var(--border); padding-top: 10px; }
 
 /* --- 详情键值对 --- */
 

@@ -26,17 +26,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Akasha-Benchmark 评测平台", version="0.2.0")
     app.state.settings = resolved
 
-    # 建表在启动时做，所以没有单独的迁移命令要记。
+    # 建表在启动时做，所以没有单独的迁移命令。
     archived = init_db(resolved.db_path)
     app.state.runner = TaskRunner(resolved)
-    # 上次进程留下的「运行中」任务：线程已经没了，标成暂停让用户显式继续。
+    # 上次进程留下的「运行中」任务标成暂停，让用户显式继续。
     recovered = app.state.runner.recover()
     app.state.startup = {
         "archived_legacy_db": str(archived) if archived else None,
         "recovered_tasks": recovered,
     }
 
-    # 开发时前端在 Vite dev server 上，需要 CORS；同源部署时也安全。
+    # 开发时前端在 Vite dev server 上，需要 CORS。
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(resolved.dev_origins),

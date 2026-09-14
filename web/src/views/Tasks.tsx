@@ -7,6 +7,7 @@ import {
   Loading,
   STATUS_TEXT,
   StatusTag,
+  formatDateTime,
   useAction,
   useAsync,
   usePoll,
@@ -64,7 +65,7 @@ export function Tasks() {
       {list.length === 0 && !tasks.loading && <p className="muted">还没有任务。</p>}
 
       {list.length > 0 && (
-        <table>
+        <table className="records-table tasks-table">
           <thead>
             <tr>
               <th>#</th>
@@ -152,9 +153,9 @@ function Row({
           .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join('+') : value}`)
           .join(' ') || '—'}
       </td>
-      <td className="small muted">{task.started_at ?? '—'}</td>
-      <td>
-        <div className="row tight">
+      <td className="small muted mono">{formatDateTime(task.started_at)}</td>
+      <td className="table-actions-cell">
+        <div className="table-actions">
           <button className="action small" onClick={onToggle}>
             {open ? '收起' : '日志'}
           </button>
@@ -198,7 +199,7 @@ function Row({
   )
 }
 
-/** 增量日志。只拉新增的行，长任务的日志不会重复传。 */
+/** 增量日志，只拉 after_id 之后新增的行。 */
 function Logs({ taskId, onClose }: { taskId: number; onClose: () => void }) {
   const [detail, setDetail] = useState<TaskDetail | null>(null)
   const [error, setError] = useState<string | null>(null)

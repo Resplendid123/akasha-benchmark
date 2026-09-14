@@ -1,9 +1,6 @@
 """查询层：选一次编译的空间，逐条跑 query，把完整响应写库。
 
-**这一层不算任何指标。** 它只产出证据，解释证据是评测的事。
-存完整响应体而不是当下用得到的那几个字段 —— 重跑要烧 LLM 调用，
-以后想看某个新字段时不该被迫重跑。
-
+这一层不算指标，只产出证据。存完整响应体，免得以后想看某个新字段时被迫重跑。
 失败也照样写一行：失败率本身是结果，静默跳过会把后面所有均值算高。
 """
 
@@ -37,8 +34,7 @@ def _query_one(
         status, body, latency = response.status, response.body, response.latency_ms
         error = None
     except (AkashaError, httpx.RequestError, OSError) as exc:
-        # httpx.RequestError 不是 OSError 的子类，少了它一次网络抖动会让
-        # 整个阶段带 traceback 崩掉，而那一行也不会落库。
+        # httpx.RequestError 不是 OSError 的子类，要单独列，否则网络抖动会让整个阶段崩掉。
         status, body, latency, error = 0, None, None, f"{type(exc).__name__}: {exc}"
 
     return {
@@ -75,7 +71,7 @@ def run(ctx: TaskContext) -> None:
     if compile_run is None:
         raise ValueError(f"编译 #{compile_id} 不存在")
 
-    # 不可跳过的前置闸门。半成品索引会产出一份看起来像配置问题的报告。
+    # 不可跳过的前置闸门：半成品索引会产出一份看着合理的坏报告。
     readiness = run_store.compile_ready(ctx.db, compile_id)
     if not readiness["ready"]:
         raise ValueError("这次编译还不能用于查询：" + "；".join(readiness["reasons"]))
@@ -98,9 +94,7 @@ def run(ctx: TaskContext) -> None:
     with AkashaClient(config) as client:
         client.login()
 
-        # workspace 不匹配拒绝执行。这一层的 space_id 只在它编译时那个 workspace 里
-        # 解析得到 —— 换个地方跑，每条 query 都会打到一个空 space，而那不报错，
-        # 只会给出一份 recall 全 0 的报告。
+        # workspace 不匹配拒绝执行：换个地方跑会打到一个空 space，且不报错。
         me = client.current_user()
         mismatch = run_store.workspace_mismatch(
             ctx.db, compile_id, ((me or {}).get("workspace") or {}).get("id")
@@ -112,8 +106,7 @@ def run(ctx: TaskContext) -> None:
         snapshot = loads(compile_run["model_configs_json"])
         changed = drift(current, snapshot)
         if changed["embedding"]:
-            # 这一项不可绕过：旧 chunk 的 embedding_profile 对不上，
-            # 那些 chunk 永远召回不到，而评测会照常算出一份看着合理的坏报告。
+            # 不可绕过：旧 chunk 的 embedding_profile 对不上，永远召回不到。
             raise RuntimeError(
                 "embedding 模型在这次编译之后改过了。旧 chunk 永远召回不到，"
                 "检索指标会全部错但不报错。请重新编译。"
@@ -141,7 +134,7 @@ def run(ctx: TaskContext) -> None:
         ctx.db.commit()
         ctx.bind("query", query_id)
 
-        # 固化这一轮问哪些样本，之后续跑以它为准。
+        # 固化这一轮问哪些样本，续跑以它为准。
         selected = _select_samples(ctx.db, compile_id, datasets, limit)
         if not selected:
             raise ValueError("所选数据集在这次编译里没有样本")
@@ -182,7 +175,7 @@ def _issue(
     score_threshold: float | None,
     concurrency: int,
 ) -> None:
-    """发请求并逐条落库。已有响应的样本跳过，所以暂停后继续是续跑。"""
+    """发请求并逐条落库。已有响应的样本跳过，所以暂停后继续即续跑。"""
     todo = run_store.pending_query_samples(ctx.db, query_id)
     total = len(run_store.query_samples(ctx.db, query_id))
     done = total - len(todo)
@@ -204,11 +197,11 @@ def _issue(
             error=row["error"],
             response=row["response"],
         )
-        # 逐条提交，前端才看得到进度。
+        # 逐条提交，前端因此看得到进度。
         ctx.db.commit()
         done += 1
         if done % 5 == 0 or done == total:
-            ctx.progress(done, total, f"查询 {done}/{total}")
+            ctx.progress(done, total, "查询")
 
     if concurrency <= 1:
         for sample in todo:
@@ -217,8 +210,7 @@ def _issue(
         return
 
     # 每个 worker 一个独立客户端：限流器用实例上的 _last_request_at，
-    # 多线程共用一个实例会退化成「一起睡、一起发」。
-    # 落库只在主线程做，所以 sqlite 连接不跨线程使用。
+    # 共用一个实例会退化成「一起睡、一起发」。落库只在主线程做。
     extra = [AkashaClient(client.config) for _ in range(concurrency - 1)]
     try:
         for spare in extra:
@@ -235,7 +227,7 @@ def _issue(
                 pool.put(borrowed)
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            # 分批提交而不是一次全提交：暂停时只需要等当前这批收尾。
+            # 分批提交，暂停时只需要等当前这批收尾。
             for start in range(0, len(todo), concurrency):
                 ctx.checkpoint()
                 batch = todo[start : start + concurrency]

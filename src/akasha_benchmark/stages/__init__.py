@@ -1,10 +1,9 @@
 """六个流水线阶段。
 
 ``STAGES`` 是任务运行器唯一认的阶段来源：请求体里的阶段名必须在这里，
-参数按 ``params`` 声明过滤 —— 参数经 HTTP 进来，不过滤等于让请求体决定
-阶段代码看到什么。
+参数按 ``params`` 声明过滤，未声明的键不传给阶段代码。
 
-链路测试不是这里的一个阶段：它是 :mod:`.chain` 摊平出来的四条普通任务。
+链路测试不在这里，它是 :mod:`.chain` 摊平出来的四条普通任务。
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..task import TaskContext
-from . import attribute, chain, compile_stage, download, evaluate, normalize, query
+from . import attribute, chain, compile, download, evaluate, normalize, query
 
 
 @dataclass(frozen=True)
@@ -45,7 +44,7 @@ STAGES: dict[str, StageSpec] = {
     "compile": StageSpec(
         name="compile",
         label="编译",
-        run=compile_stage.run,
+        run=compile.run,
         params={
             "run_id": str,
             "datasets": list,
@@ -53,7 +52,7 @@ STAGES: dict[str, StageSpec] = {
             "qa_limit": int,
             "negatives_ratio": float,
         },
-        cost="约 40 秒/篇（Akasha 的 BullMQ worker 吞吐，客户端调不动）",
+        cost="约 40 秒/篇，取决于 Akasha 的编译 worker 吞吐",
         needs_akasha=True,
     ),
     "query": StageSpec(

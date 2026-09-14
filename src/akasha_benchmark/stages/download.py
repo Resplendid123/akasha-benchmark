@@ -33,8 +33,7 @@ REMOTE_NAMES = {
 MAX_ATTEMPTS = 3
 
 # 行数缓存：键是 (路径, mtime_ns, 大小)，文件一改键就变，不用手动失效。
-# 没有它每次 file_status() 都要解析上百 MB JSON（narrativeqa 单文件 94MB），
-# 而四个前端视图都读这个端点。
+# 免得每次 file_status() 都重新解析上百 MB 的 JSON。
 _ROW_CACHE: dict[tuple[str, int, int], tuple[int | None, str | None]] = {}
 
 
@@ -50,14 +49,6 @@ def _count_rows(path: Path, stat: os.stat_result) -> tuple[int | None, str | Non
         except (ValueError, UnicodeDecodeError, OSError) as exc:
             _ROW_CACHE[key] = (None, str(exc)[:200])
     return _ROW_CACHE[key]
-
-
-def local_files() -> list[str]:
-    """四组适配器声明的 QA 与语料文件名。"""
-    names: list[str] = []
-    for adapter in all_adapters():
-        names += [adapter.qa_filename, adapter.corpus_filename]
-    return names
 
 
 def file_status(dataset_dir: Path | None = None) -> list[dict[str, object]]:
@@ -120,7 +111,7 @@ def _fetch(local: str, endpoint: str, expected: int | None, dest: Path) -> str:
                 raise
             time.sleep(2**attempt)
             continue
-        # 从缓存拷出来，让 dataset/ 下是真实文件而不是链接。
+        # 从缓存拷出来，dataset/ 下放真实文件而不是链接。
         shutil.copyfile(cached, target)
         return "downloaded"
     raise RuntimeError(f"unreachable: {remote}")

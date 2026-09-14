@@ -30,26 +30,20 @@ _INTS = {"concurrency"}
 
 ROLES = ("judge", "attribution")
 
-# 显式列而不是 SELECT *：建表用的是 IF NOT EXISTS，老库里仍留着已删的
-# temperature / max_tokens 两列，SELECT * 会把它们带回响应里。
+# 显式列而不是 SELECT *：建表用 IF NOT EXISTS，老库里已删的列还在，
+# SELECT * 会把它们带回响应里。
 _PROVIDER_COLUMNS = "id, role, label, base_url, model, api_key, updated_at"
-
-# 同上。老库里还有已删的 api_prefix，SELECT * 会让它出现在配置页的响应里。
 _CONNECTION_COLUMNS = ", ".join(("id", *CONNECTION_FIELDS, "updated_at"))
 
-# 主机名带 URL 的字段。localhost 在这些字段里要换成 127.0.0.1，见 _prefer_ipv4。
+# 这两个字段的主机名要过 _prefer_ipv4。
 _HOST_URLS = {"base_url", "database_url"}
 
 
 def _prefer_ipv4(url: str) -> str:
-    """把 ``localhost`` 换成 ``127.0.0.1``。
+    """把主机名恰好是 ``localhost`` 的换成 ``127.0.0.1``。
 
-    Windows 上 ``getaddrinfo('localhost')`` 把 ``::1`` 排在前面，而服务通常只听
-    IPv4。httpx 按顺序逐个试（没有 happy eyeballs），于是每个请求都要先等 ``::1``
-    被拒 —— 实测 2.0s，一次「加载模型配置」是 login + get 两个请求，5s 就这么来的。
-    服务端还发 ``Connection: close``，连接复用不了，每个请求都得重付一次。
-
-    只换恰好等于 ``localhost`` 的主机名。写 ``[::1]`` 的人是特意要 IPv6，不动。
+    Windows 上 ``localhost`` 会先解析到 ``::1``，而服务通常只听 IPv4，
+    于是每个请求都要先等 ``::1`` 被拒。写 ``[::1]`` 的不动。
     """
     parts = urlsplit(url)
     if parts.hostname != "localhost":
@@ -70,8 +64,7 @@ def get_connection_row(connection: sqlite3.Connection) -> dict[str, Any]:
 def normalize_hosts(connection: sqlite3.Connection) -> list[str]:
     """把已存的 localhost 换成 127.0.0.1，返回改了哪几个字段。
 
-    schema 里的 DEFAULT 只作用于新行，已有配置得在这里过一遍。改的是库里的值而不是
-    读出来再换，这样配置页显示的与实际连的是同一个地址。
+    改库里的值而不是读出来再换，配置页显示的与实际连的因此是同一个地址。
     """
     row = get_connection_row(connection)
     changed = {
@@ -85,7 +78,7 @@ def normalize_hosts(connection: sqlite3.Connection) -> list[str]:
 
 
 def sanitize_connection(payload: dict[str, Any]) -> dict[str, Any]:
-    """只认已知字段。表单没提交的字段不出现在 payload 里，因此保持原值。"""
+    """只认已知字段并转好类型。没提交的字段不出现在结果里，因此保持原值。"""
     cleaned: dict[str, Any] = {}
     for key, value in payload.items():
         if key not in CONNECTION_FIELDS:
@@ -128,11 +121,8 @@ def upsert_provider(
     api_key: str,
     provider_id: int | None = None,
 ) -> int:
-    """存一个端点。
-
-    给了 ``provider_id`` 就改那一行，包括改 label —— 否则按 (role, label) 认行，
-    「把 default 改名成 gpt4」会变成新增一条，原来那条还留着。
-    """
+    """存一个端点。给了 ``provider_id`` 就改那一行（可改 label），否则按
+    (role, label) 认行。"""
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}")
     if provider_id is not None:

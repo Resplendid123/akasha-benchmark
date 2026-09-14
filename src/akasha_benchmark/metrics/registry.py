@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from ..datasets.models import DataDependency, DependencyError
 
-# 指标族。检索/引用/多跳三族都依赖 gold 文档，qa 依赖参考答案，judge 无依赖。
+# 检索/引用/多跳三族依赖 gold 文档，qa 依赖参考答案，judge 无依赖。
 FAMILY_RETRIEVAL = "retrieval"
 FAMILY_QA = "qa"
 FAMILY_ATTRIBUTION = "attribution"
@@ -19,11 +19,7 @@ KIND_JUDGE = "judge"
 
 @dataclass(frozen=True)
 class MetricDefinition:
-    """一个指标的身份与它的数据依赖。
-
-    ``name`` 里的 ``@k`` 由 :func:`expand` 按实际的 k 展开，registry 里存的是
-    不带 k 的模板名（``recall`` 而不是 ``recall@10``）。
-    """
+    """一个指标的身份与它的数据依赖。registry 里存不带 k 的模板名。"""
 
     name: str
     family: str
@@ -69,8 +65,7 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         "full_coverage",
         FAMILY_RETRIEVAL,
         _GOLD,
-        "前 k 个里凑齐全部 gold 才算 1。多跳少一跳就答不对，所以它比 recall 均值"
-        "更贴近多跳的实际需求：recall 在 2 篇 gold 上只有 0/0.5/1 三个取值",
+        "前 k 个里凑齐全部 gold 才算 1，比 recall 均值更贴近多跳的需求",
         per_k=True,
     ),
     _definition("mrr", FAMILY_RETRIEVAL, _GOLD, "首个 gold 的倒数排名"),
@@ -79,14 +74,13 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         "em",
         FAMILY_QA,
         _ANSWERS,
-        "Exact Match：归一化后的答案整串相等。解释性长答案通常得分较低，需结合 F1 和证据解读。",
+        "Exact Match：归一化后整串相等。解释性长答案得分偏低，需结合 F1 与证据解读",
     ),
     _definition(
         "f1",
         FAMILY_QA,
         _ANSWERS,
-        "token F1。被解释性 token 稀释（分母是 20-40 个散文 token，参考答案只有"
-        " 1-5 个），绝对值不可与公开数字比，只可同配置比较",
+        "token F1。会被解释性 token 稀释，绝对值只可同配置比较",
     ),
     # --- 引用归因 ---
     _definition("citation_precision", FAMILY_ATTRIBUTION, _GOLD, "被引文档里 gold 的占比"),
@@ -98,8 +92,7 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         "truncated_gold",
         FAMILY_ATTRIBUTION,
         _GOLD,
-        "被截断掉的 gold 篇数。标了 citation_dropped 的样本这一项应 > 0，"
-        "不一致说明判断或指标有一个错了",
+        "被截断掉的 gold 篇数",
         higher_is_better=False,
     ),
     _definition(
@@ -114,11 +107,7 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         _GOLD,
         "只靠图扩展才能到达的 gold 占比，即图边的净增量价值",
     ),
-    # --- 诊断计数：不是「越高越好」的分数，是读其他指标时的分母与背景 ---
-    #
-    # 它们照样进 registry，因为进了 registry 才有描述与方向声明可以给 UI 用;
-    # 不进的话前端只能拿到一个裸数字，而 truncation_loss 这种「越低越好」
-    # 的项会被默认当成越高越好来排序。
+    # --- 诊断计数：读其他指标时的分母与背景，进 registry 以便 UI 拿到方向声明 ---
     _definition(
         "retrieved_count", FAMILY_RETRIEVAL, _GOLD, "召回条数，检索精确率的分母", higher_is_better=True
     ),
@@ -138,13 +127,33 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
     _definition(
         "graph_exclusive_gold_count", FAMILY_MULTIHOP, _GOLD, "只靠图扩展才拿到的 gold 篇数"
     ),
-    # --- judge：requires 是空集，所以四组都成立 ---
+    # --- judge：除 answer_correctness 外 requires 都是空集，所以四组都成立 ---
     _definition(
         "faithfulness",
         FAMILY_JUDGE,
         _NONE,
-        "答案里的每条陈述能否由检索到的上下文支撑。不需要任何标注，所以它是"
-        " narrativeqa 唯一可用的质量指标",
+        "答案里的每条陈述能否由检索到的上下文支撑。不需要标注，narrativeqa 也可用",
+        kind=KIND_JUDGE,
+    ),
+    _definition(
+        "answer_relevancy",
+        FAMILY_JUDGE,
+        _NONE,
+        "答案有多少句在回答这个问题，判「答没答到点上」而非「答得对不对」",
+        kind=KIND_JUDGE,
+    ),
+    _definition(
+        "context_relevancy",
+        FAMILY_JUDGE,
+        _NONE,
+        "召回的上下文里有多少是这个问题用得上的，即检索的信噪比",
+        kind=KIND_JUDGE,
+    ),
+    _definition(
+        "answer_correctness",
+        FAMILY_JUDGE,
+        _ANSWERS,
+        "答案与参考答案在事实上是否一致，不受措辞与长度影响。拒答无定义，不记 0",
         kind=KIND_JUDGE,
     ),
 )
@@ -163,49 +172,23 @@ def get_metric(name: str) -> MetricDefinition:
         ) from None
 
 
-def expand(name: str, ks: tuple[int, ...]) -> list[str]:
-    """把模板名展开成实际的指标名。``recall`` -> ``recall@2``、``recall@5`` ..."""
-    definition = get_metric(name)
-    return [f"{definition.name}@{k}" for k in ks] if definition.per_k else [definition.name]
-
-
 def available(provides: frozenset[DataDependency]) -> list[MetricDefinition]:
     """给定数据集拥有的标注，返回能算的全部指标。"""
     return [d for d in METRIC_DEFINITIONS if d.requires <= provides]
 
 
 def omitted(provides: frozenset[DataDependency]) -> list[MetricDefinition]:
-    """算不了的那些。报告要把它们连同原因一起写出来，而不是伪造 0 分。"""
+    """算不了的那些。报告连同原因一起写出来，不伪造 0 分。"""
     return [d for d in METRIC_DEFINITIONS if not d.requires <= provides]
 
 
 def require(dataset: str, provides: frozenset[DataDependency], metric: str) -> MetricDefinition:
-    """闸门：数据集缺依赖就抛异常，**不返回 0.0**。
-
-    返回 0.0 的后果是一个看着合理的假分数进了汇总，而且没有任何地方报错 ——
-    等发现的时候，那个数字已经被引用过好几次了。
-    """
+    """闸门：数据集缺依赖就抛 :class:`DependencyError`，不返回 0.0。"""
     definition = get_metric(metric)
     missing = definition.requires - provides
     if missing:
         raise DependencyError(
             f"{dataset} cannot compute {metric!r}: missing data dependency "
-            f"{sorted(m.value for m in missing)}. Reporting 0.0 instead would silently "
-            "pollute every aggregate that includes it."
+            f"{sorted(m.value for m in missing)}"
         )
     return definition
-
-
-def as_rows() -> list[dict[str, object]]:
-    """供 ``metric_definition`` 表同步用。计算依据始终是这里的代码，不是那张表。"""
-    return [
-        {
-            "name": d.name,
-            "family": d.family,
-            "requires_json": sorted(r.value for r in d.requires),
-            "kind": d.kind,
-            "higher_is_better": int(d.higher_is_better),
-            "description": d.description,
-        }
-        for d in METRIC_DEFINITIONS
-    ]

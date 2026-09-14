@@ -1,8 +1,6 @@
 -- ------------------------------------------------------------ 配置层
 CREATE TABLE IF NOT EXISTS akasha_connection (
     id                       INTEGER PRIMARY KEY CHECK (id = 1),
-    -- 用 127.0.0.1 而不是 localhost：后者在 Windows 上先解析到 ::1，
-    -- 每个请求都要先等它被拒（实测 2s）。见 config_store._prefer_ipv4。
     base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3000',
     email                    TEXT NOT NULL DEFAULT '',
     password                 TEXT NOT NULL DEFAULT '',
@@ -17,7 +15,6 @@ CREATE TABLE IF NOT EXISTS akasha_connection (
 
 INSERT OR IGNORE INTO akasha_connection (id, updated_at) VALUES (1, '1970-01-01T00:00:00Z');
 
--- 采样参数不入表：judge 要可复现，温度与长度上限由 judge/client.py 固定。
 CREATE TABLE IF NOT EXISTS model_provider (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     role        TEXT NOT NULL CHECK (role IN ('judge', 'attribution')),
@@ -63,15 +60,16 @@ CREATE TABLE IF NOT EXISTS corpus_doc (
 CREATE TABLE IF NOT EXISTS compile_run (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id             TEXT NOT NULL UNIQUE,
-    datasets_json      TEXT NOT NULL,  -- 当初勾了哪几组；与实际抽出的比对能看出哪组失败
+    datasets_json      TEXT NOT NULL,    -- 当初勾了哪几组；与实际抽出的比对能看出哪组失败
     seed               INTEGER NOT NULL,
     qa_limit           INTEGER NOT NULL,  -- 每组各自的 QA 上限，不是总数
     negatives_ratio    REAL NOT NULL,     -- 每篇 gold 配几篇负样本
     space_id           TEXT,             -- 本次编译随机创建的空间；查询打在它上面
     space_name         TEXT,             -- 随机 slug，只做展示与人工核对
-    workspace_id       TEXT,             -- 那个空间属于哪个 workspace；换账号后靠它拦住
-    model_configs_json TEXT,             -- 这一次编译跑在什么模型上 
+    workspace_id       TEXT,             -- 那个空间属于哪个 workspace
+    model_configs_json TEXT,             -- 这一次编译跑在什么模型上
     quality_json       TEXT,             -- missingChunk / missingEmbedding / missingSource / stalePageCount
+    pace_json          TEXT,             -- 每篇编译耗时的估算，见 _compile_pace
     status             TEXT NOT NULL,     -- running / paused / succeeded / failed
     created_at         TEXT NOT NULL,
     finished_at        TEXT
@@ -89,7 +87,7 @@ CREATE TABLE IF NOT EXISTS compile_doc (
     dataset    TEXT NOT NULL,
     doc_id     TEXT NOT NULL,
     is_gold    INTEGER NOT NULL,
-    page_id    TEXT,    -- 导入成功才有；反查 sourcePageId 靠它
+    page_id    TEXT,
     error      TEXT,
     PRIMARY KEY (compile_id, dataset, doc_id)
 );
@@ -102,7 +100,7 @@ CREATE TABLE IF NOT EXISTS query_run (
     name               TEXT NOT NULL UNIQUE,
     compile_id         INTEGER NOT NULL REFERENCES compile_run(id) ON DELETE CASCADE,
     score_threshold    REAL,             -- 空表示用服务端默认值
-    concurrency        INTEGER NOT NULL, -- 同时在飞的请求数；只影响快慢，不影响结果
+    concurrency        INTEGER NOT NULL, -- 并发调用数
     model_configs_json TEXT,             -- 查询时的模型快照
     status             TEXT NOT NULL,    -- running / paused / succeeded / failed
     created_at         TEXT NOT NULL,
@@ -165,8 +163,7 @@ CREATE TABLE IF NOT EXISTS sample_metric (
 
 CREATE INDEX IF NOT EXISTS sample_metric_lookup_idx ON sample_metric(eval_id, metric, value);
 
--- scope 取 overall / knowledge_only：非 knowledge 的回答无条件返回空 retrievedSources，
--- 两份口径的差值就是生成端拒答的规模。
+-- scope 取 overall / knowledge_only，两份口径的差值即生成端拒答的规模。
 CREATE TABLE IF NOT EXISTS metric_summary (
     eval_id      INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
     dataset      TEXT NOT NULL,
@@ -187,13 +184,16 @@ CREATE TABLE IF NOT EXISTS dataset_eval (
     PRIMARY KEY (eval_id, dataset)
 );
 
+-- 一个样本可以有多条 judge 结论，所以指标名进主键。
 CREATE TABLE IF NOT EXISTS judge_verdict (
     eval_id      INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
     sample_id    TEXT NOT NULL,
+    metric       TEXT NOT NULL DEFAULT 'faithfulness',
     score        REAL,           -- 跳过或失败时为 NULL，不记 0
     failure_kind TEXT,
+    latency_ms   INTEGER,        -- 跳过的条目没有调用，为 NULL
     detail_json  TEXT,
-    PRIMARY KEY (eval_id, sample_id)
+    PRIMARY KEY (eval_id, sample_id, metric)
 );
 
 -- ------------------------------------------------------------ 归因层
@@ -217,6 +217,7 @@ CREATE TABLE IF NOT EXISTS attribution_result (
     evidence_json  TEXT NOT NULL,
     narrative      TEXT,
     rule_based     INTEGER NOT NULL,
+    latency_ms     INTEGER,        -- 规则归因没有调用，为 NULL
     PRIMARY KEY (attribution_id, sample_id)
 );
 
@@ -244,7 +245,7 @@ CREATE TABLE IF NOT EXISTS task (
 CREATE INDEX IF NOT EXISTS task_status_idx ON task(status, id);
 CREATE INDEX IF NOT EXISTS task_chain_idx ON task(chain_id, id);
 
--- 审计日志：只追加，清理任务不删它，所以 task_id 不设外键。
+-- 只追加，清理任务不删它，所以 task_id 不设外键。
 CREATE TABLE IF NOT EXISTS audit_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER,

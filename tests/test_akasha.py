@@ -1,8 +1,7 @@
 """Akasha 客户端契约，以及编译/查询阶段的闸门。
 
-用假客户端跑，不需要真实部署。这些闸门拦的都是**不报错的失败** ——
-非 owner 静默丢 chunk、embedding 换了让旧 chunk 永远召回不到、
-质量闸门读到空值时假通过。它们全都会产出一份看着合理的坏报告。
+用假客户端跑，不需要真实部署。这些闸门拦的都是不报错的失败：
+非 owner 静默丢 chunk、换 embedding 让旧 chunk 召回不到、闸门读到空值假通过。
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import pytest
 
 from akasha_benchmark import model_configs
 from akasha_benchmark.akasha_client import unwrap_envelope
-from akasha_benchmark.stages import compile_stage, query
+from akasha_benchmark.stages import compile, query
 from akasha_benchmark.store import config_store, dumps, run_store
 from akasha_benchmark.task import TaskContext
 
@@ -54,9 +53,31 @@ class FakeClient:
         role: str = "owner",
         configs: Any = None,
         retrieved: list[str] | None = None,
+        accepted_runs: int = 1,
+        status_counts: dict[str, int] | None = None,
+        page_log_items: list[dict[str, Any]] | None = None,
+        run_items: list[dict[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.role = role
+        # accepted_runs=0 且 status_counts 为空 = Akasha 没接编译请求。
+        self.accepted_runs = accepted_runs
+        self.status_counts = (
+            status_counts if status_counts is not None else {"succeeded": 1}
+        )
+        # 逐页编译日志。闸门失败时阶段会读它问原因。
+        self.page_log_items: list[dict[str, Any]] = page_log_items or []
+        # 编译 Run 明细，用于估算每篇耗时。
+        self.run_items: list[dict[str, Any]] = (
+            run_items
+            if run_items is not None
+            else [
+                {
+                    "runDurationMs": 8000,
+                    "progress": {"text": {"expected": 4, "succeeded": 4, "failed": 0}},
+                }
+            ]
+        )
         self.configs = configs if configs is not None else CONFIGS
         # query 时回哪些 page_id。空表示回空 retrievedSources（生成端拒答的形状）。
         self.retrieved = retrieved or []
@@ -97,13 +118,19 @@ class FakeClient:
         return {"id": f"page-{len(self.imported)}"}
 
     def compile_spaces(self, space_ids):
-        return {"acceptedRunCount": 1, "coalescedRunCount": 0}
+        return {"acceptedRunCount": self.accepted_runs, "coalescedRunCount": 0}
 
     def run_diagnostics_summary(self, space_ids):
-        return {"statusCounts": {"succeeded": 1}}
+        return {"statusCounts": dict(self.status_counts)}
+
+    def run_diagnostics(self, space_ids, *, limit=50):
+        return {"items": list(self.run_items)}
 
     def quality_diagnostics(self, space_ids):
         return self.quality
+
+    def page_log(self, space_ids, *, limit=100):
+        return {"items": list(self.page_log_items)}
 
     def query(self, question, space_ids, score_threshold=None):
         from akasha_benchmark.akasha_client import Response
@@ -174,11 +201,11 @@ def test_normalize_model_configs_is_order_stable():
 def test_compile_requires_owner(ready_connection, monkeypatch):
     """非 owner 会在授权闸门静默丢弃 chunk，症状看起来像召回质量差。"""
     monkeypatch.setattr(
-        compile_stage, "AkashaClient", lambda config: FakeClient(config, role="member")
+        compile, "AkashaClient", lambda config: FakeClient(config, role="member")
     )
     ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2})
     with pytest.raises(RuntimeError, match="owner"):
-        compile_stage.run(ctx)
+        compile.run(ctx)
 
 
 def test_compile_fails_when_quality_gate_reports_nothing(ready_connection, monkeypatch):
@@ -189,13 +216,113 @@ def test_compile_fails_when_quality_gate_reports_nothing(ready_connection, monke
         client.quality = {}
         return client
 
-    monkeypatch.setattr(compile_stage, "AkashaClient", factory)
+    monkeypatch.setattr(compile, "AkashaClient", factory)
     ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2})
     with pytest.raises(RuntimeError, match="质量闸门"):
-        compile_stage.run(ctx)
+        compile.run(ctx)
 
     run = run_store.list_compile_runs(ready_connection)[0]
     assert run["status"] == run_store.STATUS_FAILED
+
+
+def test_compile_records_pace_estimate(ready_connection, monkeypatch):
+    """每篇耗时按 Run 墙钟时长 ÷ 页数估算。"""
+
+    def factory(config):
+        return FakeClient(
+            config,
+            run_items=[
+                {"runDurationMs": 8000, "progress": {"text": {"expected": 4}}},
+            ],
+        )
+
+    monkeypatch.setattr(compile, "AkashaClient", factory)
+    ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "p1"})
+    compile.run(ctx)
+
+    from akasha_benchmark.store import loads
+
+    run = run_store.compile_run_by_run_id(ready_connection, "p1")
+    pace = loads(run["pace_json"])
+    assert pace["pages"] == 4
+    assert pace["total_ms"] == 8000
+    assert pace["per_page_ms"] == 2000
+
+
+def test_compile_pace_survives_missing_diagnostics(ready_connection, monkeypatch):
+    """诊断拿不到就不记 pace，编译照样成功：它是展示用的估算，不是闸门。"""
+
+    def factory(config):
+        return FakeClient(config, run_items=[])
+
+    monkeypatch.setattr(compile, "AkashaClient", factory)
+    ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "p2"})
+    compile.run(ctx)
+
+    run = run_store.compile_run_by_run_id(ready_connection, "p2")
+    assert run["status"] == run_store.STATUS_SUCCEEDED
+    assert run["pace_json"] is None
+
+
+def test_compile_reports_page_failure_reason(ready_connection, monkeypatch):
+    """闸门只报后果，报错里要带上逐页日志给出的 errorCode。"""
+    pages = [
+        {
+            "status": "failed",
+            "errorCode": "provider_error",
+            "errorSummary": "Knowledge compiler provider request failed.",
+            "title": f"Doc {index}",
+        }
+        for index in range(8)
+    ]
+
+    def factory(config):
+        client = FakeClient(config, page_log_items=pages)
+        client.quality = {"summary": {"missingChunkPageCount": 8, "missingSourcePageCount": 8}}
+        return client
+
+    monkeypatch.setattr(compile, "AkashaClient", factory)
+    ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2})
+    with pytest.raises(RuntimeError, match="provider_error") as caught:
+        compile.run(ctx)
+
+    assert "8 篇" in str(caught.value)
+
+
+def test_compile_fails_when_no_run_was_accepted(ready_connection, monkeypatch):
+    """一个编译 Run 都没有算没编译，不算编译好了（两者的 active 都是 0）。"""
+
+    def factory(config):
+        return FakeClient(config, accepted_runs=0, status_counts={})
+
+    monkeypatch.setattr(compile, "AkashaClient", factory)
+    ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2})
+    with pytest.raises(RuntimeError, match="编译没有启动"):
+        compile.run(ctx)
+
+    run = run_store.list_compile_runs(ready_connection)[0]
+    assert run["status"] == run_store.STATUS_FAILED
+
+
+def test_compile_waits_when_runs_are_still_active(ready_connection, monkeypatch):
+    """有 Run 在跑就得等 —— 别把「进行中」当成「没有 Run」提前放行。"""
+    seen: list[dict[str, int]] = []
+
+    class Slow(FakeClient):
+        def run_diagnostics_summary(self, space_ids):
+            seen.append({})
+            # 第一次回「编译中」，第二次回终态。
+            counts = {"compiling": 1} if len(seen) == 1 else {"succeeded": 1}
+            return {"statusCounts": counts}
+
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: Slow(config))
+    monkeypatch.setattr(compile.time, "sleep", lambda seconds: None)
+    ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r0"})
+    compile.run(ctx)
+
+    assert len(seen) == 2
+    run = run_store.compile_run_by_run_id(ready_connection, "r0")
+    assert run["status"] == run_store.STATUS_SUCCEEDED
 
 
 def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
@@ -206,9 +333,9 @@ def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
         clients.append(client)
         return client
 
-    monkeypatch.setattr(compile_stage, "AkashaClient", factory)
+    monkeypatch.setattr(compile, "AkashaClient", factory)
     ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r1"})
-    compile_stage.run(ctx)
+    compile.run(ctx)
 
     run = run_store.compile_run_by_run_id(ready_connection, "r1")
     assert run["status"] == run_store.STATUS_SUCCEEDED
@@ -227,13 +354,13 @@ def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
         clients.append(client)
         return client
 
-    monkeypatch.setattr(compile_stage, "AkashaClient", factory)
+    monkeypatch.setattr(compile, "AkashaClient", factory)
     params = {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r1"}
-    compile_stage.run(context(ready_connection, params))
+    compile.run(context(ready_connection, params))
     first = len(clients[0].imported)
 
     # 同 run_id 再跑一次：子集与已导入的文档都跳过。
-    compile_stage.run(context(ready_connection, params))
+    compile.run(context(ready_connection, params))
     assert clients[1].imported == []
     assert first > 0
 
@@ -242,8 +369,8 @@ def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
 
 
 def _compiled(connection, monkeypatch) -> int:
-    monkeypatch.setattr(compile_stage, "AkashaClient", lambda config: FakeClient(config))
-    compile_stage.run(
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
+    compile.run(
         context(connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r1"})
     )
     return int(run_store.compile_run_by_run_id(connection, "r1")["id"])
@@ -310,9 +437,9 @@ def test_compile_resume_refuses_on_workspace_mismatch(ready_connection, monkeypa
         clients.append(client)
         return client
 
-    monkeypatch.setattr(compile_stage, "AkashaClient", factory)
+    monkeypatch.setattr(compile, "AkashaClient", factory)
     with pytest.raises(RuntimeError, match="workspace"):
-        compile_stage.run(
+        compile.run(
             context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r1"})
         )
     # 必须在发出任何写入之前拦住。

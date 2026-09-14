@@ -1,9 +1,8 @@
 """适配器契约。
 
-一个数据集一个类，各自声明自己的名字、别名、文件名和 capability。
-分派**只**按数据集名字，绝不按「row 里有没有某个字段」来猜 ——
-按字段存在性分派的话，数据集换个版本就会静默走错分支，
-而且症状是一个看着挺合理的指标，不是一个报错。
+一个数据集一个类，各自声明名字、别名、文件名与 provides。
+分派只按数据集名字，不按「row 里有没有某个字段」猜 —— 后者在数据换版时
+会静默走错分支，症状是一个看着合理的指标而不是报错。
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ class DatasetAdapter(ABC):
     aliases: ClassVar[tuple[str, ...]] = ()
     qa_filename: ClassVar[str]
     corpus_filename: ClassVar[str]
-    # 这个数据集**拥有**哪些标注。指标声明需要什么，闸门做集合比对。
+    # 这个数据集拥有哪些标注，决定哪些指标算得出来。
     provides: ClassVar[frozenset[DataDependency]]
     version: ClassVar[str] = "1"
 
@@ -30,7 +29,7 @@ class DatasetAdapter(ABC):
         return dependency in self.provides
 
     def identity_rules(self) -> dict[str, str]:
-        """这个数据集怎么给样本与语料行赋身份。见 :mod:`.models` 里的两张规则表。"""
+        """这个数据集怎么给样本与语料行赋身份，取自 :mod:`.models` 的两张规则表。"""
         from .models import CORPUS_ID_RULES, SAMPLE_ID_RULES
 
         return {
@@ -42,8 +41,8 @@ class DatasetAdapter(ABC):
     def parse_row(
         self, row: dict[str, Any], row_index: int, corpus: CorpusIndex
     ) -> CanonicalSample:
-        """转换一行原始 QA。遇到任何意外结构都报错。"""
+        """转换一行原始 QA，遇到意外结构就报错。``corpus`` 供解析 gold 反查。"""
 
     def expected_qa_rows(self) -> int | None:
-        """在锁定的数据快照上实测的行数，校验时比对。"""
+        """锁定快照上的行数，归一化时比对。``None`` 表示不校验。"""
         return None

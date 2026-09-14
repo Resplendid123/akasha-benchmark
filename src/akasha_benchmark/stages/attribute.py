@@ -1,7 +1,7 @@
 """归因层：针对某次 编译->查询->评测 链路，逐条推出根因。
 
 规则判据在 :mod:`..attribution`。链路证据（原文 vs 编译产物的 diff）走只读
-PostgreSQL —— 没配 database_url 时跳过那一段判据，其余判据照旧成立。
+PostgreSQL，没配 database_url 时跳过那一段判据。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from .evaluate import resolve_provider
 
 DEFAULT_METRIC = "recall@5"
 DEFAULT_LIMIT = 10
-# 上限压到 50：带模型的归因每条一次 LLM 调用，一个手滑的 500 会烧掉一笔钱。
+# 带模型的归因每条一次 LLM 调用，所以给条数设上限。
 MAX_LIMIT = 50
 
 
@@ -41,7 +41,7 @@ def _lineage_of(
         try:
             chain = reader.lineage(page_id)
         except LineageUnavailable:
-            # 连不上只读库：整条链路都拿不到，判据退回不含 compiled_away 的那套。
+            # 连不上只读库，判据退回不含 compiled_away 的那套。
             return None
         except BadPageId as exc:
             entries.append({"doc_id": doc_id, "page_id": page_id, "error": str(exc)})
@@ -90,7 +90,7 @@ def run(ctx: TaskContext) -> None:
         try:
             provider = resolve_provider(ctx.db, provider_id, "attribution")
         except JudgeConfigError as exc:
-            # 模型没配好不是失败：规则结论仍然是一条有效的归因。
+            # 模型没配好不算失败，规则结论仍是一条有效归因。
             ctx.log(f"未使用模型：{exc}", "warn")
 
     reader: LineageReader | None = None
@@ -192,18 +192,19 @@ def _analyze(
 
         narrative: str | None = None
         rule_based = True
+        latency_ms: int | None = None
         if provider is not None:
             system, user = attribution.build_prompt(sample, ruling, lineage)
             with JudgeClient(provider) as client:
                 reply = client.complete(system, user)
+            latency_ms = reply.latency_ms
             if reply.failure_kind:
                 ruling["evidence"]["model_error"] = reply.failure_kind
             else:
                 try:
                     payload = parse_json_object(reply.content or "")
                 except ValueError as exc:
-                    # 模型没按 schema 输出。规则结论照样写 —— 丢掉它等于
-                    # 因为叙述失败而放弃了分类。
+                    # 模型没按 schema 输出，规则结论照样写。
                     ruling["evidence"]["model_error"] = f"parse_error: {exc}"
                 else:
                     narrative = str(payload.get("narrative") or "").strip() or None
@@ -223,6 +224,7 @@ def _analyze(
             evidence=ruling["evidence"],
             narrative=narrative,
             rule_based=rule_based,
+            latency_ms=latency_ms,
         )
         ctx.db.commit()
-        ctx.progress(position, len(todo), f"归因 {position}/{len(todo)}")
+        ctx.progress(position, len(todo), "归因")

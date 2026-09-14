@@ -1,13 +1,10 @@
 """任务运行器：在后台线程里跑阶段，支持暂停、继续、清理。
 
-阶段在**本进程**里跑（不再起子进程），因为参数与产物都在库里，
-而暂停需要一个能被阶段看见的信号 —— 跨进程做这件事要额外一套 IPC，
-而它换不来别的好处。代价是后端重启会中断在跑的任务：启动时把它们标成暂停,
-让用户显式继续，而不是留一个状态是「运行中」但其实没人在跑的记录。
+阶段在本进程里跑，参数与产物都在库里。后端重启会中断在跑的任务，
+启动时 :meth:`TaskRunner.recover` 把它们标成暂停，让用户显式继续。
 
-「暂停」是协作式的：阶段在每个可续跑的边界调 ``ctx.checkpoint()``，
-所以暂停总是停在一个已落库的位置上。继续 = 用同一条任务记录重跑，
-阶段自己跳过已完成的部分。
+暂停是协作式的：阶段在每个可续跑的边界调 ``ctx.checkpoint()``。
+继续即用同一条任务记录重跑，阶段自己跳过已完成的部分。
 """
 
 from __future__ import annotations
@@ -21,8 +18,8 @@ from akasha_benchmark.task import Paused, TaskContext
 
 from .settings import Settings
 
-# 同一阶段不并行：两个 compile 同时写同一批表只会互相覆盖。
-# 数据准备类阶段之间也互斥 —— 它们改的是下游所有层的输入。
+# 这些阶段与任何在跑的任务互斥：它们改的是下游所有层的输入。
+# 同名阶段一律不并行，见 _require_free。
 EXCLUSIVE = frozenset({"download", "normalize"})
 
 
@@ -36,16 +33,14 @@ class TaskRunner:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._pauses: dict[int, threading.Event] = {}
-        self._threads: dict[int, threading.Thread] = {}
         self._lock = threading.Lock()
 
     # --- 启动与恢复 ---
 
     def recover(self) -> int:
-        """把上次进程留下的「运行中」标成暂停。返回处理了几条。
+        """把上次进程留下的「运行中」标成暂停，返回处理了几条。
 
-        重启之后那些线程已经没了，留着 running 会让界面显示一个不存在的任务,
-        而清理又不许删在跑的任务 —— 于是那条记录卡住。
+        那些线程已经没了，留着 running 会让记录卡住（清理不许删在跑的任务）。
         """
         connection = connect(self.settings.db_path)
         try:
@@ -88,7 +83,7 @@ class TaskRunner:
     def start_chain(self, args: dict[str, Any]) -> dict[str, Any]:
         """起一条链路测试：建链首那条编译任务，余下几步挂在它上面。
 
-        返回链首任务，前端据此跳到任务列表 —— 后面三条会在前一条成功时自动出现。
+        返回链首任务；后面三条在前一条成功时自动出现。
         """
         connection = connect(self.settings.db_path)
         try:
@@ -100,7 +95,7 @@ class TaskRunner:
             params = clean_params(head["stage"], head["params"])
             self._require_free(connection, head["stage"])
             task_id = task_store.create_task(connection, stage=head["stage"], params=params)
-            # 链首自己就是链号，四条任务凭它归到一起。
+            # 链首的 id 就是链号，四条任务凭它归到一起。
             task_store.set_task_chain(connection, task_id, chain=rest, chain_id=task_id)
             connection.commit()
             record = task_store.get_task(connection, task_id) or {}
@@ -142,7 +137,7 @@ class TaskRunner:
             with self._lock:
                 event = self._pauses.get(task_id)
             if event is None:
-                # 没有对应线程（比如后端重启过），直接改状态。
+                # 没有对应线程（后端重启过），直接改状态。
                 task_store.pause_task(connection, task_id)
                 connection.commit()
             else:
@@ -160,10 +155,7 @@ class TaskRunner:
             connection.close()
 
     def cleanup(self, task_id: int | None) -> dict[str, int]:
-        """删任务记录。``None`` 时清掉所有非运行中的任务。
-
-        **审计日志不删** —— 它是审计记录，任务记录清掉之后仍然查得到。
-        """
+        """删任务记录，``None`` 时清掉所有非运行中的。审计日志不删。"""
         connection = connect(self.settings.db_path)
         try:
             try:
@@ -191,9 +183,9 @@ class TaskRunner:
                 )
 
     def _verify(self, connection, task_id: int, stage: str) -> None:
-        """链上的任务要过契约校验才算成功。抛出的异常按失败处理。
+        """校验链上任务的产物契约，抛出的异常按失败处理。
 
-        只对链上的任务生效：手动起的单阶段任务不受这套断言约束。
+        只对链上的任务生效，手动起的单阶段任务不受约束。
         """
         chain_id, _ = task_store.task_chain(connection, task_id)
         check = chain.VERIFY.get(stage)
@@ -214,7 +206,7 @@ class TaskRunner:
         connection.commit()
 
     def _advance_chain(self, connection, task_id: int, stage: str) -> None:
-        """成功之后接上链的下一步：上一步的产物 id 填进它的关联参数。"""
+        """接上链的下一步，把这一步的产物 id 填进它的 ``link`` 参数。"""
         chain_id, remaining = task_store.task_chain(connection, task_id)
         if chain_id is None or not remaining:
             return
@@ -265,17 +257,14 @@ class TaskRunner:
         event = threading.Event()
         with self._lock:
             self._pauses[task_id] = event
-        thread = threading.Thread(
+        threading.Thread(
             target=self._run, args=(task_id, stage, params, event), daemon=True
-        )
-        with self._lock:
-            self._threads[task_id] = thread
-        thread.start()
+        ).start()
 
     def _run(
         self, task_id: int, stage: str, params: dict[str, Any], event: threading.Event
     ) -> None:
-        # 每个任务线程一条独立连接：sqlite 连接不跨线程共用。
+        # 每个任务线程一条独立连接，sqlite 连接不跨线程共用。
         connection = connect(self.settings.db_path)
         try:
             task_store.start_task(connection, task_id)
@@ -328,4 +317,3 @@ class TaskRunner:
             connection.close()
             with self._lock:
                 self._pauses.pop(task_id, None)
-                self._threads.pop(task_id, None)

@@ -37,11 +37,9 @@ def test_ndcg_rewards_earlier_gold():
 
 
 def test_retrieval_refuses_without_gold():
-    """没有 gold 时拒绝计算，不返回 0.0 —— 假分数会静默污染汇总。"""
+    """没有 gold 时拒绝计算，不返回 0.0。"""
     with pytest.raises(ValueError):
         retrieval.recall_at_k(["d1"], [], 2)
-    with pytest.raises(DependencyError):
-        retrieval.require_gold_docs("narrativeqa", frozenset())
 
 
 def test_registry_gate_is_set_comparison():
@@ -52,11 +50,6 @@ def test_registry_gate_is_set_comparison():
         registry.require("narrativeqa", frozenset({DataDependency.REFERENCE_ANSWERS}), "recall")
     # faithfulness 的依赖是空集，所以它对任何数据集都成立。
     assert registry.require("narrativeqa", frozenset(), "faithfulness").kind == "judge"
-
-
-def test_expand_only_applies_k_to_per_k_metrics():
-    assert registry.expand("recall", (2, 5)) == ["recall@2", "recall@5"]
-    assert registry.expand("em", (2, 5)) == ["em"]
 
 
 def test_truncation_loss_separates_retrieval_from_citation():
@@ -113,6 +106,47 @@ def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
         "answer": "x",
         "detail": {"gold_doc_ids": list(gold), "question": "q"},
     }
+
+
+def test_correct_answer_is_not_a_failure():
+    """答对的样本不能被归成失败。
+
+    归因取的是「按指标最差的 N 条」，那不等于「N 条失败」—— 真实失败不足 N 条
+    时健康样本也会进来。不先摘出去，后面每一条都在解释一个不存在的失败。
+    """
+    # 检索一条 gold 都没命中，但答案 EM 命中：系统没依赖那篇 gold。
+    ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 1.0}), [])
+    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+
+    # judge 判事实一致，同样算对。
+    ruling = attribution.classify(
+        _sample({"hit@5": 0.0, "em": 0.0, "answer_correctness": 1.0}), []
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+
+
+def test_not_a_failure_outranks_every_failure_cause():
+    """它必须判在最前面，包括压在 generation_fallback 之前。
+
+    拒答且答对是矛盾的，但真出现时「答对」才是那条样本的事实。
+    """
+    for metrics, lineage, mode in (
+        ({"hit@5": 0.0, "em": 1.0}, [{"question_terms_lost": ["grammy"]}], "knowledge"),
+        ({"hit@5": 0.0, "em": 1.0, "truncated_gold": 1.0}, [], "knowledge"),
+        ({"hit@5": 0.0, "em": 1.0}, None, "general"),
+    ):
+        ruling = attribution.classify(_sample(metrics, mode=mode), lineage)
+        assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+
+
+def test_high_f1_alone_does_not_clear_a_sample():
+    """F1 高不算答对。
+
+    F1=0.6 可能是答对了被散文稀释，也可能是答错了但词有重叠，分不开。
+    宁可漏判成别的分类，也不能把答错的说成没问题。
+    """
+    ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 0.0, "f1": 0.9}), [])
+    assert ruling["root_cause"] != attribution.CAUSE_NOT_A_FAILURE
 
 
 def test_fallback_is_judged_before_retrieval():

@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from akasha_benchmark.datasets import DataDependency, get_adapter
-from akasha_benchmark.stages import clean_params, compile_stage, evaluate, normalize
+from akasha_benchmark.stages import clean_params, compile, evaluate, normalize
 from akasha_benchmark.store import data_store, run_store
 from akasha_benchmark.task import TaskContext
 
@@ -73,7 +73,7 @@ def test_subset_covers_every_gold(normalized):
         normalized, run_id="r", datasets=["hotpotqa"], seed=7, qa_limit=2, negatives_ratio=1.0
     )
     normalized.commit()
-    stats = compile_stage.build_subset(
+    stats = compile.build_subset(
         normalized, compile_id, "hotpotqa", seed=7, qa_limit=2, negatives_ratio=1.0
     )
 
@@ -101,7 +101,7 @@ def test_subset_is_seed_stable_and_seed_sensitive(normalized):
             negatives_ratio=1.0,
         )
         normalized.commit()
-        compile_stage.build_subset(
+        compile.build_subset(
             normalized, compile_id, "hotpotqa", seed=seed, qa_limit=1, negatives_ratio=1.0
         )
         return {d["doc_id"] for d in run_store.compile_docs(normalized, compile_id)}
@@ -114,7 +114,7 @@ def test_subset_negatives_ratio_zero_keeps_only_gold(normalized):
         normalized, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=2, negatives_ratio=0.0
     )
     normalized.commit()
-    stats = compile_stage.build_subset(
+    stats = compile.build_subset(
         normalized, compile_id, "hotpotqa", seed=1, qa_limit=2, negatives_ratio=0.0
     )
     assert stats["negatives"] == 0
@@ -123,13 +123,13 @@ def test_subset_negatives_ratio_zero_keeps_only_gold(normalized):
 
 def test_markdown_uses_heading_for_title(normalized):
     """heading 承担 title，文件名承担 doc_id，两者独立，所以重复 title 不影响身份。"""
-    markdown = compile_stage.markdown_of(normalized, "hotpotqa", "0")
+    markdown = compile.markdown_of(normalized, "hotpotqa", "0")
     assert markdown.startswith("# Rita Moreno")
 
 
 def test_unsafe_doc_id_is_rejected():
     with pytest.raises(ValueError):
-        compile_stage._safe_doc_id("../escape")
+        compile._safe_doc_id("../escape")
 
 
 # ------------------------------------------------------------ 评测
@@ -140,7 +140,7 @@ def _fixture_chain(connection, response: dict) -> tuple[int, int, int]:
         connection, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=2, negatives_ratio=1.0
     )
     connection.commit()
-    compile_stage.build_subset(
+    compile.build_subset(
         connection, compile_id, "hotpotqa", seed=1, qa_limit=2, negatives_ratio=1.0
     )
     for doc in run_store.compile_docs(connection, compile_id):

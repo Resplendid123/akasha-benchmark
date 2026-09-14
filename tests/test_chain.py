@@ -18,7 +18,7 @@ from akasha_benchmark.stages import (
     STAGES,
     attribute,
     chain,
-    compile_stage,
+    compile,
     evaluate,
     query,
 )
@@ -77,7 +77,7 @@ def test_build_lays_out_four_steps(normalized, monkeypatch):
 def test_build_seed_defaults_to_today(normalized, monkeypatch):
     monkeypatch.setattr(chain, "DATASETS", ("hotpotqa",))
     steps = chain.build({"dataset": "hotpotqa", "samples": 1}, normalized)
-    assert steps[0]["params"]["seed"] == compile_stage.default_seed()
+    assert steps[0]["params"]["seed"] == compile.default_seed()
 
 
 def test_full_chain(normalized, monkeypatch):
@@ -85,7 +85,7 @@ def test_full_chain(normalized, monkeypatch):
     config_store.update_connection(normalized, base_url="http://x", email="e@x", password="p")
     normalized.commit()
 
-    monkeypatch.setattr(compile_stage, "AkashaClient", lambda config: FakeClient(config))
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
     # 查询时回本次编译真实的 page_id，这样评测才反查得回语料文档。
     monkeypatch.setattr(
         query,
@@ -222,7 +222,7 @@ def test_runner_advances_the_chain(db_path, dataset_dir, monkeypatch):
     finally:
         connection.close()
 
-    monkeypatch.setattr(compile_stage, "AkashaClient", lambda config: FakeClient(config))
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
 
     def _fake_query_client(config):
         probe = connect(db_path)

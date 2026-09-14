@@ -88,6 +88,16 @@ export interface Provider {
   updated_at: string
 }
 
+/** 探测结果。ok 为假时 failure 是失败类别，detail 是 provider 回的原文。 */
+export interface ProviderProbe {
+  ok: boolean
+  failure: string | null
+  status: number | null
+  reply: string
+  detail: string | null
+  provider: { base_url: string; model: string; api_key_set: boolean }
+}
+
 // --- 数据集层与归一化层 ---
 
 export interface DatasetFile {
@@ -247,6 +257,8 @@ export interface CompileRun {
   finished_at: string | null
   stats: Record<string, CompileStats>
   quality: { passed: boolean; gates: Record<string, number | null> } | null
+  /** 每篇编译耗时的估算，不是实测。 */
+  pace: { runs: number; pages: number; total_ms: number; per_page_ms: number } | null
   readiness: Readiness
   queries: QueryRun[]
 }
@@ -295,6 +307,8 @@ export interface JudgeSummary {
   scored: number
   failed: number
   mean: number | null
+  /** 每条调用的平均延迟。跳过的条目不进均值。 */
+  latency_mean: number | null
   failure_rate: number
   failures_by_kind: Record<string, number>
 }
@@ -313,33 +327,6 @@ export interface EvalDetail {
   judge: JudgeSummary
 }
 
-export interface EvalSampleRow {
-  sample_id: string
-  dataset: string
-  http_status: number
-  answer: string
-  question: string | null
-  metrics: Metrics
-}
-
-export interface EvalSamples {
-  by_answer_mode: Record<string, EvalSampleRow[]>
-  counts: Record<string, number>
-}
-
-export interface WorstList {
-  metric: string
-  higher_is_better: boolean
-  samples: {
-    sample_id: string
-    dataset: string
-    value: number
-    answer_mode: string | null
-    answer: string | null
-  }[]
-  count_by_answer_mode: Record<string, number>
-}
-
 export interface EvalSampleDetail {
   sample_id: string
   dataset: string
@@ -353,14 +340,29 @@ export interface EvalSampleDetail {
   compile_id: number
   response: Record<string, unknown> | null
   gold_pages: Record<string, string | null>
-  judge_verdict: {
-    score: number | null
-    failure_kind: string | null
-    detail: Record<string, unknown> | null
-  } | null
+  judge_verdicts: JudgeVerdict[]
+}
+
+export interface JudgeVerdict {
+  sample_id: string
+  metric: string
+  score: number | null
+  failure_kind: string | null
+  latency_ms: number | null
+  detail: Record<string, unknown> | null
+}
+
+/** 响应体里检索回来的一条 chunk。 */
+export interface Snippet {
+  title?: string
+  text?: string
+  retrievalReasons?: string[]
+  sourceWindows?: { sourcePageId?: string }[]
+  score?: number
 }
 
 export type RootCause =
+  | 'not_a_failure'
   | 'generation_fallback'
   | 'compiled_away'
   | 'citation_dropped'
@@ -381,6 +383,8 @@ export interface AttributionResult {
 
 export interface AttributionDetail extends AttributionRun {
   count_by_root_cause: Record<string, number>
+  /** 模型归因的每条平均延迟。规则归因的条目不进均值。 */
+  latency_mean: number | null
   results: AttributionResult[]
   remedies: Record<string, string>
 }

@@ -244,6 +244,89 @@ def test_provider_api_key_never_leaves_the_backend(client):
     assert stored["model"] == "m2"
 
 
+def test_provider_probe_reports_failure_as_data(client, monkeypatch):
+    """探测调不通时回 200 + ok=false，不是 500。
+
+    调不通是这个接口要报告的结果，不是它自己的故障 —— 报 500 会让前端把
+    「模型端点有问题」显示成「平台出错了」。
+    """
+    from akasha_benchmark.judge.client import JudgeReply
+
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "k"},
+    )
+    provider_id = client.get("/api/providers?role=judge").json()[0]["id"]
+
+    monkeypatch.setattr(
+        "akasha_benchmark.judge.client.JudgeClient.complete",
+        lambda self, system, user: JudgeReply(
+            content=None, failure_kind="http:401", raw='{"error":"bad key"}', status=401
+        ),
+    )
+    body = client.post(f"/api/providers/{provider_id}/probe")
+    assert body.status_code == 200
+    payload = body.json()
+    assert payload["ok"] is False
+    assert payload["failure"] == "http:401"
+    assert payload["status"] == 401
+    assert "bad key" in payload["detail"]
+    # 探测的响应也不能带出密钥。
+    assert payload["provider"]["api_key_set"] is True
+    assert "api_key" not in payload["provider"]
+
+
+def test_provider_probe_returns_the_reply(client, monkeypatch):
+    from akasha_benchmark.judge.client import JudgeReply
+
+    client.put(
+        "/api/providers/attribution",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "k"},
+    )
+    provider_id = client.get("/api/providers?role=attribution").json()[0]["id"]
+
+    sent: list[tuple[str, str]] = []
+
+    def fake(self, system, user):
+        sent.append((system, user))
+        return JudgeReply(content="Hi there", failure_kind=None, raw=None, status=200)
+
+    monkeypatch.setattr("akasha_benchmark.judge.client.JudgeClient.complete", fake)
+    payload = client.post(f"/api/providers/{provider_id}/probe").json()
+    assert payload["ok"] is True
+    assert payload["reply"] == "Hi there"
+    # 发的是一句 hi。user 消息里必须带 json —— JudgeClient 固定要求 json_object
+    # 输出，而有些 provider 规定消息里出现 "json" 才允许这个格式。
+    assert len(sent) == 1
+    system, user = sent[0]
+    assert user.startswith("hi")
+    assert "json" in user.lower()
+
+
+def test_provider_probe_reports_missing_key(client):
+    """没配密钥时也回 200 —— 那是配置问题，同样是要报告的结果。"""
+    from akasha_benchmark.store import config_store
+
+    connection = connect(client.app.state.settings.db_path)
+    try:
+        provider_id = config_store.upsert_provider(
+            connection, role="judge", label="nokey", base_url="https://x/v1",
+            model="m", api_key="",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    payload = client.post(f"/api/providers/{provider_id}/probe").json()
+    assert payload["ok"] is False
+    assert payload["failure"] == "config"
+    assert "api key" in payload["detail"]
+
+
+def test_provider_probe_404s_on_unknown_endpoint(client):
+    assert client.post("/api/providers/9999/probe").status_code == 404
+
+
 def test_connection_test_flags_compiles_in_another_workspace(client, db_path, monkeypatch):
     """预检：不必等起了任务才发现这些编译在当前连接下用不了。"""
     connection = connect(db_path)
@@ -401,7 +484,7 @@ def test_bad_role_is_rejected(client):
 
 
 def test_missing_records_return_404(client):
-    for path in ("/api/compiles/9", "/api/queries/9", "/api/evals/9", "/api/attributions/9"):
+    for path in ("/api/evals/9", "/api/attributions/9", "/api/compiles/9/docs"):
         assert client.get(path).status_code == 404, path
 
 

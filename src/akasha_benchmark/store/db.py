@@ -38,9 +38,8 @@ def loads(value: str | None, default: Any = None) -> Any:
 def connect(path: Path | None = None, *, read_only: bool = False) -> sqlite3.Connection:
     """打开连接并设好 pragma。
 
-    ``foreign_keys`` 必须逐连接开 —— SQLite 默认关闭，不开则 ``ON DELETE CASCADE``
-    静默失效，清理某一层会留下指向已删行的孤儿数据。
-    WAL 让读写不互斥：任务在写库时前端要能读进度。
+    ``foreign_keys`` 必须逐连接开，否则 ``ON DELETE CASCADE`` 静默失效。
+    WAL 让读写不互斥，任务在写库时前端仍能读进度。
     """
     target = path or DEFAULT_DB_PATH
     if read_only:
@@ -75,7 +74,7 @@ def _is_legacy(path: Path) -> bool:
 
 
 def _move_aside(path: Path) -> Path:
-    """把旧库改名留档。它的 schema 与现在的对不上，就地建表会两套混在一起。"""
+    """把旧库连同 -wal / -shm 改名留档，返回留档路径。"""
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     target = path.with_name(f"{path.name}.legacy-{stamp}")
     path.replace(target)
@@ -89,14 +88,39 @@ def _move_aside(path: Path) -> Path:
 # 建表之后补的列：表名 -> ((列名, 类型), ...)
 ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "task": (("chain_id", "INTEGER"), ("chain_json", "TEXT")),
+    "judge_verdict": (("latency_ms", "INTEGER"),),
+    "attribution_result": (("latency_ms", "INTEGER"),),
+    "compile_run": (("pace_json", "TEXT"),),
 }
+
+# 主键变了的表：表名 -> 新主键。SQLite 改不了主键，只能重建。
+REBUILT_KEYS: dict[str, tuple[str, ...]] = {
+    "judge_verdict": ("eval_id", "sample_id", "metric"),
+}
+
+
+def _drop_outdated_tables(connection: sqlite3.Connection) -> list[str]:
+    """主键与当前 schema 不一致的表，删掉让建表脚本重建。
+
+    只对可重算的表这么做（:data:`REBUILT_KEYS` 里都是评测产物，重跑就能再得到）。
+    """
+    dropped = []
+    for table, expected in REBUILT_KEYS.items():
+        info = list(connection.execute(f"PRAGMA table_info({table})"))
+        if not info:
+            continue
+        # table_info 的第 6 列是该列在主键里的序号，0 表示不在主键中。
+        current = tuple(row[1] for row in sorted(info, key=lambda r: r[5]) if row[5])
+        if current != expected:
+            connection.execute(f"DROP TABLE {table}")
+            dropped.append(table)
+    return dropped
 
 
 def _add_missing_columns(connection: sqlite3.Connection) -> None:
     """给已存在的表补后加的列。
 
-    必须在建表脚本**之前**跑：``CREATE TABLE IF NOT EXISTS`` 不动已存在的表,
-    而脚本里的索引会引用新列，列不在就建不出索引。
+    必须在建表脚本之前跑：脚本里的索引会引用新列。
     空的 ``table_info`` 表示这张表还不存在，交给建表脚本。
     """
     for table, columns in ADDED_COLUMNS.items():
@@ -115,6 +139,7 @@ def init_db(path: Path | None = None) -> Path | None:
     connection = connect(target)
     try:
         _add_missing_columns(connection)
+        _drop_outdated_tables(connection)
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         from . import config_store
 

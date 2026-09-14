@@ -1,14 +1,10 @@
 """归因判据：从指标 + 链路推出根因。
 
-**两段式，规则在前。** 规则不需要任何模型配置就能出分类，所以归因层在没配
-分析模型时也能用；模型在它之上补一段因果叙述。
-
-分开不是为了稳妥，而是两者答的问题不同：规则给分类（哪一段断了），
-模型给叙述（为什么断在那里）。把后者当分类用会得到一个听起来有道理、
-但与指标对不上的结论 —— 而那种错误没有任何地方会报出来。
+两段式，规则在前：规则不需要模型配置就能出分类，模型在它之上补因果叙述。
 
 | 根因                    | 判据                                          |
 | ----------------------- | --------------------------------------------- |
+| not_a_failure           | 答案正确（EM 命中或 judge 判 correct）          |
 | generation_fallback     | answer_mode != knowledge（retrievedSources 空）|
 | compiled_away           | 问题实词落在编译丢掉的词里                     |
 | citation_dropped        | truncated_gold > 0（召回到了但引用被截断）      |
@@ -16,14 +12,15 @@
 | graph_edge_missing      | gold 不全且图扩展没贡献独有 gold                |
 | gold_annotation_suspect | gold 全召回、引用完整，答案仍判错               |
 
-顺序即优先级：``generation_fallback`` 必须最先判，否则它那 0 分会被解释成
-检索失败。
+顺序即优先级。``not_a_failure`` 必须第一（送来的是「最差 N 条」而不是
+「N 条失败」），``generation_fallback`` 第二（否则它那 0 分会被当成检索失败）。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+CAUSE_NOT_A_FAILURE = "not_a_failure"
 CAUSE_GENERATION_FALLBACK = "generation_fallback"
 CAUSE_COMPILED_AWAY = "compiled_away"
 CAUSE_CITATION_DROPPED = "citation_dropped"
@@ -32,8 +29,10 @@ CAUSE_GRAPH_EDGE_MISSING = "graph_edge_missing"
 CAUSE_GOLD_SUSPECT = "gold_annotation_suspect"
 CAUSE_UNKNOWN = "unknown"
 
-# 每个根因该怎么处置。「这条能不能靠调参救」是归因结论里最有用的一句。
+# 每个根因该怎么处置，含「这条能不能靠调参救」。
 REMEDIES = {
+    CAUSE_NOT_A_FAILURE: "答案是对的，这条排进最差 N 只是因为检索指标低。"
+    "不用查系统 —— 要么它没依赖被漏掉的那篇 gold，要么 F1 被长答案稀释了。",
     CAUSE_GENERATION_FALLBACK: "生成端拒答，检索指标按定义为 0。不是检索问题，"
     "先看 answerMode 分布而不是 recall。",
     CAUSE_COMPILED_AWAY: "编译产物里缺少问题中的实词，三条召回路径同时断。"
@@ -50,8 +49,20 @@ REMEDIES = {
 }
 
 
+def _answered_correctly(metrics: dict[str, float]) -> bool:
+    """答案是否算对：``answer_correctness`` 或 ``em`` 命中即成立。
+
+    不拿 F1 高当判据 —— 它分不开「答对了被散文稀释」与「答错了但词有重叠」。
+    """
+    correctness = metrics.get("answer_correctness")
+    if correctness is not None and correctness >= 1.0:
+        return True
+    em = metrics.get("em")
+    return em is not None and em >= 1.0
+
+
 def _at_max_k(metrics: dict[str, float], prefix: str) -> float | None:
-    """取最大 k 的那一项。没有则返回 None（不是 0）。"""
+    """取最大 k 的那一项，没有则返回 None 而不是 0。"""
     keys = sorted(
         (k for k in metrics if k.startswith(prefix)),
         key=lambda k: int(k.split("@", 1)[1]),
@@ -63,10 +74,10 @@ def _at_max_k(metrics: dict[str, float], prefix: str) -> float | None:
 def classify(
     sample: dict[str, Any], lineage: list[dict[str, Any]] | None
 ) -> dict[str, Any]:
-    """规则归因。返回 ``{root_cause, evidence}``。
+    """规则归因，返回 ``{root_cause, evidence, remedy}``。
 
-    ``lineage`` 是每篇 gold 的 diff 结果，没配只读库时为 None —— 那时
-    ``compiled_away`` 判不了，会退到 ``retrieval_miss`` 并在 evidence 里注明。
+    ``lineage`` 是每篇 gold 的 diff 结果。为 None 时 ``compiled_away`` 判不了，
+    退到 ``retrieval_miss`` 并在 evidence 里注明。
     """
     metrics: dict[str, float] = sample.get("metrics") or {}
     detail = sample.get("detail") or {}
@@ -94,7 +105,9 @@ def classify(
     }
 
     # 顺序即优先级，见模块开头。
-    if answer_mode and answer_mode != "knowledge":
+    if _answered_correctly(metrics):
+        cause = CAUSE_NOT_A_FAILURE
+    elif answer_mode and answer_mode != "knowledge":
         cause = CAUSE_GENERATION_FALLBACK
     elif lost_terms:
         cause = CAUSE_COMPILED_AWAY
@@ -105,8 +118,8 @@ def classify(
     elif coverage is not None and coverage < 1.0 and not graph_exclusive:
         cause = CAUSE_GRAPH_EDGE_MISSING
     else:
-        # 检索与引用都没问题，答案却不对：先怀疑标注与评分口径。
-        # 用 F1 而不是 EM —— EM 对长答案要求整串相等，误判率太高。
+        # 检索与引用都没问题而答案不对：先怀疑标注与评分口径。
+        # 这里用 F1 而不是 EM，后者对长答案要求整串相等、误判率太高。
         f1 = metrics.get("f1")
         cause = (
             CAUSE_GOLD_SUSPECT
@@ -117,20 +130,25 @@ def classify(
     return {"root_cause": cause, "evidence": evidence, "remedy": REMEDIES[cause]}
 
 
-SYSTEM_PROMPT = """你在分析一个检索增强问答系统的失败样本。
+SYSTEM_PROMPT = """你在分析一个检索增强问答系统的样本。
 
 这套系统的向量与词法召回跑在**编译产物**上，不是原始文档：编译器会重写原文，
 重写时可能删掉原文里的修饰语与专有名词。被删掉的词不在被索引的文本里，
 所以查询命中它们时三条召回路径会同时断，且调参救不回来。
 
 `no_match` 与 `general` 两种回答无条件返回空的 retrievedSources，它们的检索
-得分按定义为 0 —— 那是生成端拒答，不是检索失败。
+得分按定义为 0 —— 是生成端拒答，不是检索失败。
+
+**这条样本未必是失败的。** 送来分析的是「按某个指标最差的 N 条」，真实失败
+不足 N 条时健康样本也会进来；EM 与 F1 对解释性长答案本就失真，答案正确而
+得分低是常见的。规则分类为 `not_a_failure` 时，narrative 要说明它为什么其实
+没问题，**不要编造一个失败原因**。
 
 已经有一个规则归因给出了分类。你的任务是**解释因果**，不是重新分类：
 如果你认为分类错了，在 disagreement 里说明理由，不要直接改 root_cause。
 
 只输出 JSON：
-{"narrative": "两三句话说明这条为什么失败，引用给你的具体证据",
+{"narrative": "两三句话说明这条为什么失败（或为什么其实没问题），引用给你的具体证据",
  "contributing_factors": ["..."],
  "disagreement": null 或 "为什么规则分类可能不对",
  "confidence": 0.0 到 1.0}"""

@@ -10,6 +10,7 @@ import {
   Pager,
   Pass,
   StatusTag,
+  Timing,
   num,
   useAction,
   useAsync,
@@ -24,7 +25,7 @@ function todaySeed(): number {
   return Number(`${now.getFullYear()}${month}${day}`)
 }
 
-/** 编译层：抽子集 + 入 Akasha 库。一次编译一个随机创建的空间，配置在 run_id 上固化。 */
+/** 编译层：抽子集 + 入 Akasha 库。一次编译一个随机创建的空间。 */
 export function Compile({
   activeCompile,
   onSelect,
@@ -70,7 +71,7 @@ export function Compile({
       <h3>编译记录</h3>
       {compiles.data.compiles.length === 0 && <p className="muted">还没有编译记录。</p>}
       {compiles.data.compiles.length > 0 && (
-        <table>
+        <table className="records-table">
           <thead>
             <tr>
               <th>run_id</th>
@@ -79,6 +80,7 @@ export function Compile({
               <th>质量闸门</th>
               <th className="num">语料</th>
               <th className="num">已导入</th>
+              <th>耗时</th>
               <th>可用于查询</th>
               <th />
             </tr>
@@ -101,10 +103,19 @@ export function Compile({
                   <td className="num">{docs}</td>
                   <td className="num">{imported}</td>
                   <td>
-                    <Pass ok={run.readiness.ready} yes="就绪" no="未就绪" />
+                    {/* 每篇耗时是估算，不是实测。 */}
+                    <Timing
+                      startedAt={run.created_at}
+                      finishedAt={run.finished_at}
+                      latencyMs={run.pace?.per_page_ms}
+                      perLabel="篇"
+                    />
                   </td>
                   <td>
-                    <div className="row tight">
+                    <Pass ok={run.readiness.ready} yes="就绪" no="未就绪" />
+                  </td>
+                  <td className="table-actions-cell">
+                    <div className="table-actions">
                       <button className="action small" onClick={() => onSelect(run.id)}>
                         {run.id === activeCompile ? '已选中' : '查看'}
                       </button>
