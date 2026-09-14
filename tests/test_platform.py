@@ -1,413 +1,451 @@
-"""平台后端：绑定安全、answerMode 默认切分、任务白名单、原文/编译 diff。"""
+"""平台层：任务生命周期（暂停/继续/清理）、审计日志留存、路由与鉴权。"""
 
 from __future__ import annotations
 
-from pathlib import Path
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
-from akasha_benchmark.store import repo
-from akasha_benchmark.store.migrate import migrate
-from akasha_platform import diff
+from akasha_benchmark.stages import STAGES, StageSpec
+from akasha_benchmark.store import connect, run_store, task_store
 from akasha_platform.main import create_app
 from akasha_platform.settings import Settings
-from akasha_platform.tasks import STAGE_ARGS, STAGE_MODULES, TaskRejected, _argv, _clean_args
-
-DATASET = "hotpotqa"
-
-
-# --- 绑定与认证（红线）------------------------------------------------------
-
-
-def test_refuses_to_bind_a_public_address_without_a_token():
-    """红线：这个服务持有 Akasha 管理员凭据、只读数据库连接、
-    以及启动长任务的能力。暴露到 0.0.0.0 而不设认证等于把三样一起交出去。"""
-    with pytest.raises(RuntimeError, match="refusing to bind"):
-        Settings(host="0.0.0.0", auth_token="").validate_binding()
-
-
-def test_public_binding_is_allowed_once_a_token_is_set():
-    Settings(host="0.0.0.0", auth_token="t" * 32).validate_binding()
-
-
-def test_loopback_needs_no_token():
-    Settings(host="127.0.0.1", auth_token="").validate_binding()
-
-
-def test_settings_never_expose_the_token():
-    view = Settings(auth_token="secret-token").redacted()
-    assert view["auth_required"] is True
-    assert "secret-token" not in str(view)
-
-
-def test_token_is_enforced_on_every_request(tmp_path: Path):
-    db = tmp_path / "t.db"
-    migrate(db, verbose=False)
-    app = create_app(Settings(db_path=db, auth_token="right-token"))
-    client = TestClient(app)
-
-    assert client.get("/api/health").status_code == 401
-    assert client.get("/api/health", headers={"X-Auth-Token": "wrong"}).status_code == 401
-    assert client.get("/api/health", headers={"X-Auth-Token": "right-token"}).status_code == 200
-
-
-# --- 任务白名单 -------------------------------------------------------------
-
-
-def test_argv_is_built_from_a_whitelist(tmp_path: Path):
-    """argv 只从白名单取模块名，参数走库不走命令行。"""
-    settings = Settings(db_path=tmp_path / "t.db")
-    argv = _argv("ingest", 7, settings)
-    assert argv[1:3] == ["-m", "akasha_benchmark.ingest"]
-    assert argv[-2:] == ["--run-config", "7"]
-    # 实验参数不在 argv 里。
-    assert "--label" not in argv
-
-
-def test_unknown_stage_is_rejected(tmp_path: Path):
-    with pytest.raises(TaskRejected, match="unknown stage"):
-        _argv("rm -rf /", 1, Settings(db_path=tmp_path / "t.db"))
-    with pytest.raises(TaskRejected, match="unknown stage"):
-        _clean_args("rm -rf /", {})
-
-
-def test_unmapped_arguments_never_reach_the_stage(tmp_path: Path):
-    """请求体里的未知键不会进 run_config，阶段代码也就读不到它们。"""
-    cleaned = _clean_args("ingest", {"label": "x", "evil": "--dangerous", "extra_flag": True})
-    assert cleaned == {"label": "x"}
-
-
-def test_stage_args_are_type_checked():
-    """类型不对直接拒掉，不让它进库再到阶段里炸。"""
-    assert _clean_args("subset", {"seed": "42"}) == {"seed": 42}
-    with pytest.raises(TaskRejected, match="expected int"):
-        _clean_args("subset", {"seed": "not-a-number"})
-    with pytest.raises(TaskRejected, match="expected list"):
-        _clean_args("subset", {"datasets": "hotpotqa"})
-    with pytest.raises(TaskRejected, match="expected bool"):
-        _clean_args("query", {"retry_failed": "false"})
-
-
-def test_run_config_round_trips_into_stage_arguments(tmp_path: Path):
-    """库里的参数能盖到 argparse 的结果上，而未声明的属性设不进去。"""
-    import argparse
-
-    from akasha_benchmark import run_args
-    from akasha_benchmark.store import connect
-
-    db = tmp_path / "t.db"
-    migrate(db, verbose=False)
-    connection = connect(db)
-    run_config_id = repo.create_run_config(
-        connection, "subset", {"label": "runX", "datasets": ["hotpotqa"], "seed": 7, "evil": "x"}
-    )
-    connection.commit()
-    connection.close()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--label", default=None)
-    parser.add_argument("--dataset", action="append")
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--db", type=Path, default=None)
-    run_args.add_argument(parser)
-    args = run_args.apply(
-        parser.parse_args(["--db", str(db), "--run-config", str(run_config_id)]), stage="subset"
-    )
-
-    assert args.label == "runX"
-    # UI 那边是 datasets（复数），阶段的 argparse 是 dataset —— 名字对不上
-    # 就会静默跑全量，所以这一项要专门映射。
-    assert args.dataset == ["hotpotqa"]
-    assert args.seed == 7
-    # 未声明的属性设不进去。
-    assert not hasattr(args, "evil")
-
-
-def test_every_whitelisted_stage_maps_to_a_real_module():
-    import importlib
-
-    for stage, module in STAGE_MODULES.items():
-        assert importlib.util.find_spec(module) is not None, stage
-
-
-def test_every_stage_with_args_has_a_module_and_vice_versa():
-    """两张白名单必须对齐。"""
-    assert set(STAGE_ARGS) == set(STAGE_MODULES)
-
-
-def test_stage_arg_names_exist_on_the_stage_parsers():
-    """参数表里的键必须是阶段 argparse 真的认的属性。"""
-    import importlib
-
-    # datasets 走 dataset 的特例映射，provider_label 也是显式 dest。
-    aliases = {"datasets": "dataset", "k": "k", "metrics": "metrics"}
-    for stage, spec in STAGE_ARGS.items():
-        module = importlib.import_module(STAGE_MODULES[stage])
-        parser_args = _declared_dests(module)
-        for key in spec:
-            target = aliases.get(key, key)
-            assert target in parser_args, f"{stage}: {key!r} is not declared by {module.__name__}"
-
-
-def _declared_dests(module) -> set[str]:
-    """跑一遍阶段的 main parser，收集它声明了哪些 dest。"""
-    import argparse
-    from unittest.mock import patch
-
-    captured: dict[str, argparse.ArgumentParser] = {}
-    original_init = argparse.ArgumentParser.__init__
-
-    def spy(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        captured.setdefault("parser", self)
-
-    with patch.object(argparse.ArgumentParser, "__init__", spy):
-        with patch.object(argparse.ArgumentParser, "parse_args", side_effect=SystemExit):
-            try:
-                module.main([])
-            except SystemExit:
-                pass
-    parser = captured.get("parser")
-    return {action.dest for action in parser._actions} if parser else set()
-
-
-# --- 原文 vs 编译 diff ------------------------------------------------------
-
-
-def test_diff_reports_words_the_compiler_dropped():
-    """根因形态：编译把查询需要的短语删了。"""
-    source = (
-        "Guests in the album include the Grammy and Emmy award winning Cyndi Lauper, "
-        "along with other artists."
-    )
-    compiled = (
-        "The album features vocal contributions from guest artists including Cyndi Lauper "
-        "and several others."
-    )
-    result = diff.diff_vocabulary(source, compiled)
-    assert "grammy" in result["dropped"]
-    assert "emmy" in result["dropped"]
-    # 保留的部分也要看得见，否则读者无法判断这是「丢了修饰语」还是「整段换了」。
-    assert result["kept"] > 0
-
-    # 问题里的实词有三个落在 dropped 里 —— "award" 同样被改写掉了
-    # （"award winning" -> "guest artists"）。三个都要报出来。
-    lost = diff.question_terms_lost("who won Grammy and Emmy award", result)
-    assert lost == ["award", "emmy", "grammy"]
-
-
-def test_diff_expansion_ratio_shows_compilation_expands():
-    """编译**不是压缩而是扩写**（实测中位 2.19 倍）。"""
-    result = diff.diff_vocabulary("short source", "a much longer compiled rendition " * 5)
-    assert result["expansion_ratio"] > 1
-
-
-def test_question_terms_lost_is_empty_when_nothing_relevant_dropped():
-    result = diff.diff_vocabulary("Cyndi Lauper won a Grammy", "Cyndi Lauper won a Grammy award")
-    assert diff.question_terms_lost("who won Grammy", result) == []
-
-
-def test_stopwords_do_not_count_as_dropped():
-    """虚词的增删不说明任何问题，不该混进 dropped 里。"""
-    result = diff.diff_vocabulary("the cat sat on the mat", "cat sat mat")
-    assert result["dropped"] == []
-
-
-# --- answerMode 默认切分------------------------------------
+from akasha_platform.tasks import TaskRejected, TaskRunner
 
 
 @pytest.fixture
-def seeded(tmp_path: Path):
-    """一个装好 4 条样本的评测层：3 条 general（检索得分按定义为 0）+ 1 条真漏 gold。"""
-    db = tmp_path / "t.db"
-    migrate(db, verbose=False)
-    from akasha_benchmark.store import connect
+def settings(db_path) -> Settings:
+    return Settings(db_path=db_path)
 
-    connection = connect(db)
-    repo.upsert_dataset(
-        connection,
-        name=DATASET,
-        adapter="A",
-        adapter_version="1",
-        provides=["gold_docs", "reference_answers"],
-        identity_rules={},
-        qa_path="q",
-        qa_sha256="0" * 64,
-        qa_rows=4,
-        corpus_path="c",
-        corpus_sha256="1" * 64,
-        corpus_rows=2,
-        dedup_stats={},
-        gold_count_distribution={},
-        unique_question_texts=4,
+
+@pytest.fixture
+def client(settings) -> TestClient:
+    return TestClient(create_app(settings))
+
+
+# ------------------------------------------------------------ 任务生命周期
+
+
+def _register(monkeypatch, name: str, run) -> None:
+    monkeypatch.setitem(
+        STAGES, name, StageSpec(name=name, label=name, run=run, params={"marker": str})
     )
-    layer_id = repo.create_index_layer(
-        connection,
-        label="L",
-        subset_hash="sh",
-        seed=1,
-        qa_limit=4,
-        negatives_ratio=1.0,
-        narrativeqa_docs=2,
+
+
+def _wait(settings, task_id: int, statuses: set[str], timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        connection = connect(settings.db_path, read_only=True)
+        try:
+            task = task_store.get_task(connection, task_id)
+        finally:
+            connection.close()
+        if task and task["status"] in statuses:
+            return task
+        time.sleep(0.02)
+    raise AssertionError(f"任务 #{task_id} 未在 {timeout}s 内进入 {statuses}，当前 {task}")
+
+
+def test_task_succeeds_and_logs_are_kept_after_cleanup(settings, monkeypatch):
+    """审计日志只追加：清理任务记录之后它仍然查得到。"""
+
+    def stage(ctx):
+        ctx.log("干了点事")
+        ctx.progress(1, 1, "完成")
+
+    _register(monkeypatch, "unit", stage)
+    runner = TaskRunner(settings)
+    task = runner.start("unit", {"marker": "x"})
+    finished = _wait(settings, int(task["id"]), {task_store.SUCCEEDED})
+    assert finished["status"] == task_store.SUCCEEDED
+
+    runner.cleanup(int(task["id"]))
+    connection = connect(settings.db_path, read_only=True)
+    try:
+        assert task_store.get_task(connection, int(task["id"])) is None
+        messages = [entry["message"] for entry in task_store.audit_logs(connection)]
+    finally:
+        connection.close()
+    assert any("干了点事" in message for message in messages)
+
+
+def test_failure_is_recorded_on_the_task(settings, monkeypatch):
+    def stage(ctx):
+        raise RuntimeError("炸了")
+
+    _register(monkeypatch, "unit", stage)
+    runner = TaskRunner(settings)
+    task = runner.start("unit", {})
+    failed = _wait(settings, int(task["id"]), {task_store.FAILED})
+    assert "炸了" in (failed["error"] or "")
+
+
+def test_pause_stops_at_checkpoint_and_resume_continues(settings, monkeypatch):
+    """暂停是协作式的：停在已落库的位置上，继续时接着跑而不是重来。"""
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[int] = []
+
+    def stage(ctx):
+        calls.append(1)
+        if len(calls) == 1:
+            entered.set()
+            release.wait(5)
+            # 第一次进来时会被请求暂停，checkpoint 在这里抛出。
+            ctx.checkpoint()
+            raise AssertionError("checkpoint 没有拦住暂停")
+        ctx.log("续跑完成")
+
+    _register(monkeypatch, "unit", stage)
+    runner = TaskRunner(settings)
+    task = runner.start("unit", {})
+    task_id = int(task["id"])
+    assert entered.wait(5)
+
+    runner.pause(task_id)
+    release.set()
+    paused = _wait(settings, task_id, {task_store.PAUSED})
+    assert paused["status"] == task_store.PAUSED
+
+    runner.resume(task_id)
+    done = _wait(settings, task_id, {task_store.SUCCEEDED})
+    assert done["status"] == task_store.SUCCEEDED
+    assert len(calls) == 2
+
+
+def test_running_task_cannot_be_cleaned_up(settings, monkeypatch):
+    """在跑的任务不许删 —— 那会留下一个没人认领的线程还在写库。"""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stage(ctx):
+        entered.set()
+        release.wait(5)
+
+    _register(monkeypatch, "unit", stage)
+    runner = TaskRunner(settings)
+    task = runner.start("unit", {})
+    assert entered.wait(5)
+    with pytest.raises(TaskRejected):
+        runner.cleanup(int(task["id"]))
+    release.set()
+    _wait(settings, int(task["id"]), {task_store.SUCCEEDED})
+
+
+def test_same_stage_does_not_run_twice(settings, monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stage(ctx):
+        entered.set()
+        release.wait(5)
+
+    _register(monkeypatch, "unit", stage)
+    runner = TaskRunner(settings)
+    runner.start("unit", {})
+    assert entered.wait(5)
+    with pytest.raises(TaskRejected, match="正在运行"):
+        runner.start("unit", {})
+    release.set()
+
+
+def test_unknown_stage_and_bad_params_are_rejected(settings):
+    runner = TaskRunner(settings)
+    with pytest.raises(TaskRejected, match="未知阶段"):
+        runner.start("nope", {})
+    with pytest.raises(TaskRejected):
+        runner.start("query", {"compile_id": "abc"})
+
+
+def test_recover_marks_orphaned_tasks_paused(settings):
+    """后端重启后线程没了，留着 running 会让界面显示一个不存在的任务。"""
+    connection = connect(settings.db_path)
+    try:
+        task_id = task_store.create_task(connection, stage="compile", params={})
+        task_store.start_task(connection, task_id)
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert TaskRunner(settings).recover() == 1
+    connection = connect(settings.db_path, read_only=True)
+    try:
+        assert task_store.get_task(connection, task_id)["status"] == task_store.PAUSED
+    finally:
+        connection.close()
+
+
+# ------------------------------------------------------------ 路由
+
+
+def test_health_and_stages(client):
+    assert client.get("/api/health").json()["ok"] is True
+    stages = client.get("/api/stages").json()
+    assert {entry["stage"] for entry in stages} == set(STAGES)
+
+
+def test_datasets_route_reports_missing_files(client):
+    body = client.get("/api/datasets").json()
+    assert len(body["datasets"]) == 4
+    entry = next(d for d in body["datasets"] if d["name"] == "hotpotqa")
+    assert entry["normalized"] is False
+    assert "sample_id" in entry["identity_rules"]
+
+
+def test_metrics_route_narrows_by_dataset(client):
+    body = client.get("/api/metrics?datasets=narrativeqa").json()
+    assert "recall" not in body["computable_for_all"]
+    # faithfulness 不需要任何标注，所以它对 narrativeqa 也成立。
+    assert "faithfulness" in body["computable_for_all"]
+
+    both = client.get("/api/metrics?datasets=hotpotqa,narrativeqa").json()
+    assert "recall" in both["computable_for_some"]
+    assert "recall" not in both["computable_for_all"]
+
+
+def test_connection_put_only_updates_given_fields(client):
+    client.put("/api/connection", json={"base_url": "http://x", "email": "a@b"})
+    body = client.get("/api/connection").json()
+    assert body["base_url"] == "http://x"
+    assert body["password"] == ""
+
+    client.put("/api/connection", json={"password": "p"})
+    body = client.get("/api/connection").json()
+    assert body["base_url"] == "http://x"
+    assert body["password"] == "p"
+
+    assert client.put("/api/connection", json={"concurrency": "many"}).status_code == 422
+
+
+def test_provider_api_key_never_leaves_the_backend(client):
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "secret"},
     )
-    query_layer_id = repo.create_query_layer(
-        connection,
-        index_layer_id=layer_id,
-        label="Q",
-        config_hash="qh",
-        score_threshold=None,
-        concurrency=1,
-        request_interval_seconds=0.5,
-        model_configs=None,
-        model_configs_match_index=True,
-        allow_config_drift=False,
+    providers = client.get("/api/providers?role=judge").json()
+    assert providers[0]["api_key_set"] is True
+    assert "api_key" not in providers[0]
+
+    # 密钥留空表示保留原值。
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m2", "api_key": ""},
     )
-    eval_id = repo.create_eval_layer(
-        connection,
-        query_layer_id=query_layer_id,
-        label="E",
-        config_hash="eh",
-        ks=[5],
-        metrics=["recall"],
-    )
-    rows = [
-        ("g1", "general", 0.0),
-        ("g2", "general", 0.0),
-        ("g3", "general", 0.0),
-        ("k1", "knowledge", 0.5),
-        ("k2", "knowledge", 1.0),
-    ]
-    for sample_id, mode, recall in rows:
-        repo.record_sample_eval(
-            connection,
-            eval_id,
-            sample_id=sample_id,
-            dataset=DATASET,
-            answer_mode=mode,
-            ok=True,
-            http_status=200,
-            gold_count=2,
-            retrieved_count=0 if mode == "general" else 5,
-            citation_count=0,
-            snippet_count=0,
-            latency_ms=100,
-            answer="a",
-            detail={"metadata": {"type": "bridge"}},
+    connection = connect(client.app.state.settings.db_path, read_only=True)
+    try:
+        from akasha_benchmark.store import config_store
+
+        stored = config_store.list_providers(connection, "judge")[0]
+    finally:
+        connection.close()
+    assert stored["api_key"] == "secret"
+    assert stored["model"] == "m2"
+
+
+def test_connection_test_flags_compiles_in_another_workspace(client, db_path, monkeypatch):
+    """预检：不必等起了任务才发现这些编译在当前连接下用不了。"""
+    connection = connect(db_path)
+    try:
+        compile_id = run_store.create_compile_run(
+            connection, run_id="r1", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
         )
-        repo.record_sample_metrics(
-            connection, eval_id, sample_id, DATASET, {"recall@5": recall}
+        run_store.update_compile_run(
+            connection, compile_id, space_id="s1", workspace_id="w-original"
         )
-    connection.commit()
-    app = create_app(Settings(db_path=db))
-    yield TestClient(app), eval_id, connection
-    connection.close()
+        connection.commit()
+    finally:
+        connection.close()
+    client.put(
+        "/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"}
+    )
+
+    from akasha_platform.api import config as config_api
+
+    class Fake:
+        def __init__(self, cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def login(self):
+            pass
+
+        def current_user(self):
+            return {
+                "user": {"id": "u", "email": "e@x", "role": "owner"},
+                "workspace": {"id": "w-other", "name": "Other"},
+            }
+
+        def get_model_configs(self):
+            return {"configs": []}
+
+    monkeypatch.setattr(config_api, "AkashaClient", Fake)
+    body = client.post("/api/connection/test").json()
+    assert body["ok"] is True
+    assert [entry["run_id"] for entry in body["blocked_compiles"]] == ["r1"]
+    assert "w-original" in body["blocked_compiles"][0]["reason"]
 
 
-def test_sample_list_groups_by_answer_mode_without_being_asked(seeded):
-    """按 answerMode 分组是**默认行为**，不是可选筛选器。"""
-    client, eval_id, _ = seeded
-    body = client.get(f"/api/layers/eval/{eval_id}/samples").json()
-    assert set(body["by_answer_mode"]) == {"general", "knowledge"}
-    assert body["counts"] == {"general": 3, "knowledge": 2}
-    assert "检索失败" in body["note"]
+def test_raw_samples_serves_qa_and_corpus_separately(client, dataset_dir, monkeypatch):
+    """样本与语料是两个入口，读的是两个文件。"""
+    from akasha_platform.api import datasets as datasets_api
+
+    monkeypatch.setattr(datasets_api, "DEFAULT_DATASET_DIR", dataset_dir)
+
+    qa = client.get("/api/datasets/hotpotqa/raw?kind=qa&limit=1").json()
+    assert qa["source_file"] == "hotpotqa.json"
+    assert qa["kind"] == "qa"
+    assert len(qa["rows"]) == 1
+
+    corpus = client.get("/api/datasets/hotpotqa/raw?kind=corpus&limit=1").json()
+    assert corpus["source_file"] == "hotpotqa_corpus.json"
+    assert corpus["kind"] == "corpus"
+    assert len(corpus["rows"]) == 1
+    assert corpus["rows"] != qa["rows"]
+
+    # 默认是 qa，与加了 kind 之前的行为一致。
+    assert client.get("/api/datasets/hotpotqa/raw").json()["kind"] == "qa"
+    assert client.get("/api/datasets/hotpotqa/raw?kind=bogus").status_code == 422
 
 
-def test_worst_samples_expose_the_answer_mode_split(seeded):
-    """失败案例入口必须先给出按 answerMode 的计数。"""
-    client, eval_id, _ = seeded
-    body = client.get(f"/api/layers/eval/{eval_id}/worst?metric=recall@5&limit=4").json()
-    assert body["count_by_answer_mode"]["general"] == 3
-    assert body["count_by_answer_mode"]["knowledge"] == 1
-    # 只有一条是真的漏 gold。
-    knowledge = [s for s in body["samples"] if s["answer_mode"] == "knowledge"]
-    assert len(knowledge) == 1
-    assert knowledge[0]["value"] == pytest.approx(0.5)
+def test_provider_rename_updates_the_same_row(client):
+    """带 id 的改名改的是那一条 —— 不带 id 会按 label 认行，于是变成新增。"""
+    created = client.put(
+        "/api/providers/judge",
+        json={"label": "default", "base_url": "https://x/v1", "model": "m", "api_key": "secret"},
+    ).json()
+
+    body = client.put(
+        "/api/providers/judge",
+        json={"id": created["id"], "label": "gpt4", "base_url": "https://x/v1", "model": "m"},
+    ).json()
+    assert body["id"] == created["id"]
+
+    providers = client.get("/api/providers?role=judge").json()
+    assert [p["label"] for p in providers] == ["gpt4"]
+    assert providers[0]["api_key_set"] is True
 
 
-def test_worst_respects_metric_direction(seeded):
-    """``truncation_loss`` 是越低越好，排序方向必须跟着指标声明走。"""
-    client, eval_id, connection = seeded
-    repo.record_sample_metrics(connection, eval_id, "k1", DATASET, {"truncation_loss": 9.0})
-    repo.record_sample_metrics(connection, eval_id, "k2", DATASET, {"truncation_loss": 1.0})
-    connection.commit()
+def test_provider_rename_onto_a_taken_label_is_rejected(client):
+    for label in ("a", "b"):
+        client.put(
+            "/api/providers/judge",
+            json={"label": label, "base_url": "https://x/v1", "model": "m"},
+        )
+    first = client.get("/api/providers?role=judge").json()[0]
 
-    body = client.get(f"/api/layers/eval/{eval_id}/worst?metric=truncation_loss&limit=2").json()
-    assert body["higher_is_better"] is False
-    # 越低越好 -> 最差的是最大的那个。
-    assert body["samples"][0]["value"] == pytest.approx(9.0)
+    conflict = client.put(
+        "/api/providers/judge",
+        json={"id": first["id"], "label": "b", "base_url": "https://x/v1", "model": "m"},
+    )
+    assert conflict.status_code == 409
+    assert len(client.get("/api/providers?role=judge").json()) == 2
+
+    missing = client.put(
+        "/api/providers/judge",
+        json={"id": 999, "label": "c", "base_url": "https://x/v1", "model": "m"},
+    )
+    assert missing.status_code == 404
 
 
-def test_metric_definitions_expose_requires_and_direction():
-    """前端靠 requires 决定某列该不该显示，靠 higher_is_better 决定排序方向。"""
-    app = create_app(Settings(db_path=Path("nonexistent.db")))
+def test_provider_carries_no_sampling_params(client):
+    """温度与长度上限不是配置项 —— judge 分数要可比，它们由 judge/client.py 固定。"""
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "temperature": 0.9},
+    )
+    stored = client.get("/api/providers?role=judge").json()[0]
+    assert "temperature" not in stored
+    assert "max_tokens" not in stored
+
+
+def test_model_config_put_fills_the_only_legal_provider(client, monkeypatch):
+    """provider 不进表单，但 Akasha 的 PUT 要它，所以后端补上。"""
+    client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
+    sent: dict = {}
+
+    from akasha_platform.api import config as config_api
+
+    class Fake:
+        def __init__(self, cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def login(self):
+            pass
+
+        def put_model_config(self, feature, payload):
+            sent.update({"feature": feature, "payload": payload})
+            return {"ok": True}
+
+    monkeypatch.setattr(config_api, "AkashaClient", Fake)
+    body = client.put("/api/model-configs/answer", json={"model": "m", "baseUrl": "u"}).json()
+    assert body["requires_new_compile"] is False
+    assert sent["payload"] == {"provider": "openai-compatible", "model": "m", "baseUrl": "u"}
+
+
+def test_bad_role_is_rejected(client):
+    assert client.put("/api/providers/bogus", json={"base_url": "u", "model": "m"}).status_code == 422
+    assert client.get("/api/providers?role=bogus").status_code == 422
+
+
+def test_missing_records_return_404(client):
+    for path in ("/api/compiles/9", "/api/queries/9", "/api/evals/9", "/api/attributions/9"):
+        assert client.get(path).status_code == 404, path
+
+
+def test_compile_cleanup_reports_untouched_space(client, db_path):
+    connection = connect(db_path)
+    try:
+        compile_id = run_store.create_compile_run(
+            connection, run_id="r", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
+        )
+        run_store.update_compile_run(connection, compile_id, space_id="space-1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    body = client.delete(f"/api/compiles/{compile_id}").json()
+    assert body["deleted"] == 1
+    assert body["space_id"] == "space-1"
+    assert "没有删除" in body["note"]
+
+
+def test_cleanup_refused_while_a_task_writes_the_record(client, db_path):
+    connection = connect(db_path)
+    try:
+        compile_id = run_store.create_compile_run(
+            connection, run_id="r", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
+        )
+        task_id = task_store.create_task(connection, stage="compile", params={})
+        task_store.start_task(connection, task_id)
+        task_store.set_task_target(connection, task_id, "compile", compile_id)
+        connection.commit()
+    finally:
+        connection.close()
+    assert client.delete(f"/api/compiles/{compile_id}").status_code == 409
+
+
+def test_auth_token_is_required_when_set(db_path):
+    app = create_app(Settings(db_path=db_path, auth_token="secret"))
     client = TestClient(app)
-    definitions = {d["name"]: d for d in client.get("/api/metrics/definitions").json()}
-
-    assert definitions["recall"]["requires"] == ["gold_docs"]
-    # faithfulness 不需要任何标注，所以四组都成立 —— 这是 具体收获。
-    assert definitions["faithfulness"]["requires"] == []
-    assert definitions["truncation_loss"]["higher_is_better"] is False
-    assert definitions["recall"]["per_k"] is True
+    assert client.get("/api/health").status_code == 401
+    assert client.get("/api/health", headers={"X-Auth-Token": "wrong"}).status_code == 401
+    assert client.get("/api/health", headers={"X-Auth-Token": "secret"}).status_code == 200
 
 
-def test_lineage_returns_503_without_a_readonly_database(tmp_path: Path):
-    """没配 database_url 时给一句明确的 503，其余视图照常工作。"""
-    db = tmp_path / "t.db"
-    migrate(db, verbose=False)
-    client = TestClient(create_app(Settings(db_path=db)))
-
-    response = client.get("/api/lineage/some-page-id")
-    assert response.status_code == 503
-    assert "database_url" in response.json()["detail"]
-
-
-def test_delete_normalized_dataset_preserves_other_data(seeded):
-    client, _, connection = seeded
-    connection.execute(
-        "INSERT INTO dataset SELECT 'removable', adapter, adapter_version, provides_json, "
-        "identity_rules_json, qa_path, qa_sha256, qa_rows, corpus_path, corpus_sha256, "
-        "corpus_rows, dedup_stats_json, gold_count_distribution_json, unique_question_texts, "
-        "normalized_at FROM dataset WHERE name = ?", (DATASET,)
-    )
-    connection.execute(
-        "INSERT INTO sample VALUES ('removable', 'removable:0', '0', 'question', '[]', '[]', '{}')"
-    )
-    connection.execute(
-        "INSERT INTO corpus_doc VALUES ('removable', '0', 'title', 'body', 'hash')"
-    )
-    connection.commit()
-    response = client.delete('/api/datasets/removable')
-    assert response.status_code == 200
-    assert response.json() == {'deleted': 1, 'dataset': 'removable'}
-    assert repo.get_dataset(connection, 'removable') is None
-    assert repo.samples_of(connection, 'removable') == []
-    assert repo.corpus_of(connection, 'removable') == []
-    assert repo.get_dataset(connection, DATASET) is not None
-    assert client.delete('/api/datasets/removable').status_code == 404
-
-
-def test_delete_normalized_dataset_rejects_downstream_references(seeded):
-    client, _, connection = seeded
-    assert client.delete(f'/api/datasets/{DATASET}').status_code == 409
-    assert repo.get_dataset(connection, DATASET) is not None
-
-
-def test_delete_normalized_dataset_rejects_active_tasks(seeded):
-    client, _, connection = seeded
-    repo.create_task(connection, stage='normalize', argv=[])
-    connection.commit()
-    response = client.delete(f'/api/datasets/{DATASET}')
-    assert response.status_code == 409
-    assert '任务' in response.json()['detail']
-    assert repo.get_dataset(connection, DATASET) is not None
-
-
-def test_layer_tree_preserves_compilation_run_identity(seeded):
-    client, eval_id, _ = seeded
-    layer = client.get('/api/layers').json()['index_layers'][0]
-    query = layer['query_layers'][0]
-    evaluation = next(row for row in query['eval_layers'] if row['id'] == eval_id)
-    assert layer['run_id'] == query['run_id'] == evaluation['run_id'] == layer['label']
-    assert query['index_layer_id'] == layer['id']
-    assert evaluation['query_layer_id'] == query['id']
+def test_non_loopback_without_token_refuses_to_start(db_path):
+    """这个服务持有 Akasha 管理员凭据并能起长任务，不能裸奔在 0.0.0.0 上。"""
+    with pytest.raises(RuntimeError, match="拒绝绑定"):
+        create_app(Settings(db_path=db_path, host="0.0.0.0"))

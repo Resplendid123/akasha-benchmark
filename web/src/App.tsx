@@ -1,49 +1,47 @@
 import { useState } from 'react'
-import { Badcase } from './views/Badcase'
+import { Attribution } from './views/Attribution'
 import { Compile } from './views/Compile'
 import { Datasets } from './views/Datasets'
 import { Evaluate } from './views/Evaluate'
 import { Normalize } from './views/Normalize'
 import { Query } from './views/Query'
-import { Testing } from './views/Testing'
 import { Settings } from './views/Settings'
 import { Tasks } from './views/Tasks'
+import { Testing } from './views/Testing'
 
+// 顺序即流水线顺序。
 const LAYERS = [
-  { key: 'datasets', step: '1', label: '数据集', hint: '原始样例' },
-  { key: 'normalize', step: '2', label: '归一化', hint: '适配器与归一化后的样本' },
-  { key: 'compile', step: '3', label: '编译层', hint: '编译模型与文档变化' },
-  { key: 'query', step: '4', label: '查询层', hint: '运行查询、查看检索与生成响应' },
-  { key: 'evaluate', step: '5', label: '评测层', hint: '选择指标、计算并查看评测结果' },
-  { key: 'badcase', step: '6', label: '归因层', hint: '完整链路与根因' },
+  { key: 'datasets', step: '1', label: '数据集', hint: '下载与校验原始数据' },
+  { key: 'normalize', step: '2', label: '归一化', hint: '入 SQLite，不入 Akasha' },
+  { key: 'compile', step: '3', label: '编译', hint: '抽子集并入 Akasha 库' },
+  { key: 'query', step: '4', label: '查询', hint: '在编译的空间上跑 query' },
+  { key: 'evaluate', step: '5', label: '评测', hint: '选指标并计算' },
+  { key: 'attribution', step: '6', label: '归因', hint: '完整链路与根因' },
 ] as const
 
-const CROSS_CUTTING = [
-  { key: 'tasks', label: '任务', hint: '各阶段任务的启动、停止与清理' },
+const CROSS = [
+  { key: 'tasks', label: '任务', hint: '实时观测六层的任务' },
   { key: 'settings', label: '配置', hint: 'Akasha 连接与模型端点' },
-  { key: 'testing', label: '测试', hint: '小样本链路测试' },
+  { key: 'testing', label: '测试', hint: '轻量的一次完整链路' },
 ] as const
 
-type ViewKey = (typeof LAYERS)[number]['key'] | (typeof CROSS_CUTTING)[number]['key']
+type ViewKey = (typeof LAYERS)[number]['key'] | (typeof CROSS)[number]['key']
 
 export function App() {
   const [view, setView] = useState<ViewKey>('datasets')
-  const [activeEval, setActiveEval] = useState<number | null>(null)
-  const [activeQuery, setActiveQuery] = useState<number | null>(null)
-  const [activeIndexLayer, setActiveIndexLayer] = useState<number | null>(null)
-  const selectIndex = (id: number) => {
-    setActiveIndexLayer(id)
-    setActiveQuery(null)
-    setActiveEval(null)
+  const [compileId, setCompileId] = useState<number | null>(null)
+  const [queryId, setQueryId] = useState<number | null>(null)
+  const [evalId, setEvalId] = useState<number | null>(null)
+
+  const openTasks = () => setView('tasks')
+  const selectCompile = (id: number) => {
+    setCompileId(id)
+    setQueryId(null)
+    setEvalId(null)
   }
   const selectQuery = (id: number) => {
-    setActiveQuery(id)
-    setActiveEval(null)
-  }
-
-  const openBadcase = (evalLayerId: number) => {
-    setActiveEval(evalLayerId)
-    setView('badcase')
+    setQueryId(id)
+    setEvalId(null)
   }
 
   return (
@@ -68,7 +66,7 @@ export function App() {
 
         <div style={{ height: 14 }} />
         <nav className="nav">
-          {CROSS_CUTTING.map((entry) => (
+          {CROSS.map((entry) => (
             <button
               key={entry.key}
               className={view === entry.key ? 'active' : ''}
@@ -83,41 +81,55 @@ export function App() {
       </aside>
 
       <main className="main">
-        {view === 'datasets' && <Datasets onOpenTasks={() => setView('tasks')} />}
-        {view === 'normalize' && <Normalize onOpenTasks={() => setView('tasks')} />}
+        {view === 'datasets' && <Datasets onOpenTasks={openTasks} />}
+        {view === 'normalize' && <Normalize onOpenTasks={openTasks} />}
         {view === 'compile' && (
           <Compile
-            activeLayer={activeIndexLayer}
-            onSelectLayer={selectIndex}
-            onOpenQuery={(id) => { selectIndex(id); setView('query') }}
-            onOpenTasks={() => setView('tasks')}
+            activeCompile={compileId}
+            onSelect={selectCompile}
+            onOpenQuery={(id) => {
+              selectCompile(id)
+              setView('query')
+            }}
+            onOpenTasks={openTasks}
           />
         )}
         {view === 'query' && (
-          <Query activeLayer={activeIndexLayer} onSelectLayer={selectIndex}
-            onEvaluate={(indexId, queryId) => {
-              setActiveIndexLayer(indexId)
-              selectQuery(queryId)
+          <Query
+            activeCompile={compileId}
+            onSelectCompile={selectCompile}
+            onEvaluate={(id) => {
+              selectQuery(id)
               setView('evaluate')
             }}
-            onOpenSettings={() => setView('settings')} onOpenTasks={() => setView('tasks')} />
-        )}
-        {view === 'evaluate' && (
-          <Evaluate activeLayer={activeIndexLayer} activeQuery={activeQuery} activeEval={activeEval}
-            onSelectLayer={selectIndex} onSelectQuery={selectQuery} onSelectEval={setActiveEval}
-            onOpenBadcase={openBadcase} onOpenSettings={() => setView('settings')}
-            onOpenTasks={() => setView('tasks')} />
-        )}
-        {view === 'badcase' && (
-          <Badcase
-            activeEval={activeEval}
-            onSelectEval={setActiveEval}
-            onOpenSettings={() => setView('settings')}
+            onOpenTasks={openTasks}
           />
         )}
-        {view === 'testing' && <Testing onOpenTasks={() => setView('tasks')} />}
+        {view === 'evaluate' && (
+          <Evaluate
+            activeQuery={queryId}
+            activeEval={evalId}
+            onSelectQuery={selectQuery}
+            onSelectEval={setEvalId}
+            onAttribute={(id) => {
+              setEvalId(id)
+              setView('attribution')
+            }}
+            onOpenSettings={() => setView('settings')}
+            onOpenTasks={openTasks}
+          />
+        )}
+        {view === 'attribution' && (
+          <Attribution
+            activeEval={evalId}
+            onSelectEval={setEvalId}
+            onOpenSettings={() => setView('settings')}
+            onOpenTasks={openTasks}
+          />
+        )}
         {view === 'tasks' && <Tasks />}
         {view === 'settings' && <Settings />}
+        {view === 'testing' && <Testing onOpenTasks={openTasks} />}
       </main>
     </div>
   )

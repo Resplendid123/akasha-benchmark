@@ -29,6 +29,15 @@ class DatasetAdapter(ABC):
     def has(self, dependency: DataDependency) -> bool:
         return dependency in self.provides
 
+    def identity_rules(self) -> dict[str, str]:
+        """这个数据集怎么给样本与语料行赋身份。见 :mod:`.models` 里的两张规则表。"""
+        from .models import CORPUS_ID_RULES, SAMPLE_ID_RULES
+
+        return {
+            "sample_id": SAMPLE_ID_RULES[self.name],
+            "corpus_doc_id": CORPUS_ID_RULES[self.name],
+        }
+
     @abstractmethod
     def parse_row(
         self, row: dict[str, Any], row_index: int, corpus: CorpusIndex

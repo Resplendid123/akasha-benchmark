@@ -1,336 +1,331 @@
-"""启动白名单阶段子进程，由后台线程读取 stdout 并记录任务进度。
+"""任务运行器：在后台线程里跑阶段，支持暂停、继续、清理。
 
-日志采集依赖 Web 进程；当前不保证后端重启后继续采集或托管任务。
+阶段在**本进程**里跑（不再起子进程），因为参数与产物都在库里，
+而暂停需要一个能被阶段看见的信号 —— 跨进程做这件事要额外一套 IPC，
+而它换不来别的好处。代价是后端重启会中断在跑的任务：启动时把它们标成暂停,
+让用户显式继续，而不是留一个状态是「运行中」但其实没人在跑的记录。
+
+「暂停」是协作式的：阶段在每个可续跑的边界调 ``ctx.checkpoint()``，
+所以暂停总是停在一个已落库的位置上。继续 = 用同一条任务记录重跑，
+阶段自己跳过已完成的部分。
 """
 
 from __future__ import annotations
 
-import os
-import re
-import subprocess
-import sys
 import threading
-from pathlib import Path
 from typing import Any
 
-from akasha_benchmark.store import connect, repo
-from akasha_benchmark import progress
+from akasha_benchmark.stages import STAGES, chain, clean_params
+from akasha_benchmark.store import connect, task_store
+from akasha_benchmark.task import Paused, TaskContext
 
 from .settings import Settings
 
-# 阶段名 -> 模块。**白名单**：argv 由这里拼，不接受请求体里的任意命令。
-STAGE_MODULES = {
-    "verify": "akasha_platform.verify",
-    "download": "akasha_platform.download",
-    "normalize": "akasha_platform.prepare_normalize",
-    "subset": "akasha_benchmark.subset",
-    "ingest": "akasha_benchmark.ingest",
-    "query": "akasha_benchmark.run_queries",
-    "evaluate": "akasha_platform.evaluation",
-    "audit": "akasha_benchmark.audit_join",
-    "judge": "akasha_benchmark.judge.run",
-    "reindex": "akasha_benchmark.store.reindex",
-}
-
-# 阶段自己打印的进度行，形如 "  hotpotqa: 120/400 (failures=0)"
-# 或 "  hotpotqa: imported 25/400"。解析它就够了 —— 让阶段代码去写库会把
-# 「跑批」和「伺候 UI」两件事缠在一起。
-_PROGRESS = re.compile(r"(\w[\w-]*)\s*:\s*(?:imported\s+)?(\d+)\s*/\s*(\d+)")
+# 同一阶段不并行：两个 compile 同时写同一批表只会互相覆盖。
+# 数据准备类阶段之间也互斥 —— 它们改的是下游所有层的输入。
+EXCLUSIVE = frozenset({"download", "normalize"})
 
 
 class TaskRejected(RuntimeError):
-    """请求的任务不合法（未知阶段，或同类任务已在跑）。"""
+    """请求的任务不合法（未知阶段、参数不对，或同类任务已在跑）。"""
 
 
-# 阶段参数白名单，写入 run_config 后由对应 CLI 读取。
-STAGE_ARGS: dict[str, dict[str, type]] = {
-    "verify": {"dataset": str, "samples": int},
-    "download": {},
-    "normalize": {"datasets": list, "export": bool},
-    "subset": {
-        "label": str,
-        "datasets": list,
-        "seed": int,
-        "qa_limit": int,
-        "negatives_ratio": float,
-        "narrativeqa_docs": int,
-        "export": bool,
-    },
-    "ingest": {"label": str, "datasets": list, "skip_compile": bool},
-    "query": {
-        "label": str,
-        "query_label": str,
-        "datasets": list,
-        "score_threshold": float,
-        "limit": int,
-        "allow_config_drift": bool,
-        "retry_failed": bool,
-    },
-    "evaluate": {
-        "provider_label": str,
-        "query_label": str,
-        "eval_label": str,
-        "datasets": list,
-        "k": list,
-        "metrics": list,
-        "export": bool,
-    },
-    "audit": {"query_label": str, "eval_label": str, "datasets": list},
-    "judge": {
-        "eval_label": str,
-        "datasets": list,
-        "provider_label": str,
-        "limit": int,
-        "max_failure_rate": float,
-    },
-    "reindex": {"run_id": str, "label": str},
-}
+class TaskRunner:
+    """在跑的任务。一个 stage 一条线程，暂停信号逐任务持有。"""
 
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._pauses: dict[int, threading.Event] = {}
+        self._threads: dict[int, threading.Thread] = {}
+        self._lock = threading.Lock()
 
-def _clean_args(stage: str, args: dict[str, Any]) -> dict[str, Any]:
-    """按白名单过滤并转换类型。未声明的键直接丢掉。
+    # --- 启动与恢复 ---
 
-    ``run_config.args_json`` 是通过 HTTP 写进来的，而阶段进程会把它当参数读。
-    不过滤等于让请求体决定阶段代码看到什么 —— 那是个远程执行面。
-    """
-    allowed = STAGE_ARGS.get(stage)
-    if allowed is None:
-        raise TaskRejected(f"unknown stage {stage!r}; known: {sorted(STAGE_ARGS)}")
+    def recover(self) -> int:
+        """把上次进程留下的「运行中」标成暂停。返回处理了几条。
 
-    cleaned: dict[str, Any] = {}
-    for key, kind in allowed.items():
-        if key not in args:
-            continue
-        value = args[key]
-        if value is None or value == "":
-            continue
+        重启之后那些线程已经没了，留着 running 会让界面显示一个不存在的任务,
+        而清理又不许删在跑的任务 —— 于是那条记录卡住。
+        """
+        connection = connect(self.settings.db_path)
         try:
-            if kind is list:
-                if not isinstance(value, list):
-                    raise ValueError("expected a JSON array")
-                cleaned[key] = [str(v) for v in value] if key != "k" else [int(v) for v in value]
-            elif kind is bool:
-                if not isinstance(value, bool):
-                    raise ValueError("expected a JSON boolean")
-                cleaned[key] = value
-            else:
-                cleaned[key] = kind(value)
-        except (TypeError, ValueError) as exc:
-            raise TaskRejected(f"{stage}.{key}: expected {kind.__name__}, got {value!r}") from exc
-    return cleaned
+            active = task_store.active_tasks(connection)
+            for task in active:
+                task_store.pause_task(connection, int(task["id"]))
+                task_store.log(
+                    connection,
+                    task_id=int(task["id"]),
+                    stage=task["stage"],
+                    level="warn",
+                    message="后端重启，任务已标为暂停；点击继续可接着跑",
+                )
+            connection.commit()
+            return len(active)
+        finally:
+            connection.close()
 
-
-def _argv(stage: str, run_config_id: int, settings: Settings) -> list[str]:
-    """拼出 argv。**只从白名单取模块名，参数走库不走命令行。**
-
-    argv 的长度因此是固定的，不随参数个数增长。
-    """
-    module = STAGE_MODULES.get(stage)
-    if module is None:
-        raise TaskRejected(f"unknown stage {stage!r}; known: {sorted(STAGE_MODULES)}")
-    return [
-        sys.executable,
-        "-m",
-        module,
-        "--db",
-        str(settings.db_path),
-        "--run-config",
-        str(int(run_config_id)),
-    ]
-
-
-def _pump(task_id: int, process: subprocess.Popen[str], settings: Settings, log_path: Path) -> None:
-    """读子进程 stdout，写日志文件与库。**逐行提交**，Web 端才看得到进度。"""
-    connection = connect(settings.db_path)
-    try:
-        structured_progress = False
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8", newline="\n") as log:
-            assert process.stdout is not None
-            for line in process.stdout:
-                line = line.rstrip("\n")
-                event = progress.parse(line)
-                if event:
-                    line = f"[进度] {event['note']}"
-                log.write(line + "\n")
-                log.flush()
-                repo.add_task_event(connection, task_id, "info", line[:2000])
-                match = _PROGRESS.search(line)
-                if event:
-                    structured_progress = True
-                    repo.update_task_progress(
-                        connection, task_id,
-                        done=min(event['done'], event['total'] - 1),
-                        total=event['total'], note=event['note'],
-                    )
-                elif match and not structured_progress:
-                    repo.update_task_progress(
-                        connection,
-                        task_id,
-                        done=int(match.group(2)),
-                        total=int(match.group(3)),
-                        note=match.group(1),
-                    )
-                # 每行都提交：憋着的话 15 小时里 Web 端看到的是一个空任务。
-                connection.commit()
-
-        code = process.wait()
-        repo.finish_task(
-            connection,
-            task_id,
-            status="succeeded" if code == 0 else "failed",
-            exit_code=code,
-            error=None if code == 0 else f"exit code {code}; see {log_path.name}",
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def start(stage: str, args: dict[str, Any], settings: Settings) -> dict[str, Any]:
-    """起一个阶段任务，立刻返回。返回库里那条 task 记录。"""
-    connection = connect(settings.db_path)
-    try:
-        # 数据准备会改写阶段输入，小样本验证跨多个阶段；两者都独占执行。
-        running = [
-            t for t in repo.running_tasks(connection)
-            if t["stage"] == stage or stage in {"verify", "download", "normalize"}
-            or t["stage"] in {"verify", "download", "normalize"}
-        ]
-        if running:
-            raise TaskRejected(
-                f"a {running[0]['stage']} task is already running (task #{running[0]['id']}). "
-                "Data preparation and verification run exclusively; wait for the active task."
-            )
-
-        cleaned = _clean_args(stage, args)
-        if stage == "verify":
-            from .verify import DATASETS
-            from akasha_benchmark.config import load_config
-
-            if cleaned.get("dataset", "hotpotqa") not in DATASETS:
-                raise TaskRejected("小样本验证仅支持 hotpotqa、2wikimultihopqa、musique")
-            if not 1 <= cleaned.get("samples", 3) <= 5:
-                raise TaskRejected("验证样本数必须在 1–5 之间")
-            if repo.get_dataset(connection, cleaned.get("dataset", "hotpotqa")) is None:
-                raise TaskRejected("请先归一化所选数据集")
-            try:
-                load_config(connection).require_credentials()
-            except ValueError as exc:
-                raise TaskRejected(str(exc)) from exc
-        run_config_id = repo.create_run_config(connection, stage, cleaned)
-        argv = _argv(stage, run_config_id, settings)
-        task_id = repo.create_task(
-            connection,
-            stage=stage,
-            argv=argv,
-            index_layer_id=args.get("index_layer_id"),
-            query_layer_id=args.get("query_layer_id"),
-            eval_layer_id=args.get("eval_layer_id"),
-        )
-        connection.commit()
-
-        log_path = settings.log_dir / f"task-{task_id}-{stage}.log"
-        environment = {
-            **os.environ,
-            # 子进程的 stdout 必须是 UTF-8：Windows 上默认跟随控制台（实测 gbk），
-            # 中文日志会变成乱码写进库。
-            "PYTHONIOENCODING": "utf-8",
-            "PYTHONUNBUFFERED": "1",
-        }
-        process = subprocess.Popen(  # noqa: S603 - argv 来自白名单，逐项显式映射
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=environment,
-            cwd=str(Path(settings.db_path).resolve().parent),
-        )
-        repo.start_task(connection, task_id, pid=process.pid, log_path=str(log_path))
-        connection.commit()
-
-        thread = threading.Thread(
-            target=_pump, args=(task_id, process, settings, log_path), daemon=True
-        )
-        thread.start()
-        return repo.get_task(connection, task_id) or {}
-    finally:
-        connection.close()
-
-
-def cleanup(task_id: int | None, settings: Settings) -> dict[str, Any]:
-    """删任务记录与日志文件。``task_id`` 为 None 时清掉所有已终态的任务。
-
-    在跑的任务不删 —— 那会留下一个没人认领的子进程，而它还在往库里写。
-    要停先 :func:`cancel`。
-    """
-    connection = connect(settings.db_path)
-    try:
-        targets = (
-            [repo.get_task(connection, task_id)]
-            if task_id is not None
-            else [t for t in repo.list_tasks(connection, limit=10000)
-                  if t["status"] not in {"queued", "running"}]
-        )
-        if task_id is not None and targets[0] is None:
-            raise TaskRejected(f"no task #{task_id}")
-
-        logs_removed = 0
-        for task in targets:
-            if not task:
-                continue
-            log_path = task.get("log_path")
-            if log_path:
-                try:
-                    Path(log_path).unlink(missing_ok=True)
-                    logs_removed += 1
-                except OSError:
-                    # 日志删不掉不该让整个清理失败：库里的记录才是要清的东西。
-                    pass
-
+    def start(self, stage: str, args: dict[str, Any]) -> dict[str, Any]:
+        """建一条任务并起线程，立刻返回那条记录。"""
+        if stage not in STAGES:
+            raise TaskRejected(f"未知阶段 {stage!r}；可用：{sorted(STAGES)}")
         try:
-            removed = (
-                repo.delete_task(connection, task_id)
-                if task_id is not None
-                else repo.delete_finished_tasks(connection)
-            )
+            params = clean_params(stage, args)
         except ValueError as exc:
             raise TaskRejected(str(exc)) from exc
-        connection.commit()
-        return {"deleted": removed, "logs_removed": logs_removed}
-    finally:
-        connection.close()
 
+        connection = connect(self.settings.db_path)
+        try:
+            self._require_free(connection, stage)
+            task_id = task_store.create_task(connection, stage=stage, params=params)
+            connection.commit()
+            record = task_store.get_task(connection, task_id) or {}
+        finally:
+            connection.close()
 
-def cancel(task_id: int, settings: Settings) -> dict[str, Any]:
-    """终止一个在跑的任务。
+        self._spawn(task_id, stage, params)
+        return record
 
-    注意这只杀客户端进程 —— 编译在 Akasha 的 BullMQ worker 里，它不会因此停。
-    所以取消 ingest 的语义是「不再盯着了」，不是「编译取消了」。
-    """
-    connection = connect(settings.db_path)
-    try:
-        task = repo.get_task(connection, task_id)
-        if task is None:
-            raise TaskRejected(f"no task #{task_id}")
-        if task["status"] not in {"queued", "running"}:
-            raise TaskRejected(f"task #{task_id} is already {task['status']}")
-        pid = task["pid"]
-        if pid:
+    def start_chain(self, args: dict[str, Any]) -> dict[str, Any]:
+        """起一条链路测试：建链首那条编译任务，余下几步挂在它上面。
+
+        返回链首任务，前端据此跳到任务列表 —— 后面三条会在前一条成功时自动出现。
+        """
+        connection = connect(self.settings.db_path)
+        try:
             try:
-                os.kill(int(pid), 9)
-            except (ProcessLookupError, PermissionError, OSError) as exc:
-                repo.add_task_event(connection, task_id, "warn", f"kill failed: {exc}")
-        repo.finish_task(
+                steps = chain.build(args, connection)
+            except ValueError as exc:
+                raise TaskRejected(str(exc)) from exc
+            head, rest = steps[0], steps[1:]
+            params = clean_params(head["stage"], head["params"])
+            self._require_free(connection, head["stage"])
+            task_id = task_store.create_task(connection, stage=head["stage"], params=params)
+            # 链首自己就是链号，四条任务凭它归到一起。
+            task_store.set_task_chain(connection, task_id, chain=rest, chain_id=task_id)
+            connection.commit()
+            record = task_store.get_task(connection, task_id) or {}
+        finally:
+            connection.close()
+
+        self._spawn(task_id, head["stage"], params)
+        return record
+
+    def resume(self, task_id: int) -> dict[str, Any]:
+        """继续一个暂停的任务：同一条记录、同一组参数，重新起线程。"""
+        connection = connect(self.settings.db_path)
+        try:
+            task = task_store.get_task(connection, task_id)
+            if task is None:
+                raise TaskRejected(f"任务 #{task_id} 不存在")
+            if task["status"] not in (task_store.PAUSED, task_store.FAILED):
+                raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，无需继续")
+            self._require_free(connection, task["stage"])
+        finally:
+            connection.close()
+
+        self._spawn(task_id, task["stage"], task["params"])
+        connection = connect(self.settings.db_path)
+        try:
+            return task_store.get_task(connection, task_id) or {}
+        finally:
+            connection.close()
+
+    def pause(self, task_id: int) -> dict[str, Any]:
+        """请求暂停。阶段跑到下一个 checkpoint 时停下并落库。"""
+        connection = connect(self.settings.db_path)
+        try:
+            task = task_store.get_task(connection, task_id)
+            if task is None:
+                raise TaskRejected(f"任务 #{task_id} 不存在")
+            if task["status"] not in task_store.ACTIVE:
+                raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，不在运行")
+            with self._lock:
+                event = self._pauses.get(task_id)
+            if event is None:
+                # 没有对应线程（比如后端重启过），直接改状态。
+                task_store.pause_task(connection, task_id)
+                connection.commit()
+            else:
+                event.set()
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage=task["stage"],
+                    level="info",
+                    message="已请求暂停，等待当前步骤收尾",
+                )
+                connection.commit()
+            return task_store.get_task(connection, task_id) or {}
+        finally:
+            connection.close()
+
+    def cleanup(self, task_id: int | None) -> dict[str, int]:
+        """删任务记录。``None`` 时清掉所有非运行中的任务。
+
+        **审计日志不删** —— 它是审计记录，任务记录清掉之后仍然查得到。
+        """
+        connection = connect(self.settings.db_path)
+        try:
+            try:
+                deleted = (
+                    task_store.delete_task(connection, task_id)
+                    if task_id is not None
+                    else task_store.delete_inactive_tasks(connection)
+                )
+            except ValueError as exc:
+                raise TaskRejected(str(exc)) from exc
+            connection.commit()
+            return {"deleted": deleted}
+        finally:
+            connection.close()
+
+    # --- 内部 ---
+
+    def _require_free(self, connection, stage: str) -> None:
+        for task in task_store.active_tasks(connection):
+            if task["stage"] == stage or (
+                stage in EXCLUSIVE or task["stage"] in EXCLUSIVE
+            ):
+                raise TaskRejected(
+                    f"{task['stage']} 任务 #{task['id']} 正在运行，请先等它结束或暂停"
+                )
+
+    def _verify(self, connection, task_id: int, stage: str) -> None:
+        """链上的任务要过契约校验才算成功。抛出的异常按失败处理。
+
+        只对链上的任务生效：手动起的单阶段任务不受这套断言约束。
+        """
+        chain_id, _ = task_store.task_chain(connection, task_id)
+        check = chain.VERIFY.get(stage)
+        if chain_id is None or check is None:
+            return
+        task = task_store.get_task(connection, task_id) or {}
+        target_id = task.get("target_id")
+        if target_id is None:
+            raise RuntimeError(f"{stage} 没有产出可校验的记录")
+        check(connection, int(target_id))
+        task_store.log(
             connection,
-            task_id,
-            status="cancelled",
-            exit_code=None,
-            error="cancelled by user; server-side compilation is unaffected",
+            task_id=task_id,
+            stage=stage,
+            level="info",
+            message="链路契约：通过",
         )
         connection.commit()
-        return repo.get_task(connection, task_id) or {}
-    finally:
-        connection.close()
+
+    def _advance_chain(self, connection, task_id: int, stage: str) -> None:
+        """成功之后接上链的下一步：上一步的产物 id 填进它的关联参数。"""
+        chain_id, remaining = task_store.task_chain(connection, task_id)
+        if chain_id is None or not remaining:
+            return
+        task = task_store.get_task(connection, task_id) or {}
+        target_id = task.get("target_id")
+        if target_id is None:
+            task_store.log(
+                connection,
+                task_id=task_id,
+                stage=stage,
+                level="error",
+                message="没有产物记录，链路中断",
+            )
+            connection.commit()
+            return
+
+        step, rest = remaining[0], remaining[1:]
+        params = {k: v for k, v in step["params"].items() if v is not None}
+        if link := step.get("link"):
+            params[link] = int(target_id)
+        try:
+            params = clean_params(step["stage"], params)
+            self._require_free(connection, step["stage"])
+        except (ValueError, TaskRejected) as exc:
+            task_store.log(
+                connection,
+                task_id=task_id,
+                stage=stage,
+                level="error",
+                message=f"链路中断，下一步 {step['stage']} 起不来：{exc}",
+            )
+            connection.commit()
+            return
+
+        next_id = task_store.create_task(connection, stage=step["stage"], params=params)
+        task_store.set_task_chain(connection, next_id, chain=rest, chain_id=chain_id)
+        task_store.log(
+            connection,
+            task_id=task_id,
+            stage=stage,
+            level="info",
+            message=f"链路继续：{STAGES[step['stage']].label} #{next_id}",
+        )
+        connection.commit()
+        self._spawn(next_id, step["stage"], params)
+
+    def _spawn(self, task_id: int, stage: str, params: dict[str, Any]) -> None:
+        event = threading.Event()
+        with self._lock:
+            self._pauses[task_id] = event
+        thread = threading.Thread(
+            target=self._run, args=(task_id, stage, params, event), daemon=True
+        )
+        with self._lock:
+            self._threads[task_id] = thread
+        thread.start()
+
+    def _run(
+        self, task_id: int, stage: str, params: dict[str, Any], event: threading.Event
+    ) -> None:
+        # 每个任务线程一条独立连接：sqlite 连接不跨线程共用。
+        connection = connect(self.settings.db_path)
+        try:
+            task_store.start_task(connection, task_id)
+            connection.commit()
+            ctx = TaskContext(
+                task_id=task_id,
+                stage=stage,
+                params=params,
+                connection=connection,
+                pause_event=event,
+            )
+            ctx.log(f"开始 {STAGES[stage].label}：{params}")
+            try:
+                STAGES[stage].run(ctx)
+                self._verify(connection, task_id, stage)
+            except Paused as exc:
+                task_store.pause_task(connection, task_id)
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage=stage,
+                    level="warn",
+                    message=f"已暂停：{exc}",
+                )
+                connection.commit()
+                return
+            except Exception as exc:  # noqa: BLE001 - 失败要落库，不能只留在线程里
+                task_store.finish_task(
+                    connection,
+                    task_id,
+                    status=task_store.FAILED,
+                    error=f"{type(exc).__name__}: {exc}"[:2000],
+                )
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage=stage,
+                    level="error",
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+                connection.commit()
+                return
+            task_store.finish_task(connection, task_id, status=task_store.SUCCEEDED)
+            task_store.log(
+                connection, task_id=task_id, stage=stage, level="info", message="任务完成"
+            )
+            connection.commit()
+            self._advance_chain(connection, task_id, stage)
+        finally:
+            connection.close()
+            with self._lock:
+                self._pauses.pop(task_id, None)
+                self._threads.pop(task_id, None)

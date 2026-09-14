@@ -1,6 +1,6 @@
 [project]
 name = "akasha-benchmark"
-version = "0.1.0"
+version = "0.2.0"
 description = "Retrieval, attribution and answer-quality benchmark for Akasha"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,10 +13,6 @@ dependencies = [
     "uvicorn==0.42.0",
 ]
 
-[project.scripts]
-akasha-benchmark = "akasha_benchmark:main"
-akasha-platform = "akasha_platform.main:main"
-
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
@@ -25,3 +21,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

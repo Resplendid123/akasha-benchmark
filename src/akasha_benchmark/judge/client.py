@@ -30,6 +30,11 @@ FAILURE_TIMEOUT = "timeout"
 FAILURE_PARSE = "parse_error"
 FAILURE_REFUSAL = "refusal"
 
+# 采样参数不可配：judge 分数要在两次运行之间可比，温度必须是 0。
+# 做成配置项就等于允许两份不可比的分数用同一个指标名落库。
+TEMPERATURE = 0.0
+MAX_TOKENS = 1024
+
 
 class JudgeConfigError(RuntimeError):
     """凭据或端点没配好。"""
@@ -50,8 +55,6 @@ class JudgeProvider:
     base_url: str
     model: str
     api_key: str = ""
-    temperature: float = 0.0
-    max_tokens: int = 1024
     timeout_seconds: float = 120.0
 
     def resolve_key(self) -> str:
@@ -74,8 +77,6 @@ class JudgeProvider:
             "base_url": self.base_url,
             "model": self.model,
             "api_key_set": bool((self.api_key or "").strip()),
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
         }
 
 
@@ -121,8 +122,8 @@ class JudgeClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": self.provider.temperature,
-            "max_tokens": self.provider.max_tokens,
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_TOKENS,
             # 要求 JSON 输出。端点不支持时会忽略这一项，所以解析侧仍然要容错。
             "response_format": {"type": "json_object"},
         }

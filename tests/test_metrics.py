@@ -1,180 +1,162 @@
-"""指标算法：拿手算的值对，外加 数据依赖校验。"""
+"""指标口径：排名、依赖闸门、归因判据优先级。"""
 
 from __future__ import annotations
 
-from math import log2
-
 import pytest
 
-from akasha_benchmark.datasets import DataDependency, DependencyError, get_adapter
-from akasha_benchmark.metrics import attribution, multihop, qa, retrieval
+from akasha_benchmark import attribution
+from akasha_benchmark.datasets import DataDependency, DependencyError
+from akasha_benchmark.metrics import attribution as citation
+from akasha_benchmark.metrics import multihop, qa, registry, retrieval
 
 
-def test_recall_and_hit_at_k():
-    """Recall 看命中比例，Hit 只看有没有命中，k 的边界要对。"""
-    ranked = ["a", "b", "c", "d"]
-    gold = ["c", "z"]
-    assert retrieval.recall_at_k(ranked, gold, 2) == 0.0
-    assert retrieval.recall_at_k(ranked, gold, 3) == 0.5
-    assert retrieval.hit_at_k(ranked, gold, 2) == 0.0
-    assert retrieval.hit_at_k(ranked, gold, 3) == 1.0
+def test_unmapped_pages_keep_their_rank():
+    """丢掉未映射的 page 会让后面的结果整体前移，把对排名敏感的指标都算高。"""
+    retrieved = [{"sourcePageId": "unknown"}, {"sourcePageId": "p1"}]
+    ranked = retrieval.ranked_doc_ids(retrieved, {"p1": "d1"})
+    assert len(ranked) == 2
+    assert ranked[1] == "d1"
+    assert retrieval.mrr(ranked, ["d1"]) == pytest.approx(0.5)
+    assert retrieval.unmapped_page_ids(retrieved, {"p1": "d1"}) == ["unknown"]
 
 
-def test_mrr_uses_first_gold_rank():
-    """MRR 只认首个 gold 的位置。"""
-    assert retrieval.mrr(["x", "gold"], ["gold"]) == 0.5
-    assert retrieval.mrr(["gold", "x"], ["gold"]) == 1.0
-    assert retrieval.mrr(["x", "y"], ["gold"]) == 0.0
+def test_full_coverage_differs_from_recall():
+    """多跳少一跳就答不对，所以「凑齐全部 gold」比 recall 均值更贴近实际需求。"""
+    ranked = ["d1", "x"]
+    gold = ["d1", "d2"]
+    assert retrieval.recall_at_k(ranked, gold, 2) == pytest.approx(0.5)
+    assert retrieval.full_coverage(ranked, gold, 2) == pytest.approx(0.0)
+    assert retrieval.full_coverage(["d1", "d2"], gold, 2) == pytest.approx(1.0)
 
 
-def test_ndcg_matches_manual_computation():
-    """gold 在第 2、3 位；理想排序是它们占第 1、2 位。"""
-    ranked = ["x", "g1", "g2", "y"]
-    gold = ["g1", "g2"]
-    dcg = 1 / log2(3) + 1 / log2(4)
-    idcg = 1 / log2(2) + 1 / log2(3)
-    assert retrieval.ndcg_at_k(ranked, gold, 4) == pytest.approx(dcg / idcg)
-    assert retrieval.ndcg_at_k(gold, gold, 4) == pytest.approx(1.0)
+def test_ndcg_rewards_earlier_gold():
+    early = retrieval.ndcg_at_k(["d1", "x", "y"], ["d1"], 3)
+    late = retrieval.ndcg_at_k(["x", "y", "d1"], ["d1"], 3)
+    assert early == pytest.approx(1.0)
+    assert late < early
 
 
-def test_full_coverage_needs_every_gold():
-    """凑齐全部 gold 才算 1，差一篇就是 0。"""
-    assert retrieval.full_coverage(["g1", "g2"], ["g1", "g2"], 2) == 1.0
-    assert retrieval.full_coverage(["g1", "x"], ["g1", "g2"], 2) == 0.0
-    # 两篇都在，但第二篇落在 k 之外。
-    assert retrieval.full_coverage(["g1", "x", "g2"], ["g1", "g2"], 2) == 0.0
-
-
-def test_ranked_doc_ids_keeps_rank_slot_for_unmapped_pages():
-    """反查不到的 page 要占住名次，同一个 page 重复出现只占一个名次。"""
-    retrieved = [
-        {"sourcePageId": "p-unknown"},
-        {"sourcePageId": "p1"},
-        {"sourcePageId": "p1"},  # 同一个 page，只占一个名次
-    ]
-    page_map = {"p1": "doc1"}
-    ranked = retrieval.ranked_doc_ids(retrieved, page_map)
-    assert ranked == ["__unmapped__:p-unknown", "doc1"]
-    # 未知 page 不能把 doc1 顶到第 1 位，否则 MRR 会被算高。
-    assert retrieval.mrr(ranked, ["doc1"]) == 0.5
-    assert retrieval.unmapped_page_ids(retrieved, page_map) == ["p-unknown"]
-
-
-def test_retrieval_metrics_refuse_datasets_without_gold():
-    """narrativeqa 没有 gold，请求检索指标必须抛异常而不是返回 0。"""
-    narrativeqa = get_adapter("narrativeqa")
-    assert DataDependency.GOLD_DOCS not in narrativeqa.provides
+def test_retrieval_refuses_without_gold():
+    """没有 gold 时拒绝计算，不返回 0.0 —— 假分数会静默污染汇总。"""
+    with pytest.raises(ValueError):
+        retrieval.recall_at_k(["d1"], [], 2)
     with pytest.raises(DependencyError):
-        retrieval.require_gold_docs("narrativeqa", narrativeqa.provides)
-    # 另外三组提供 gold 文档，应当放行。
-    for name in ("hotpotqa", "2wikimultihopqa", "musique"):
-        retrieval.require_gold_docs(name, get_adapter(name).provides)
+        retrieval.require_gold_docs("narrativeqa", frozenset())
 
 
-def test_recall_raises_without_gold_rather_than_returning_zero():
-    """gold 为空时分母无定义，报错而不是返回 0.0。"""
-    with pytest.raises(ValueError):
-        retrieval.recall_at_k(["a"], [], 5)
-    with pytest.raises(ValueError):
-        retrieval.ndcg_at_k(["a"], [], 5)
+def test_registry_gate_is_set_comparison():
+    """判据是 provides 与 requires 的集合比对，不是数据集名字。"""
+    gold = frozenset({DataDependency.GOLD_DOCS, DataDependency.REFERENCE_ANSWERS})
+    assert registry.require("hotpotqa", gold, "recall").name == "recall"
+    with pytest.raises(DependencyError):
+        registry.require("narrativeqa", frozenset({DataDependency.REFERENCE_ANSWERS}), "recall")
+    # faithfulness 的依赖是空集，所以它对任何数据集都成立。
+    assert registry.require("narrativeqa", frozenset(), "faithfulness").kind == "judge"
 
 
-def test_normalize_answer_is_the_standard_recipe():
-    """标准口径：小写、去标点、去冠词、合并空白。"""
-    assert qa.normalize_answer("The Beatles!") == "beatles"
-    assert qa.normalize_answer("  A  Hard   Day's Night ") == "hard days night"
-    assert qa.normalize_answer("An apple, an orange.") == "apple orange"
+def test_expand_only_applies_k_to_per_k_metrics():
+    assert registry.expand("recall", (2, 5)) == ["recall@2", "recall@5"]
+    assert registry.expand("em", (2, 5)) == ["em"]
 
 
-@pytest.mark.parametrize(
-    "prediction,references,expected",
-    [
-        pytest.param("the beatles", ["The Beatles", "Beatles band"], {"em": 1, "f1": 1}, id="first-reference"),
-        pytest.param("beatles", ["beatles band", "The Beatles"], {"em": 1, "f1": 1}, id="best-reference"),
-        pytest.param("John Lennon", ["Lennon"], {"em": 0, "f1": 2 / 3}, id="partial"),
-        pytest.param("The genus is Flavivirus", ["Flavivirus"], {"em": 0, "f1": 0.5}, id="prose"),
-    ],
-)
-def test_score_answer(prediction, references, expected):
-    assert qa.score_answer(prediction, references) == pytest.approx(expected)
+def test_truncation_loss_separates_retrieval_from_citation():
+    """召回到了但没被引用 —— 那是引用过滤太严，不是检索没找到。要调的地方不同。"""
+    page_to_doc = {"p1": "gold", "p2": "other"}
+    result = citation.evaluate_sample(
+        citations=[{"sourcePageId": "p2"}],
+        retrieved=[{"sourcePageId": "p1"}, {"sourcePageId": "p2"}],
+        citation_evidence=[{"excerpts": ["x"]}],
+        gold=["gold"],
+        page_to_doc=page_to_doc,
+    )
+    assert result["truncation_loss"] == pytest.approx(1.0)
+    assert result["truncated_gold"] == pytest.approx(1.0)
+    assert result["citation_recall"] == pytest.approx(0.0)
+    assert result["evidence_verifiable_rate"] == pytest.approx(1.0)
 
 
-def test_exact_match_is_whole_string_after_normalization():
-    """EM 比的是整串归一化结果，不是包含关系。"""
-    assert qa.exact_match("The Beatles!", "beatles") == 1.0
-    # 包含参考答案但多出词语时，EM 仍为零。
-    assert qa.exact_match("the beatles band", "beatles") == 0.0
-    assert qa.exact_match("Flavivirus", "flavivirus") == 1.0
+def test_graph_exclusive_gold_is_net_contribution():
+    """图扩展的净价值 = 只有它才拿到的 gold，不含语义召回本来就能找到的。"""
+    page_to_doc = {"p1": "g1", "p2": "g2"}
+    snippets = [
+        {"retrievalReasons": ["semantic"], "sourceWindows": [{"sourcePageId": "p1"}]},
+        {"retrievalReasons": ["graph-neighbor"], "sourceWindows": [{"sourcePageId": "p2"}]},
+    ]
+    result = multihop.evaluate_sample(snippets, ["g1", "g2"], page_to_doc)
+    assert result["graph_exclusive_gold_count"] == 1
+    assert result["graph_neighbor_share"] == pytest.approx(0.5)
+    assert result["graph_neighbor_precision"] == pytest.approx(1.0)
 
 
-def test_f1_empty_prediction():
-    """退化情况按官方 SQuAD 脚本口径。"""
-    assert qa.token_f1("", "something") == 0.0
-    assert qa.token_f1("", "") == 1.0
+def test_answer_scoring_takes_max_over_references():
+    scored = qa.score_answer("Rita Moreno", ["someone else", "rita moreno"])
+    assert scored["em"] == pytest.approx(1.0)
+    assert scored["f1"] == pytest.approx(1.0)
+    assert qa.normalize_answer("The  Answer!") == "answer"
 
 
 def test_answer_mode_distribution():
-    """缺失的 answerMode 单独归到 missing，不能悄悄并进别的桶。"""
-    dist = qa.answer_mode_distribution(["knowledge", "knowledge", "no_match", None])
-    assert dist == {"knowledge": 0.5, "no_match": 0.25, "missing": 0.25}
+    assert qa.answer_mode_distribution(["knowledge", "no_match", None]) == {
+        "knowledge": pytest.approx(1 / 3),
+        "missing": pytest.approx(1 / 3),
+        "no_match": pytest.approx(1 / 3),
+    }
 
 
-def test_attribution_separates_truncated_gold():
-    """被检索到但没进引用的 gold，要能和「检索没找到」区分开。"""
-    page_map = {"p1": "d1", "p2": "d2", "p3": "d3"}
-    retrieved = [{"sourcePageId": "p1"}, {"sourcePageId": "p2"}, {"sourcePageId": "p3"}]
-    citations = [{"sourcePageId": "p1"}]
-    evidence = [{"sourcePageId": "p1", "excerpts": ["quote"]}, {"sourcePageId": "p9", "excerpts": []}]
-
-    scored = attribution.evaluate_sample(citations, retrieved, evidence, ["d1", "d2"], page_map)
-    assert scored["citation_precision"] == 1.0
-    assert scored["citation_recall"] == 0.5
-    assert scored["truncation_loss"] == 2.0
-    # d2 被检索到了却没被引用：这是过滤损失，不是检索没命中。
-    assert scored["truncated_gold"] == 1.0
-    assert scored["evidence_verifiable_rate"] == 0.5
+# ------------------------------------------------------------ 归因判据
 
 
-def test_multihop_graph_exclusive_gold():
-    """只有图扩展才拿到的 gold，要单独算出来。"""
-    page_map = {"pa": "d1", "pb": "d2"}
-    snippets = [
-        {"retrievalReasons": ["semantic"], "sourceWindows": [{"sourcePageId": "pa"}]},
-        {"retrievalReasons": ["graph-neighbor"], "sourceWindows": [{"sourcePageId": "pb"}]},
-    ]
-    scored = multihop.evaluate_sample(snippets, ["d1", "d2"], page_map)
-    assert scored["graph_neighbor_share"] == 0.5
-    assert scored["graph_neighbor_precision"] == 1.0
-    # d2 只来自图扩展；d1 语义召回本来就找到了。
-    assert scored["graph_exclusive_gold_count"] == 1
-    assert scored["graph_exclusive_gold_share"] == 0.5
+def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
+    return {
+        "answer_mode": mode,
+        "metrics": metrics,
+        "answer": "x",
+        "detail": {"gold_doc_ids": list(gold), "question": "q"},
+    }
 
 
-def test_multihop_gold_found_by_both_signals_is_not_graph_exclusive():
-    """两个信号都找到的 gold 不算图扩展的净增量。"""
-    page_map = {"pa": "d1"}
-    snippets = [
-        {"retrievalReasons": ["semantic"], "sourceWindows": [{"sourcePageId": "pa"}]},
-        {"retrievalReasons": ["graph-neighbor"], "sourceWindows": [{"sourcePageId": "pa"}]},
-    ]
-    scored = multihop.evaluate_sample(snippets, ["d1"], page_map)
-    assert scored["graph_exclusive_gold_count"] == 0
+def test_fallback_is_judged_before_retrieval():
+    """生成端拒答必须最先判，否则它那 0 分会被解释成检索失败。"""
+    ruling = attribution.classify(_sample({"hit@5": 0.0}, mode="general"), None)
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
 
 
-def test_multihop_aggregate_reason_rates():
-    """按信号汇总时，计数要累加而不是取均值，命中率再由累加值算。"""
-    page_map = {"pa": "d1"}
-    rows = [
-        multihop.evaluate_sample(
-            [{"retrievalReasons": ["semantic"], "sourceWindows": [{"sourcePageId": "pa"}]}],
-            ["d1"],
-            page_map,
-        ),
-        multihop.evaluate_sample(
-            [{"retrievalReasons": ["semantic"], "sourceWindows": []}], ["d1"], page_map
-        ),
-    ]
-    agg = multihop.aggregate(rows)
-    assert agg["reason_totals"] == {"semantic": 2}
-    assert agg["reason_gold_totals"] == {"semantic": 1}
-    assert agg["reason_gold_rate"]["semantic"] == 0.5
+def test_compiled_away_needs_lineage():
+    lineage = [{"question_terms_lost": ["grammy"]}]
+    assert (
+        attribution.classify(_sample({"hit@5": 0.0}), lineage)["root_cause"]
+        == attribution.CAUSE_COMPILED_AWAY
+    )
+    # 链路不可用时判不了 compiled_away，退到 retrieval_miss 并记下这一点。
+    ruling = attribution.classify(_sample({"hit@5": 0.0}), None)
+    assert ruling["root_cause"] == attribution.CAUSE_RETRIEVAL_MISS
+    assert ruling["evidence"]["lineage_available"] is False
+
+
+def test_citation_dropped_outranks_retrieval_miss():
+    ruling = attribution.classify(_sample({"hit@5": 0.0, "truncated_gold": 1.0}), [])
+    assert ruling["root_cause"] == attribution.CAUSE_CITATION_DROPPED
+
+
+def test_graph_edge_missing_when_coverage_incomplete():
+    ruling = attribution.classify(
+        _sample({"hit@5": 1.0, "full_coverage@5": 0.0, "graph_exclusive_gold_count": 0.0}), []
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_GRAPH_EDGE_MISSING
+
+
+def test_gold_suspect_when_everything_retrieved_but_answer_wrong():
+    ruling = attribution.classify(
+        _sample({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}), []
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_GOLD_SUSPECT
+
+
+def test_every_cause_has_a_remedy():
+    """「这条能不能靠调参救」是归因结论里最有用的一句，不能缺。"""
+    causes = {
+        value
+        for name, value in vars(attribution).items()
+        if name.startswith("CAUSE_") and isinstance(value, str)
+    }
+    assert causes == set(attribution.REMEDIES)

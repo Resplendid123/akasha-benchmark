@@ -1,71 +1,36 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { Task, TaskDetail } from '../types'
-import { Bar, Failed, Loading, useAction, useAsync } from '../ui'
+import {
+  Bar,
+  Failed,
+  Loading,
+  STATUS_TEXT,
+  StatusTag,
+  useAction,
+  useAsync,
+  usePoll,
+} from '../ui'
 
-const STATUS_CLASS: Record<Task['status'], string> = {
-  queued: 'tag',
-  running: 'tag accent',
-  succeeded: 'tag ok',
-  failed: 'tag bad',
-  cancelled: 'tag warn',
-}
-
-const STATUS_TEXT: Record<Task['status'], string> = {
-  queued: '排队中',
-  running: '进行中',
-  succeeded: '已完成',
-  failed: '失败',
-  cancelled: '已停止',
-}
-
+/** 任务层：实时观测六层的任务，支持暂停、继续、清理。 */
 export function Tasks() {
   const tasks = useAsync(() => api.tasks(), [])
   const stages = useAsync(() => api.stages(), [])
-  const [openTask, setOpenTask] = useState<number | null>(null)
+  const [open, setOpen] = useState<number | null>(null)
+  const [showAudit, setShowAudit] = useState(false)
   const cleanup = useAction<{ deleted: number }>()
 
-  // 有任务在跑就每 3 秒刷一次，进度逐行提交。
-  useEffect(() => {
-    const active = tasks.data?.some((t) => t.status === 'running' || t.status === 'queued')
-    if (!active) return
-    const timer = setInterval(tasks.reload, 3000)
-    return () => clearInterval(timer)
-  }, [tasks.data, tasks.reload])
-
-  const finished = (tasks.data ?? []).filter(
-    (t) => t.status !== 'running' && t.status !== 'queued',
+  const list = tasks.data ?? []
+  usePoll(
+    list.some((t) => t.status === 'running' || t.status === 'queued'),
+    tasks.reload,
   )
+
+  const removable = list.filter((t) => t.status !== 'running' && t.status !== 'queued')
 
   return (
     <>
       <h2>任务</h2>
-
-      {stages.data && (
-        <div className="panel">
-          <h3 style={{ marginTop: 0 }}>阶段描述</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>阶段</th>
-                <th>代价</th>
-                <th>需要 Akasha 启动</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stages.data.map((stage) => (
-                <tr key={stage.stage}>
-                  <td>
-                    {stage.label} <span className="small mono muted">{stage.stage}</span>
-                  </td>
-                  <td className="small muted">{stage.cost}</td>
-                  <td>{stage.needs_akasha ? <span className="tag warn">是</span> : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
 
       <div className="spread" style={{ marginBottom: 8 }}>
         <h3 style={{ margin: 0 }}>任务列表</h3>
@@ -73,28 +38,32 @@ export function Tasks() {
           <button className="action small" onClick={tasks.reload}>
             刷新
           </button>
+          <button className="action small" onClick={() => setShowAudit(!showAudit)}>
+            {showAudit ? '收起审计日志' : '审计日志'}
+          </button>
           <button
             className="action small danger"
-            disabled={finished.length === 0 || cleanup.busy}
-            onClick={() =>
+            disabled={removable.length === 0 || cleanup.busy}
+            onClick={() => {
+              if (!window.confirm('清理所有已结束的任务记录？审计日志会保留。')) return
               cleanup.run(async () => {
-                const result = await api.cleanupFinished()
+                const result = await api.cleanupTasks()
                 tasks.reload()
                 return result
               })
-            }
+            }}
           >
-            清理已结束（{finished.length}）
+            清理已结束（{removable.length}）
           </button>
         </div>
       </div>
 
-      {cleanup.error && <div className="note bad">{cleanup.error}</div>}
+      {cleanup.error && <Failed error={cleanup.error} />}
       {tasks.loading && <Loading what="任务" />}
       {tasks.error && <Failed error={tasks.error} />}
-      {tasks.data && tasks.data.length === 0 && <p className="muted">还没有任务。</p>}
+      {list.length === 0 && !tasks.loading && <p className="muted">还没有任务。</p>}
 
-      {tasks.data && tasks.data.length > 0 && (
+      {list.length > 0 && (
         <table>
           <thead>
             <tr>
@@ -108,12 +77,13 @@ export function Tasks() {
             </tr>
           </thead>
           <tbody>
-            {tasks.data.map((task) => (
-              <TaskRow
+            {list.map((task) => (
+              <Row
                 key={task.id}
                 task={task}
-                open={openTask === task.id}
-                onToggle={() => setOpenTask(openTask === task.id ? null : task.id)}
+                label={stages.data?.find((s) => s.stage === task.stage)?.label ?? task.stage}
+                open={open === task.id}
+                onToggle={() => setOpen(open === task.id ? null : task.id)}
                 onChanged={tasks.reload}
               />
             ))}
@@ -121,53 +91,64 @@ export function Tasks() {
         </table>
       )}
 
-      {openTask !== null && <TaskLog taskId={openTask} onClose={() => setOpenTask(null)} />}
+      {open !== null && <Logs key={open} taskId={open} onClose={() => setOpen(null)} />}
+      {showAudit && <Audit />}
     </>
   )
 }
 
-function TaskRow({
+function Row({
   task,
+  label,
   open,
   onToggle,
   onChanged,
 }: {
   task: Task
+  label: string
   open: boolean
   onToggle: () => void
   onChanged: () => void
 }) {
   const action = useAction<unknown>()
-  const running = task.status === 'running' || task.status === 'queued'
+  const active = task.status === 'running' || task.status === 'queued'
+  const resumable = task.status === 'paused' || task.status === 'failed'
   const ratio =
-    task.status === 'succeeded' ? 1 : task.progress_total && task.progress_total > 0
-      ? task.progress_done / task.progress_total
-      : null
+    task.status === 'succeeded'
+      ? 1
+      : task.progress_total && task.progress_total > 0
+        ? task.progress_done / task.progress_total
+        : null
+
+  const act = (fn: () => Promise<unknown>) =>
+    action.run(async () => {
+      const result = await fn()
+      onChanged()
+      return result
+    })
 
   return (
     <tr className={open ? 'selected' : ''}>
       <td className="mono">{task.id}</td>
-      <td>{task.stage === 'verify' ? '链路测试' : task.stage}</td>
+      <td>{label}</td>
       <td>
-        <span className={STATUS_CLASS[task.status]}>{STATUS_TEXT[task.status]}</span>
+        <StatusTag status={task.status} />
       </td>
-      <td style={{ minWidth: 120 }}>
+      <td style={{ minWidth: 130 }}>
         {ratio !== null ? (
           <>
             <Bar value={ratio} kind={task.status === 'failed' ? 'bad' : undefined} />
             <span className="small mono muted">
-              {task.status === 'succeeded' || task.progress_total === 10000
-                ? `${Math.floor(ratio * 100)}%`
-                : `${task.progress_done}/${task.progress_total}`}
+              {task.progress_done}/{task.progress_total}
             </span>
           </>
         ) : (
           <span className="small mono muted">{task.progress_done || '—'}</span>
         )}
-        {task.progress_note && <span className="small muted"> {task.status === 'succeeded' ? '已完成' : task.progress_note}</span>}
+        {task.progress_note && <span className="small muted"> {task.progress_note}</span>}
       </td>
-      <td className="small mono muted truncate" title={JSON.stringify(task.args)}>
-        {Object.entries(task.args)
+      <td className="small mono muted truncate" title={JSON.stringify(task.params)}>
+        {Object.entries(task.params)
           .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join('+') : value}`)
           .join(' ') || '—'}
       </td>
@@ -177,75 +158,74 @@ function TaskRow({
           <button className="action small" onClick={onToggle}>
             {open ? '收起' : '日志'}
           </button>
-          {running ? (
+          {active && (
             <button
-              className="action small danger"
+              className="action small"
               disabled={action.busy}
-              onClick={() =>
-                action.run(async () => {
-                  const result = await api.cancelTask(task.id)
-                  onChanged()
-                  return result
-                })
-              }
-              title={task.stage === 'verify' ? '停止验证，保留已生成的层与远端 Space' : '停止是可续跑的：重新起同一阶段会接着上次的进度'}
+              title="停在下一个可续跑的边界；已提交给 Akasha 的编译不会因此停止"
+              onClick={() => act(() => api.pauseTask(task.id))}
             >
-              停止
+              暂停
             </button>
-          ) : (
+          )}
+          {resumable && (
+            <button
+              className="action small primary"
+              disabled={action.busy}
+              onClick={() => act(() => api.resumeTask(task.id))}
+            >
+              继续
+            </button>
+          )}
+          {!active && (
             <button
               className="action small danger"
               disabled={action.busy}
-              onClick={() =>
-                action.run(async () => {
-                  const result = await api.deleteTask(task.id)
-                  onChanged()
-                  return result
-                })
-              }
+              title="删任务记录，审计日志保留"
+              onClick={() => act(() => api.deleteTask(task.id))}
             >
               清理
             </button>
           )}
         </div>
-        {action.error && <div className="small" style={{ color: 'var(--bad)' }}>{action.error}</div>}
+        {action.error && (
+          <div className="small" style={{ color: 'var(--bad)' }}>
+            {action.error}
+          </div>
+        )}
       </td>
     </tr>
   )
 }
 
-/** 增量日志。只拉新增的事件，长任务的日志不会重复传。 */
-function TaskLog({ taskId, onClose }: { taskId: number; onClose: () => void }) {
+/** 增量日志。只拉新增的行，长任务的日志不会重复传。 */
+function Logs({ taskId, onClose }: { taskId: number; onClose: () => void }) {
   const [detail, setDetail] = useState<TaskDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     let alive = true
     let lastId = 0
-    let running = true
+    let active = true
 
     const tick = () => {
       api
         .task(taskId, lastId)
         .then((next) => {
           if (!alive) return
-          if (next.events.length > 0) {
-            lastId = next.events[next.events.length - 1]?.id ?? lastId
-          }
-          running = next.status === 'running' || next.status === 'queued'
+          if (next.logs.length > 0) lastId = next.logs[next.logs.length - 1]!.id
+          active = next.status === 'running' || next.status === 'queued'
           setDetail((previous) =>
-            previous
-              ? { ...next, events: [...previous.events, ...next.events].slice(-500) }
-              : next,
+            previous ? { ...next, logs: [...previous.logs, ...next.logs].slice(-500) } : next,
           )
         })
         .catch((exc: unknown) => {
-          if (alive) setError(String(exc instanceof Error ? exc.message : exc))
+          if (alive) setError(exc instanceof Error ? exc.message : String(exc))
         })
     }
 
     tick()
-    const timer = setInterval(() => running && tick(), 2000)
+    const timer = setInterval(() => active && tick(), 2000)
     return () => {
       alive = false
       clearInterval(timer)
@@ -259,12 +239,14 @@ function TaskLog({ taskId, onClose }: { taskId: number; onClose: () => void }) {
     <div className="panel">
       <div className="spread">
         <h3 style={{ margin: 0 }}>
-          任务 #{detail.id} · {detail.stage}{' '}
-          <span className={STATUS_CLASS[detail.status]}>{STATUS_TEXT[detail.status]}</span>
+          任务 #{detail.id} · {detail.stage} <StatusTag status={detail.status} />
         </h3>
         <div className="row tight small muted">
-          <span>pid {detail.pid ?? '—'}</span>
-          <span>退出码 {detail.exit_code ?? '—'}</span>
+          {detail.target_kind && (
+            <span className="mono">
+              {detail.target_kind} #{detail.target_id}
+            </span>
+          )}
           <button className="action small" onClick={onClose}>
             关闭
           </button>
@@ -272,22 +254,31 @@ function TaskLog({ taskId, onClose }: { taskId: number; onClose: () => void }) {
       </div>
 
       {detail.error && <div className="note bad">{detail.error}</div>}
-      {detail.stage === 'ingest' && detail.status === 'running' && (
-        <div className="note plain small">
-          入库的进度条本质是「帮我盯着别人干活」—— 真正在编译的是 Akasha 的
-          BullMQ worker，约 40 秒/篇是那边的吞吐，客户端调不动。停止只停客户端进程，
-          服务端的编译不会因此停。
-        </div>
-      )}
 
       <pre className="block tall" style={{ marginTop: 10 }}>
-        {detail.events.map((event) => event.message).join('\n') || '（还没有输出）'}
+        {detail.logs.map((entry) => `[${entry.level}] ${entry.message}`).join('\n') ||
+          '（还没有输出）'}
       </pre>
-      <p className="small muted mono">{detail.argv.join(' ')}</p>
       <p className="small muted">
-        参数在库里（run_config），不在命令行 —— 所以 argv 只有一个 id：
-        {JSON.stringify(detail.args)}
+        {STATUS_TEXT[detail.status]} · 参数 {JSON.stringify(detail.params)}
       </p>
+    </div>
+  )
+}
+
+/** 审计日志。只追加，清理任务不删它。 */
+function Audit() {
+  const { data, error, loading } = useAsync(() => api.audit(), [])
+  if (loading) return <Loading what="审计日志" />
+  if (error) return <Failed error={error} />
+  return (
+    <div className="panel">
+      <h3 style={{ marginTop: 0 }}>审计日志</h3>
+      <pre className="block tall">
+        {(data ?? [])
+          .map((entry) => `${entry.at} [${entry.stage}/${entry.level}] ${entry.message}`)
+          .join('\n') || '（还没有记录）'}
+      </pre>
     </div>
   )
 }

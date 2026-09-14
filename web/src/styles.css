@@ -96,6 +96,21 @@ h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
 }
 .panel.flat { box-shadow: none; background: transparent; }
 
+/* 面板首行的标题不再各自写 marginTop: 0。 */
+.panel > h3:first-child,
+.panel > .panel-head:first-child h3 { margin-top: 0; }
+/* 标题在左，状态在右。 */
+.panel-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px; flex-wrap: wrap;
+}
+.panel-head h3 { margin-bottom: 8px; }
+/* 面板底部的操作区：一条分隔线之下，各面板同一位置。 */
+.panel-actions {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+
 .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
 .row.tight { gap: 6px; }
 .spread { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
@@ -103,6 +118,22 @@ h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 @media (max-width: 1100px) {
   .grid2, .grid3 { grid-template-columns: 1fr; }
+}
+
+/* 表单：字段两列等宽，输入框填满格子而不是各自写 minWidth。
+ * compact 给数值字段，一行排得下五个。 */
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; }
+.form-grid.compact { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+/* 三四个字段排成一行。auto-fit 会把空轨道折掉，所以三个字段就是三等分，
+ * 窄屏放不下 190px 时自己换行。 */
+.form-grid.inline { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.form-grid + .form-grid { margin-top: 10px; }
+.form-grid label.field > input,
+.form-grid label.field > select,
+.form-grid .secret-input input { min-width: 0; width: 100%; }
+.form-grid label.field.wide { grid-column: 1 / -1; }
+@media (max-width: 900px) {
+  .form-grid { grid-template-columns: 1fr; }
 }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -142,20 +173,37 @@ tbody tr.selected { background: var(--accent-soft); }
 
 /* --- 控件 --- */
 
+/* font: inherit 是关键：button 不继承 font-family，不写就落回 UA 默认字体，
+ * 中文会和页面其余部分不是同一个字面。 */
 button.action {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  min-height: 28px;
   background: #fff; color: var(--text);
   border: 1px solid var(--border-strong);
-  padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  padding: 4px 12px; border-radius: 6px; cursor: pointer;
+  font: inherit; font-size: 13px; line-height: 1.2;
+  transition: background-color 0.12s, border-color 0.12s, color 0.12s;
 }
-button.action:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button.action:hover:not(:disabled) {
+  background: var(--panel-2); border-color: var(--accent); color: var(--accent);
+}
+button.action:active:not(:disabled) { background: var(--accent-soft); }
+button.action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 button.action:disabled { opacity: 0.45; cursor: not-allowed; }
 button.action.primary {
   background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600;
 }
-button.action.primary:hover:not(:disabled) { background: #1a52b8; color: #fff; }
+button.action.primary:hover:not(:disabled) {
+  background: #1a52b8; border-color: #1a52b8; color: #fff;
+}
+button.action.primary:active:not(:disabled) { background: #17489f; }
 button.action.danger { color: var(--bad); border-color: #eaa9ac; }
-button.action.danger:hover:not(:disabled) { background: var(--bad-soft); color: var(--bad); }
-button.action.small { padding: 2px 8px; font-size: 12px; }
+button.action.danger:hover:not(:disabled) {
+  background: var(--bad-soft); border-color: var(--bad); color: var(--bad);
+}
+button.action.danger:active:not(:disabled) { background: #fbdcdc; }
+/* 表格行内的按钮。2px 的上下内边距点起来太窄，min-height 兜住。 */
+button.action.small { min-height: 24px; padding: 3px 9px; font-size: 12px; }
 
 input, select, textarea {
   background: #fff; color: var(--text);
@@ -179,6 +227,9 @@ pre.block.tall { max-height: 520px; }
 
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
+/* 名称在上、代号在下。三段字挤在一行会看不清哪段是哪段。 */
+.stack { display: flex; flex-direction: column; gap: 1px; }
+.stack > .mono { font-size: 11px; }
 .mode-group { margin-bottom: 18px; }
 .mode-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46ch; }
@@ -219,15 +270,18 @@ pre.block.tall { max-height: 520px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
 
-/* 密码显隐按钮保持在输入框内，不占用文字区域。 */
-.secret-input { position: relative; display: flex; }
-.secret-input input { width: 100%; min-width: 0; padding-right: 38px; }
+/* 密码与 api_key 一套样式：显隐按钮在输入框内，不占用文字区域。 */
+.secret-input { position: relative; display: flex; width: 100%; }
+.secret-input input { width: 100%; min-width: 0; padding-right: 34px; }
+/* Edge 自带一个 reveal 按钮，不去掉会和下面这个并排出现两个眼睛。 */
+.secret-input input::-ms-reveal { display: none; }
 .secret-toggle {
   position: absolute; right: 2px; top: 2px; bottom: 2px;
-  display: flex; align-items: center; justify-content: center; width: 32px;
+  display: flex; align-items: center; justify-content: center; width: 28px;
   border: 0; border-radius: 4px; background: transparent;
   color: var(--muted); cursor: pointer;
 }
 .secret-toggle:hover { color: var(--accent); background: var(--accent-soft); }
-.secret-toggle:focus-visible { outline: 2px solid var(--accent); }
+.secret-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .secret-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
+.secret-toggle svg { display: block; }

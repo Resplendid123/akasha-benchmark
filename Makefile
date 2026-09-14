@@ -1,29 +1,22 @@
 SHELL := /bin/sh
 
-PY := uv run python
-
-.PHONY: help setup sync migrate web serve test clean
+.PHONY: help sync serve web build test
 
 help: ## 显示可用命令
-	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-10s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-sync: ## 安装 Python 依赖
+sync: ## 安装依赖（Python 与前端）
 	uv sync
+	npm --prefix web install
 
-migrate: ## 初始化数据库
-	$(PY) -m akasha_benchmark.store.migrate
+serve: ## 启动后端 :8848（建表在启动时自动完成）
+	uv run uvicorn akasha_platform.main:app --reload --port 8848
 
-setup: migrate ## 初始化数据库（需先 sync）
-	@echo '底座就绪。在两个终端分别运行 make web 和 make serve。'
-
-web: ## 启动前端热更新服务 :5173
+web: ## 启动前端热更新 :5173
 	npm --prefix web run dev
 
-serve: ## 启动后端热更新服务 :8848
-	uv run akasha-platform --reload
+build: ## 构建前端产物
+	npm --prefix web run build
 
 test: ## 运行离线测试
 	uv run pytest -q
-
-clean: ## 清理导出、缓存、日志与前端产物，保留库和原始数据
-	$(PY) scripts/clean.py all

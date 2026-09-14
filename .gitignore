@@ -13,22 +13,16 @@ wheels/
 # screenplays that must not be redistributed.
 /dataset/
 
-# Evaluation artifacts (normalized data, responses, reports).
-/data/
-
-# 评测库包含 connection 和 model_provider 的明文凭据。
+# 评测库含 akasha_connection 与 model_provider 的明文凭据。
 /akasha_bench.db
 /akasha_bench.db-wal
 /akasha_bench.db-shm
-# 迁移前的自动备份。
-/akasha_bench.db.pre-*
+# 重构前的库留档。
+/akasha_bench.db.legacy-*
 
 # 前端构建产物与依赖。
 /web/dist/
 /web/node_modules/
-
-# 平台的任务日志。
-/logs/
 
 # Test and tooling caches
 .pytest_cache/

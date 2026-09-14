@@ -1,50 +1,104 @@
 import { useState } from 'react'
 import { api } from '../api'
-import { Failed, useAction, useAsync } from '../ui'
+import type { Provider } from '../types'
+import { Failed, Field, Loading, useAction, useAsync } from '../ui'
 
+const DATASETS = ['hotpotqa', '2wikimultihopqa', 'musique']
+
+/** 测试层：轻量的一次完整六层链路。 */
 export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
   const datasets = useAsync(() => api.datasets(), [])
-  const [dataset, setDataset] = useState('')
-  const [samples, setSamples] = useState(3)
-  const start = useAction<{ id: number }>()
-  const available = (datasets.data ?? []).filter((d) =>
-    ['hotpotqa', '2wikimultihopqa', 'musique'].includes(d.name),
-  )
-  const selected = dataset || available[0]?.name || ''
+  const judges = useAsync<Provider[]>(() => api.providers('judge'), [])
+  const [dataset, setDataset] = useState(DATASETS[0]!)
+  const [samples, setSamples] = useState(2)
+  const [withJudge, setWithJudge] = useState(false)
+  const [useModel, setUseModel] = useState(false)
+  const start = useAction<unknown>()
+
+  if (datasets.loading) return <Loading what="数据集状态" />
+  if (datasets.error) return <Failed error={datasets.error} />
+
+  const normalized = (datasets.data?.datasets ?? [])
+    .filter((d) => d.normalized && DATASETS.includes(d.name))
+    .map((d) => d.name)
 
   return (
-    <div className="panel">
+    <>
       <h2>测试</h2>
-      <p className="small muted">
-        自动抽样、入库编译、查询并生成报告，检查响应结构、来源映射与断点续跑。
-        会调用模型；每篇 gold 配一篇干扰文档，最多导入 50 篇。独立创建的编译层与远端 Space 会保留，便于复查。
-      </p>
-      <div className="row">
-        <label className="field">
-          数据集
-          <select value={selected} onChange={(event) => setDataset(event.target.value)}>
-            {available.map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
-          </select>
-        </label>
-        <label className="field">
-          样本数（1–5）
-          <input type="number" min={1} max={5} value={samples}
-            onChange={(event) => setSamples(Number(event.target.value))} />
-        </label>
-        <button className="action primary"
-          disabled={start.busy || !!start.result || !selected || !Number.isInteger(samples) || samples < 1 || samples > 5}
-          onClick={() => start.run(() => api.startTask('verify', { dataset: selected, samples }))}>
-          {start.busy ? '启动中…' : '开始测试'}
-        </button>
-      </div>
-      {datasets.error && <Failed error={datasets.error} />}
-      {!datasets.loading && !datasets.error && available.length === 0 &&
-        <p className="muted">请先在归一化页面准备带 gold 文档的数据集。</p>}
-      {start.error && <div className="note bad">{start.error}</div>}
-      {start.result && <div className="note">
-        验证任务 #{start.result.id} 已启动。完成后可在评测层查看结果。
-        <button className="action small" onClick={onOpenTasks}>查看进度与检查结果</button>
-      </div>}
-    </div>
+
+      {start.error && <Failed error={start.error} />}
+
+      {normalized.length === 0 ? (
+        <div className="note warn">
+          链路测试需要一个已归一化的数据集（{DATASETS.join('、')}）。请先在「归一化」页处理。
+        </div>
+      ) : (
+        <div className="panel">
+          <div className="row">
+            <Field label="数据集" hint="只用有 gold 标注的三组">
+              <select value={dataset} onChange={(e) => setDataset(e.target.value)}>
+                {normalized.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="样本数" hint="1–3">
+              <input
+                type="number"
+                min={1}
+                max={3}
+                value={samples}
+                onChange={(e) => setSamples(Number(e.target.value))}
+              />
+            </Field>
+          </div>
+
+          <div className="row tight" style={{ marginTop: 8 }}>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={withJudge}
+                disabled={(judges.data ?? []).length === 0}
+                onChange={() => setWithJudge(!withJudge)}
+              />
+              包含评估模型
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={useModel} onChange={() => setUseModel(!useModel)} />
+              包含归因模型
+            </label>
+          </div>
+
+          <div className="panel-actions">
+            <button
+              className="action primary"
+              disabled={start.busy}
+              onClick={() =>
+                start.run(async () => {
+                  const task = await api.startChain({
+                    dataset,
+                    samples,
+                    use_model: useModel,
+                    metrics: withJudge
+                      ? ['recall', 'hit', 'em', 'f1', 'citation_recall', 'faithfulness']
+                      : ['recall', 'hit', 'em', 'f1', 'citation_recall'],
+                  })
+                  onOpenTasks()
+                  return task
+                })
+              }
+            >
+              {start.busy ? '启动中…' : '开始链路测试'}
+            </button>
+            <span className="small muted">
+              编译 → 查询 → 评测 → 归因，四条任务依次跑
+            </span>
+          </div>
+        </div>
+      )}
+
+    </>
   )
 }

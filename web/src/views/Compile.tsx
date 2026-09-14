@@ -1,485 +1,315 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { IndexLayer } from '../types'
-import { Empty, Failed, Loading, Pager, Pass, useAction, useAsync } from '../ui'
-import { DocDiff } from './DocDiff'
+import type { CompileRun } from '../types'
+import {
+  CleanupButton,
+  DatasetPicker,
+  Failed,
+  Field,
+  Loading,
+  Pager,
+  Pass,
+  StatusTag,
+  num,
+  useAction,
+  useAsync,
+  usePoll,
+} from '../ui'
 
-/** 创建语料子集、启动编译并查看文档变化。模型配置由配置页管理。 */
+/** 当天日期作为种子初值，与后端 default_seed() 一致。 */
+function todaySeed(): number {
+  const now = new Date()
+  const month = `${now.getMonth() + 1}`.padStart(2, '0')
+  const day = `${now.getDate()}`.padStart(2, '0')
+  return Number(`${now.getFullYear()}${month}${day}`)
+}
+
+/** 编译层：抽子集 + 入 Akasha 库。一次编译一个随机创建的空间，配置在 run_id 上固化。 */
 export function Compile({
-  activeLayer,
-  onSelectLayer,
-  onOpenTasks,
+  activeCompile,
+  onSelect,
   onOpenQuery,
+  onOpenTasks,
 }: {
-  activeLayer: number | null
-  onSelectLayer: (id: number) => void
-  onOpenTasks: () => void
+  activeCompile: number | null
+  onSelect: (id: number) => void
   onOpenQuery: (id: number) => void
+  onOpenTasks: () => void
 }) {
-  const { data, error, loading, reload } = useAsync(() => api.layers(), [])
+  const compiles = useAsync(() => api.compiles(), [])
+  const datasets = useAsync(() => api.datasets(), [])
+  const cleanup = useAction<unknown>()
 
-  if (loading) return <Loading what="编译层" />
-  if (error) return <Failed error={error} />
+  usePoll(
+    (compiles.data?.compiles ?? []).some((c) => c.status === 'running'),
+    compiles.reload,
+  )
 
-  const layers = data?.index_layers ?? []
+  if (compiles.loading || datasets.loading) return <Loading what="编译记录" />
+  if (compiles.error) return <Failed error={compiles.error} />
+  if (datasets.error) return <Failed error={datasets.error} />
+  if (!compiles.data || !datasets.data) return null
+
+  const normalized = datasets.data.datasets.filter((d) => d.normalized).map((d) => d.name)
+  const selected = compiles.data.compiles.find((c) => c.id === activeCompile) ?? null
 
   return (
     <>
       <h2>编译层</h2>
 
-      <NewLayer existing={layers} onDone={reload} onOpenTasks={onOpenTasks} />
+      {cleanup.error && <Failed error={cleanup.error} />}
 
-      {layers.map((layer) => (
-          <LayerCard
-            key={layer.id}
-            layer={layer}
-            active={activeLayer === layer.id}
-            onSelect={() => onSelectLayer(layer.id)}
-            onOpenQuery={() => onOpenQuery(layer.id)}
-            onOpenTasks={onOpenTasks}
-          />
-        ))}
+      <NewCompile
+        datasets={normalized}
+        onStarted={() => {
+          compiles.reload()
+          onOpenTasks()
+        }}
+      />
 
-      {activeLayer !== null && <DocBrowser layerId={activeLayer} />}
+      <h3>编译记录</h3>
+      {compiles.data.compiles.length === 0 && <p className="muted">还没有编译记录。</p>}
+      {compiles.data.compiles.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>run_id</th>
+              <th>数据集</th>
+              <th>状态</th>
+              <th>质量闸门</th>
+              <th className="num">语料</th>
+              <th className="num">已导入</th>
+              <th>可用于查询</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {compiles.data.compiles.map((run) => {
+              const stats = Object.values(run.stats)
+              const docs = stats.reduce((sum, s) => sum + (s.docs ?? 0), 0)
+              const imported = stats.reduce((sum, s) => sum + (s.imported ?? 0), 0)
+              return (
+                <tr key={run.id} className={run.id === activeCompile ? 'selected' : ''}>
+                  <td className="mono small">
+                    {run.run_id} <span className="muted">#{run.id}</span>
+                  </td>
+                  <td className="small">{run.datasets.join(', ')}</td>
+                  <td>
+                    <StatusTag status={run.status} />
+                  </td>
+                  <td>{run.quality ? <Pass ok={run.quality.passed} /> : <span className="tag">未执行</span>}</td>
+                  <td className="num">{docs}</td>
+                  <td className="num">{imported}</td>
+                  <td>
+                    <Pass ok={run.readiness.ready} yes="就绪" no="未就绪" />
+                  </td>
+                  <td>
+                    <div className="row tight">
+                      <button className="action small" onClick={() => onSelect(run.id)}>
+                        {run.id === activeCompile ? '已选中' : '查看'}
+                      </button>
+                      <button
+                        className="action small"
+                        disabled={!run.readiness.ready}
+                        onClick={() => onOpenQuery(run.id)}
+                      >
+                        去查询
+                      </button>
+                      <CleanupButton
+                        what={`编译 ${run.run_id}`}
+                        detail="子集、语料映射，以及它下面的查询、评测、归因都会从数据库删除。Akasha 那边的空间不会被删。"
+                        busy={cleanup.busy}
+                        onConfirm={() =>
+                          cleanup.run(async () => {
+                            const result = await api.deleteCompile(run.id)
+                            compiles.reload()
+                            return result
+                          })
+                        }
+                      />
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      )}
+
+      {selected && <CompileDetail run={selected} />}
     </>
   )
 }
 
-/** 建一层：抽样参数在这里编辑。
- *
- * 抽样顺序是**先 QA 后 corpus**，不是随机抽文档 —— 随机抽 100 篇的话大部分 gold
- * 会落在子集外，Recall 会因为跟检索器毫无关系的原因被钉在 0 附近。所以这里的
- * 「条数」指的是 QA 条数，语料规模由它的 gold 全集加负样本推出来。
- *
- * **label 不能复用已入库的层**：重抽会让那一层的 page_map 指向已经不在子集里的
- * 文档，而那个错配不报错，只让每条检索指标变成 0。要改参数就换个 label。
- */
-function NewLayer({
-  existing,
-  onDone,
-  onOpenTasks,
+function NewCompile({
+  datasets,
+  onStarted,
 }: {
-  existing: IndexLayer[]
-  onDone: () => void
-  onOpenTasks: () => void
+  datasets: string[]
+  onStarted: () => void
 }) {
-  const datasets = useAsync(() => api.datasets(), [])
-  const [open, setOpen] = useState(existing.length === 0)
-  const [label, setLabel] = useState('')
-  const [dataset, setDataset] = useState('')
-  const [seed, setSeed] = useState(20260908)
-  const [qaLimit, setQaLimit] = useState(100)
-  const [negatives, setNegatives] = useState(1.0)
-  const start = useAction<{ id: number }>()
-
-  const available = (datasets.data ?? []).map((entry) => entry.name)
-  const chosen = dataset ? [dataset] : available
-  const ingestedLabels = new Set(
-    existing.filter((l) => l.ingest_identity.ingested_at).map((l) => l.label),
-  )
-  const clash = ingestedLabels.has(label.trim())
-  const reused = existing.some((l) => l.label === label.trim()) && !clash
-
-  if (!open) {
-    return (
-      <div className="row" style={{ marginBottom: 14 }}>
-        <button className="action primary" onClick={() => setOpen(true)}>
-          参数配置
-        </button>
-      </div>
-    )
-  }
+  const [selected, setSelected] = useState<string[]>([])
+  const [runId, setRunId] = useState('')
+  const [qaLimit, setQaLimit] = useState(20)
+  const [seed, setSeed] = useState(todaySeed)
+  const [ratio, setRatio] = useState(1)
+  const start = useAction<unknown>()
 
   return (
     <div className="panel">
-      <div className="spread">
-        <h3 style={{ margin: 0 }}>参数配置</h3>
-        <button className="action small" onClick={() => setOpen(false)}>
-          收起
-        </button>
-      </div>
+      <h3 style={{ marginTop: 0 }}>新建编译</h3>
+      {datasets.length === 0 && (
+        <div className="note warn">还没有归一化过的数据集，请先在「归一化」页处理。</div>
+      )}
+      {start.error && <Failed error={start.error} />}
+
+      <DatasetPicker all={datasets} selected={selected} onChange={setSelected} />
 
       <div className="row" style={{ marginTop: 10 }}>
-        <label className="field">
-          编译批次（run_id）
-          <input
-            value={label}
-            placeholder="run001"
-            onChange={(event) => setLabel(event.target.value)}
-          />
-        </label>
-        <label className="field">
-          抽多少条 QA
+        <Field label="run_id" hint="留空自动生成；填已有的则续跑">
+          <input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="自动" />
+        </Field>
+        <Field label="每组 QA 数">
           <input
             type="number"
             min={1}
             value={qaLimit}
-            onChange={(event) => setQaLimit(Number(event.target.value))}
+            onChange={(e) => setQaLimit(Number(e.target.value))}
           />
-        </label>
-        <label className="field">
-          随机种子
+        </Field>
+        <Field label="随机种子" hint="同种子抽同一批">
+          <input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value))} />
+        </Field>
+        <Field label="负样本比例" hint="每篇 gold 配几篇负样本">
           <input
             type="number"
-            value={seed}
-            onChange={(event) => setSeed(Number(event.target.value))}
-          />
-        </label>
-        <label className="field">
-          每篇 gold 配几篇负样本
-          <input
-            type="number"
-            step="0.1"
+            step={0.5}
             min={0}
-            value={negatives}
-            onChange={(event) => setNegatives(Number(event.target.value))}
+            value={ratio}
+            onChange={(e) => setRatio(Number(e.target.value))}
           />
-        </label>
+        </Field>
       </div>
 
-      <div className="row" style={{ marginTop: 8 }}>
-        <label className="field">
-          数据集
-          <select value={dataset} onChange={(event) => setDataset(event.target.value)}>
-            <option value="">全部数据集</option>
-            {available.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      {datasets.loading && <Loading what="数据集" />}
-      {datasets.error && <Failed error={datasets.error} />}
-      {!datasets.loading && !datasets.error && available.length === 0 && (
-        <Empty>暂无归一化数据集，请到「归一化」页准备数据。</Empty>
-      )}
-
-      <div className="note plain small">
-        抽样顺序是<strong>先 QA 后 corpus</strong>：先按种子抽 {qaLimit} 条问题，
-        它们的 gold 文档全集必选，再按比例补负样本。
-      </div>
-
-      {clash && (
-        <div className="note bad small">
-          <strong>{label} 已经入库过了。</strong>
-          重抽会让它的 page_map 指向已经不在子集里的文档，而那个错配不报错 ——
-          只让每条检索指标变成 0。换个标签，或者先在那一层上「清掉入库产物」。
-        </div>
-      )}
-      {reused && (
-        <div className="note warn small">
-          {label} 这一层已存在但还没入库，会**重抽**它而不是新建。
-        </div>
-      )}
-
-      <div className="row" style={{ marginTop: 10 }}>
+      <div className="panel-actions">
         <button
           className="action primary"
-          disabled={start.busy || datasets.loading || !!datasets.error || chosen.length === 0 || !label.trim() || clash}
+          disabled={start.busy || selected.length === 0}
           onClick={() =>
             start.run(async () => {
-              const task = await api.startTask('subset', {
-                label: label.trim(),
-                datasets: chosen,
-                seed,
+              const task = await api.startTask('compile', {
+                datasets: selected,
                 qa_limit: qaLimit,
-                negatives_ratio: negatives,
+                seed,
+                negatives_ratio: ratio,
+                ...(runId.trim() ? { run_id: runId.trim() } : {}),
               })
-              onDone()
+              onStarted()
               return task
             })
           }
         >
-          {start.busy ? '启动中…' : '抽子集'}
+          {start.busy ? '启动中…' : '开始编译'}
         </button>
       </div>
-
-      {start.error && <div className="note bad">{start.error}</div>}
-      {start.result && (
-        <div className="note">
-          已启动任务 #{start.result.id}。
-          <button className="action small" style={{ marginLeft: 8 }} onClick={onOpenTasks}>
-            看进度
-          </button>
-          <button className="action small" style={{ marginLeft: 4 }} onClick={onDone}>
-            刷新层列表
-          </button>
-        </div>
-      )}
     </div>
   )
 }
 
-function LayerCard({
-  layer,
-  active,
-  onSelect,
-  onOpenTasks,
-  onOpenQuery,
-}: {
-  layer: IndexLayer
-  active: boolean
-  onSelect: () => void
-  onOpenTasks: () => void
-  onOpenQuery: () => void
-}) {
-  const imported = Object.values(layer.page_map_counts).reduce((a, b) => a + b, 0)
+function CompileDetail({ run }: { run: CompileRun }) {
+  const [dataset, setDataset] = useState<string>('')
+  const [goldOnly, setGoldOnly] = useState(false)
+  const [offset, setOffset] = useState(0)
+  const [pageId, setPageId] = useState<string | null>(null)
+  const limit = 10
+
+  const docs = useAsync(
+    () =>
+      api.compileDocs(run.id, {
+        dataset: dataset || undefined,
+        gold_only: goldOnly,
+        limit,
+        offset,
+      }),
+    [run.id, dataset, goldOnly, offset],
+  )
 
   return (
-    <div className="panel">
+    <div className="panel" style={{ marginTop: 14 }}>
       <div className="spread">
-        <div>
-          <strong>#{layer.id}</strong> <span className="tag accent">{layer.label}</span>{' '}
-          <Pass ok={layer.ready_for_query} yes="可跑查询" no="未就绪" />
-        </div>
-        <div className="row tight">
-          <span className="small muted mono">
-            subset {layer.subset_hash}
-            {layer.config_hash ? ` · config ${layer.config_hash}` : ' · config 待入库补齐'}
-          </span>
-          <button className={`action small${active ? ' primary' : ''}`} onClick={onSelect}>
-            {active ? '已选中' : '看文档变化'}
-          </button>
-          <button className="action small" disabled={!layer.ready_for_query} onClick={onOpenQuery}>去查询</button>
-        </div>
+        <h3 style={{ margin: 0 }}>
+          {run.run_id} <span className="muted small">#{run.id}</span>
+        </h3>
+        <span className="small mono muted">space {run.space_id ?? '—'}</span>
       </div>
 
-      <div className="row small muted" style={{ marginTop: 6 }}>
-        <span>seed {layer.seed}</span>
-        <span>qa-limit {layer.qa_limit}</span>
-        <span>negatives {layer.negatives_ratio}</span>
-        <span>已编译入库 {imported} 篇</span>
-        {layer.same_subset_layers.length > 0 && (
-          <span title="同抽样配置的其他层，可做「同子集换 embedding」的对照">
-            同子集层 #{layer.same_subset_layers.join(' #')}
-          </span>
-        )}
-      </div>
-
-      <IngestIdentityRow layer={layer} onOpenTasks={onOpenTasks} />
-
-      {!layer.ready_for_query && (
+      {!run.readiness.ready && (
         <div className="note warn">
-          <strong>这一层还不能跑查询。</strong>
+          <strong>这次编译还不能用于查询。</strong>
           <ul>
-            {layer.not_ready_reasons.map((reason) => (
-              <li key={reason} className="small">
-                {reason}
-              </li>
+            {run.readiness.reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
             ))}
           </ul>
-          <div className="small" style={{ marginTop: 6 }}>
-            半成品索引会产出一份「recall 低、拒答率高」的报告 —— 那看起来像配置差，
-            实际是索引没建好。
-          </div>
         </div>
       )}
 
-      <table style={{ marginTop: 10 }}>
+      {run.quality && (
+        <p className="small muted">
+          质量闸门：
+          {Object.entries(run.quality.gates).map(([name, value]) => (
+            <span key={name} className={`tag ${value === 0 ? 'ok' : 'bad'}`} style={{ marginLeft: 4 }}>
+              {name}={value ?? 'n/a'}
+            </span>
+          ))}
+        </p>
+      )}
+
+      <table>
         <thead>
           <tr>
             <th>数据集</th>
-            <th>抽样策略</th>
-            <th className="num">QA</th>
+            <th className="num">样本</th>
             <th className="num">语料</th>
             <th className="num">gold</th>
             <th className="num">已导入</th>
-            <th>Space</th>
           </tr>
         </thead>
         <tbody>
-          {layer.datasets.map((entry) => {
-            const count = layer.page_map_counts[entry.dataset] ?? 0
-            const complete = count === entry.corpus_count
-            return (
-              <tr key={entry.dataset}>
-                <td>{entry.dataset}</td>
-                <td className="small muted">{entry.strategy}</td>
-                <td className="num">{entry.qa_count}</td>
-                <td className="num">{entry.corpus_count}</td>
-                <td className="num">{entry.gold_doc_count}</td>
-                <td className="num">
-                  {count}
-                  {!complete && (
-                    <span className="tag bad" style={{ marginLeft: 6 }}>
-                      缺
-                    </span>
-                  )}
-                </td>
-                <td className="small mono muted">{entry.space_slug ?? '—'}</td>
-              </tr>
-            )
-          })}
+          {Object.values(run.stats).map((entry) => (
+            <tr key={entry.dataset}>
+              <td>{entry.dataset}</td>
+              <td className="num">{num(entry.samples)}</td>
+              <td className="num">{num(entry.docs)}</td>
+              <td className="num">{num(entry.gold)}</td>
+              <td className="num">{num(entry.imported)}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
-    </div>
-  )
-}
 
-/** 这一层**入库时**跑在什么上，以及清掉入库产物。
- *
- * 显示的是历史真相而不是当前配置：配置改过之后这两者会不同，而这一层的
- * page_map 属于前者。显示当前配置会让人以为那一层跑在新配置上。
- */
-function IngestIdentityRow({
-  layer,
-  onOpenTasks,
-}: {
-  layer: IndexLayer
-  onOpenTasks: () => void
-}) {
-  const identity = layer.ingest_identity
-  const discard = useAction<{ discarded: Record<string, number>; note: string }>()
-  const ingest = useAction<{ id: number }>()
-
-  if (!identity.ingested_at) {
-    const docs = layer.datasets.reduce((sum, entry) => sum + entry.corpus_count, 0)
-    const hours = (docs * 40) / 3600
-    return (
-      <div className="row small" style={{ marginTop: 6 }}>
-        <span className="tag warn">未入库</span>
-        <span className="muted">
-          {docs} 篇待编译，约 {hours.toFixed(1)} 小时
-        </span>
-        <button
-          className="action small primary"
-          disabled={ingest.busy || docs === 0}
-          onClick={() =>
-            ingest.run(() =>
-              api.startTask('ingest', {
-                label: layer.label,
-                datasets: layer.datasets.map((entry) => entry.dataset),
-              }),
-            )
-          }
-        >
-          {ingest.busy ? '启动中…' : '入库编译'}
-        </button>
-        {ingest.error && (
-          <div className="note bad small" style={{ width: '100%' }}>
-            {ingest.error}
-          </div>
-        )}
-        {ingest.result && (
-          <div className="note small" style={{ width: '100%' }}>
-            已启动任务 #{ingest.result.id}。约 40 秒/篇是 Akasha 的 BullMQ worker 吞吐，
-            客户端调不动。
-            <button className="action small" style={{ marginLeft: 8 }} onClick={onOpenTasks}>
-              看进度
-            </button>
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  return (
-    <div className="row small" style={{ marginTop: 6 }}>
-      <span className="muted">入库于</span>
-      <span className="mono muted">{identity.ingested_at}</span>
-      {identity.base_url && <span className="mono muted">{identity.base_url}</span>}
-      {identity.workspace_id && (
-        <span className="mono muted" title="从 users/me 解析，不是配置项">
-          ws {identity.workspace_id}
-        </span>
-      )}
-      {identity.akasha_user_role && identity.akasha_user_role !== 'owner' && (
-        <span className="tag bad" title="非 owner 会在授权闸门静默丢弃 chunk">
-          {identity.akasha_user_role}
-        </span>
-      )}
-      <button
-        className="action small danger"
-        disabled={discard.busy}
-        onClick={() => discard.run(() => api.discardIngest(layer.id, false))}
-        title="配置改到了另一个 workspace 时才需要这个"
-      >
-        清掉入库产物
-      </button>
-
-      {discard.error && (
-        <div className="note bad small" style={{ width: '100%' }}>
-          {discard.error}
-          {discard.error.includes('confirm=true') && (
-            <div style={{ marginTop: 6 }}>
-              <button
-                className="action small danger"
-                onClick={() => discard.run(() => api.discardIngest(layer.id, true))}
-              >
-                我确认：清掉并重新入库
-              </button>
-              <span className="muted" style={{ marginLeft: 8 }}>
-                子集保留；远端的 space 不删。
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-      {discard.result && (
-        <div className="note small" style={{ width: '100%' }}>
-          {discard.result.note}
-          <span className="mono">
-            {' '}
-            清掉：
-            {Object.entries(discard.result.discarded)
-              .filter(([, n]) => n > 0)
-              .map(([table, n]) => `${table}=${n}`)
-              .join(' ')}
-          </span>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** 文档浏览器：选一篇看它的原文 vs 编译产物。 */
-function DocBrowser({ layerId }: { layerId: number }) {
-  const [offset, setOffset] = useState(0)
-  const [term, setTerm] = useState('')
-  const [q, setQ] = useState('')
-  const [goldOnly, setGoldOnly] = useState(false)
-  const [open, setOpen] = useState<{ dataset: string; docId: string } | null>(null)
-  const limit = 20
-
-  const { data, error, loading } = useAsync(
-    () => api.layerDocs(layerId, { q, gold_only: goldOnly, limit, offset }),
-    [layerId, q, goldOnly, offset],
-  )
-
-  return (
-    <div className="panel">
-      <h3 style={{ marginTop: 0 }}>编译层 #{layerId} 的文档</h3>
-
-      <div className="row">
-        <input
-          placeholder="按 doc_id 搜索"
-          value={term}
-          onChange={(event) => setTerm(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              setQ(term)
-              setOffset(0)
-            }
-          }}
-        />
-        <button
-          className="action"
-          onClick={() => {
-            setQ(term)
+      <h4>已导入的文档</h4>
+      <div className="row tight" style={{ marginBottom: 8 }}>
+        <select
+          value={dataset}
+          onChange={(e) => {
+            setDataset(e.target.value)
             setOffset(0)
           }}
         >
-          搜索
-        </button>
+          <option value="">全部数据集</option>
+          {run.datasets.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
         <label className="check">
           <input
             type="checkbox"
             checked={goldOnly}
-            onChange={(event) => {
-              setGoldOnly(event.target.checked)
+            onChange={() => {
+              setGoldOnly(!goldOnly)
               setOffset(0)
             }}
           />
@@ -487,92 +317,110 @@ function DocBrowser({ layerId }: { layerId: number }) {
         </label>
       </div>
 
-      {loading && <Loading what="文档" />}
-      {error && <Failed error={error} />}
-      {data && (
+      {docs.loading && <Loading what="文档" />}
+      {docs.error && <Failed error={docs.error} />}
+      {docs.data && (
         <>
-          <p className="small muted" style={{ marginTop: 8 }}>
-            共 {data.total} 篇，已导入 {data.imported} 篇。
-            {data.imported < data.total && (
-              <span className="tag bad" style={{ marginLeft: 6 }}>
-                {data.total - data.imported} 篇没有 page_id，看不到编译产物
-              </span>
-            )}
-          </p>
           <table>
             <thead>
               <tr>
-                <th>数据集</th>
                 <th>doc_id</th>
+                <th>数据集</th>
                 <th>gold</th>
                 <th>page_id</th>
+                <th />
               </tr>
             </thead>
             <tbody>
-              {data.docs.map((doc) => {
-                const selected =
-                  open?.dataset === doc.dataset && open?.docId === doc.doc_id
-                return (
-                  <tr
-                    key={`${doc.dataset}/${doc.doc_id}`}
-                    className={`clickable${selected ? ' selected' : ''}`}
-                    onClick={() =>
-                      setOpen(selected ? null : { dataset: doc.dataset, docId: doc.doc_id })
-                    }
-                  >
-                    <td className="small">{doc.dataset}</td>
-                    <td className="small mono">{doc.doc_id}</td>
-                    <td>{doc.is_gold && <span className="tag ok">gold</span>}</td>
-                    <td className="small mono muted">
-                      {doc.page_id ? (
-                        doc.page_id.slice(0, 8)
-                      ) : (
-                        <span className="tag bad">未导入</span>
-                      )}
-                    </td>
-                  </tr>
-                )
-              })}
+              {docs.data.docs.map((doc) => (
+                <tr key={`${doc.dataset}/${doc.doc_id}`}>
+                  <td className="mono small">{doc.doc_id}</td>
+                  <td className="small muted">{doc.dataset}</td>
+                  <td>{doc.is_gold ? <span className="tag ok">gold</span> : '—'}</td>
+                  <td className="mono small muted truncate">
+                    {doc.page_id ?? <span className="tag bad">未导入</span>}
+                  </td>
+                  <td>
+                    {doc.page_id && (
+                      <button
+                        className="action small"
+                        onClick={() => setPageId(pageId === doc.page_id ? null : doc.page_id)}
+                      >
+                        {pageId === doc.page_id ? '收起' : '编译变化'}
+                      </button>
+                    )}
+                    {doc.error && (
+                      <span className="small" style={{ color: 'var(--bad)' }} title={doc.error}>
+                        导入失败
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
-          <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />
+          <Pager total={docs.data.total} offset={offset} limit={limit} onChange={setOffset} />
         </>
       )}
 
-      {open && <DocView layerId={layerId} dataset={open.dataset} docId={open.docId} />}
+      {pageId && <LineageView key={pageId} pageId={pageId} />}
     </div>
   )
 }
 
-function DocView({
-  layerId,
-  dataset,
-  docId,
-}: {
-  layerId: number
-  dataset: string
-  docId: string
-}) {
+/** 原文 vs 编译产物并排。编译产物才是被检索的文本。 */
+export function LineageView({ pageId, question = '' }: { pageId: string; question?: string }) {
   const { data, error, loading } = useAsync(
-    () => api.layerDoc(layerId, dataset, docId),
-    [layerId, dataset, docId],
+    () => api.lineage(pageId, question),
+    [pageId, question],
   )
 
-  if (loading) return <Loading what="文档" />
+  if (loading) return <Loading what="编译链路" />
   if (error) return <Failed error={error} />
   if (!data) return null
 
   return (
-    <div style={{ marginTop: 12 }}>
-      <h4>
-        {dataset} / {docId} {data.is_gold && <span className="tag ok">gold</span>}
-      </h4>
-      {data.note && <div className="note warn small">{data.note}</div>}
-      {data.page_id ? (
-        <DocDiff pageId={data.page_id} uploaded={data.md_text} />
-      ) : (
-        <pre className="block">{data.md_text}</pre>
+    <div className="panel flat" style={{ marginTop: 12 }}>
+      <div className="note plain small">
+        编译扩写比 {data.diff.expansion_ratio?.toFixed(2) ?? '—'}，
+        实词留存 {data.diff.retention ? `${(data.diff.retention * 100).toFixed(1)}%` : '—'}。
+      </div>
+
+      {data.question_terms_lost.length > 0 && (
+        <div className="note bad">
+          <strong>{data.verdict}</strong>
+          <div style={{ marginTop: 4 }}>
+            {data.question_terms_lost.map((term) => (
+              <span key={term} className="chip lost">
+                {term}
+              </span>
+            ))}
+          </div>
+        </div>
       )}
+
+      <div className="side-by-side">
+        <div>
+          <h4>原文（{data.source.chunk_count} 块）</h4>
+          <pre className="block">{data.source.text || '（无）'}</pre>
+        </div>
+        <div>
+          <h4>
+            编译产物（{data.compiled.chunk_count} 块 / {data.compiled.artifact_count} 个 artifact）
+          </h4>
+          <pre className="block">{data.compiled.text || '（无）'}</pre>
+        </div>
+      </div>
+
+      <h4>编译丢掉的实词（{data.diff.dropped_total}）</h4>
+      <div>
+        {data.diff.dropped.map((term) => (
+          <span key={term} className="chip dropped">
+            {term}
+          </span>
+        ))}
+        {data.diff.dropped.length === 0 && <span className="small muted">无</span>}
+      </div>
     </div>
   )
 }

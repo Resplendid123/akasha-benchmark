@@ -25,7 +25,6 @@ import random
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -276,26 +275,14 @@ class AkashaClient:
 
     # --- Space 管理 ---
 
-    def list_spaces(self, page: int = 1, limit: int = 100) -> dict[str, Any]:
-        return self.post("spaces", {"page": page, "limit": limit})
-
     def create_space(self, name: str, slug: str, description: str = "") -> dict[str, Any]:
         # slug 必须是纯字母数字（CreateSpaceDto 的 @IsAlphanumeric），长度 2-100。
-        # 与 import_page 同理不重试：建 Space 是写入，重试可能建出第二个。
-        # slug 唯一约束大概率会拦住，但报错形态会变成难懂的冲突而不是原本的 502。
+        # 与导入同理不重试：建 Space 是写入，重试可能建出第二个。
         return self.post(
             "spaces/create",
             {"name": name, "slug": slug, "description": description},
             retry=False,
         )
-
-    def delete_space(self, space_id: str) -> Any:
-        """删 Space。**只给在线冒烟测试收尾用**，评测流程本身不删任何东西。
-
-        ``SpaceIdDto`` 只要求非空字符串（``space-id.dto.ts:3-8``，那里的
-        ``@IsUUID`` 是注释掉的）；调用者需要 Manage Settings 权限，OWNER 满足。
-        """
-        return self.post("spaces/delete", {"spaceId": space_id})
 
     # --- 导入 ---
 
@@ -304,8 +291,7 @@ class AkashaClient:
     ) -> dict[str, Any]:
         """导入一段 Markdown 正文，返回创建的 page（含 ``id``）。
 
-        正文的权威副本在库里（``subset_doc.md_text``），所以这是入库阶段实际走的
-        入口 —— 不再需要先把 1722 篇落成临时文件再读回来。
+        正文由 ``CorpusDoc.to_markdown()`` 从库里的语料渲染，不落临时文件。
 
         ``filename`` 只承担 doc_id 的职责：导入服务会取首个 Markdown heading 当
         page title 并从正文移除，两者互不干扰，所以 title 重复也不影响身份追踪。
@@ -315,7 +301,7 @@ class AkashaClient:
         重复，它不在 ``page_map`` 里，续跑也发现不了，只会悄悄抬高语料规模并污染
         检索指标。
 
-        不重试的代价很小：导入失败会被记下并继续跑下一篇，而入库阶段本身可续跑,
+        不重试的代价很小：导入失败会被记下并继续跑下一篇，而编译层可续跑,
         重跑一次就会把缺的补上（缺篇能被发现，重复不能）。
         """
         return self.post(
@@ -323,15 +309,6 @@ class AkashaClient:
             files={"file": (filename, markdown.encode("utf-8"), "text/markdown")},
             data={"spaceId": space_id},
             retry=False,
-        )
-
-    def import_page(self, markdown_path: Path, space_id: str) -> dict[str, Any]:
-        """从磁盘导入一个 .md 文件。见 :meth:`import_page_text`。
-
-        留着这个入口是给在线冒烟测试和一次性导入用的；评测流程本身走库里的正文。
-        """
-        return self.import_page_text(
-            markdown_path.name, markdown_path.read_text(encoding="utf-8"), space_id
         )
 
     # --- 知识编译 ---
@@ -343,28 +320,8 @@ class AkashaClient:
     def run_diagnostics_summary(self, space_ids: list[str]) -> dict[str, Any]:
         return self.post("llm-wiki/admin/diagnostics/summary", {"spaceIds": space_ids})
 
-    def run_diagnostics(self, space_ids: list[str], **kwargs: Any) -> dict[str, Any]:
-        return self.post(
-            "llm-wiki/admin/diagnostics/runs", {"spaceIds": space_ids, **kwargs}
-        )
-
     def quality_diagnostics(self, space_ids: list[str]) -> dict[str, Any]:
         return self.post("llm-wiki/admin/diagnostics/quality", {"spaceIds": space_ids})
-
-    def retry_pages(self, page_ids: list[str]) -> dict[str, Any]:
-        """按源页 id 重试编译，一次最多 100 篇。
-
-        服务端 DTO（``admin-retry-pages.dto.ts``）只认 ``pageIds``，且要求页面
-        在编译 run 里出现过 —— 失败页也算，所以这是补 ``partial`` 缺口的正道：
-        它建的是 ``page_retry`` run，范围恰好是这些页，不会像 ``follow_up``
-        那样把整个 space 拖去重编译。
-        """
-        return self.post("llm-wiki/admin/retry-pages", {"pageIds": page_ids})
-
-    def cancel_run(self, run_id: str, reason: str | None = None) -> dict[str, Any]:
-        """取消一个未终态的编译 run。``reason`` 会进审计日志，上限 400 字。"""
-        body = {"reason": reason} if reason else {}
-        return self.post(f"llm-wiki/admin/compilation-runs/{run_id}/cancel", body)
 
     # --- 模型配置 ---
 

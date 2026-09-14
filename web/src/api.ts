@@ -1,27 +1,23 @@
 import type {
-  AdapterList,
-  AvailableMetrics,
-  BadcaseList,
-  BatchAnalysis,
-  AppConnection,
+  AttributionDetail,
+  CompileDoc,
+  CompileRun,
+  Connection,
   ConnectionTest,
-  CorpusDocs,
-  Dataset,
-  Diff,
-  EvalLayerDetail,
-  IndexLayer,
-  LayerDocDetail,
-  LayerDocs,
+  CorpusList,
+  DatasetEntry,
+  EvalDetail,
+  EvalSampleDetail,
+  EvalSamples,
   Lineage,
-  MetricDefinition,
+  MetricsView,
   ModelConfigsView,
-  NormalizedSampleDetail,
-  NormalizedSamples,
+  Paged,
   Provider,
   RawSamples,
   ResponseList,
+  Sample,
   SampleDetail,
-  SampleLineage,
   SampleList,
   Stage,
   Task,
@@ -33,13 +29,8 @@ import type {
 // 关掉标签页就没了，少一个长期留在磁盘上的凭据。
 const TOKEN_KEY = 'akasha-platform-token'
 
-export function setToken(token: string): void {
-  sessionStorage.setItem(TOKEN_KEY, token)
-}
-
-export function getToken(): string {
-  return sessionStorage.getItem(TOKEN_KEY) ?? ''
-}
+export const setToken = (token: string) => sessionStorage.setItem(TOKEN_KEY, token)
+export const getToken = () => sessionStorage.getItem(TOKEN_KEY) ?? ''
 
 export class ApiError extends Error {
   constructor(
@@ -74,7 +65,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const post = <T>(path: string, body?: unknown) =>
-  request<T>(path, { method: 'POST', ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
+  request<T>(path, {
+    method: 'POST',
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  })
+
+const put = <T>(path: string, body: unknown) =>
+  request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
+
+const del = <T>(path: string) => request<T>(path, { method: 'DELETE' })
 
 const query = (params: Record<string, string | number | boolean | undefined>) => {
   const search = new URLSearchParams()
@@ -86,140 +85,109 @@ const query = (params: Record<string, string | number | boolean | undefined>) =>
 }
 
 export const api = {
-  health: () => request<{ ok: boolean; settings: Record<string, unknown> }>('/api/health'),
+  health: () =>
+    request<{
+      ok: boolean
+      settings: Record<string, unknown>
+      startup: { archived_legacy_db: string | null; recovered_tasks: number }
+    }>('/api/health'),
 
-  // --- 连接（只有一份）---
-  connection: () => request<AppConnection>('/api/connection'),
+  // --- 配置 ---
+  connection: () => request<Connection>('/api/connection'),
   saveConnection: (payload: Record<string, unknown>) =>
-    request<{ updated: string[]; connection: AppConnection }>(
-      '/api/connection',
-      { method: 'PUT', body: JSON.stringify(payload) },
-    ),
+    put<{ updated: string[]; connection: Connection }>('/api/connection', payload),
   testConnection: () => post<ConnectionTest>('/api/connection/test'),
-
-  // --- Akasha 侧的模型配置 ---
   modelConfigs: () => request<ModelConfigsView>('/api/model-configs'),
   saveModelConfig: (feature: string, payload: Record<string, unknown>) =>
-    request<{ feature: string; requires_new_index_layer: boolean; impact: string }>(
+    put<{ feature: string; requires_new_compile: boolean; impact: string }>(
       `/api/model-configs/${feature}`,
-      { method: 'PUT', body: JSON.stringify(payload) },
+      payload,
     ),
-  discardIngest: (layerId: number, confirm: boolean) =>
-    post<{ discarded: Record<string, number>; note: string }>(
-      `/api/layers/index/${layerId}/discard-ingest`,
-      { confirm },
-    ),
-  providers: (role?: 'judge' | 'analysis') =>
-    request<Provider[]>(`/api/providers${role ? `/${role}` : ''}`),
-  saveProvider: (role: 'judge' | 'analysis', payload: Record<string, unknown>) =>
-    request<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
-  deleteProvider: (id: number) =>
-    request<{ deleted: number }>(`/api/providers/${id}`, { method: 'DELETE' }),
+  providers: (role?: 'judge' | 'attribution') =>
+    request<Provider[]>(`/api/providers${query({ role })}`),
+  saveProvider: (role: 'judge' | 'attribution', payload: Record<string, unknown>) =>
+    put<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, payload),
+  deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
 
   // --- 数据集层与归一化层 ---
-  datasets: () => request<Dataset[]>('/api/datasets'),
-  adapters: () => request<AdapterList>('/api/adapters'),
+  datasets: () => request<{ datasets: DatasetEntry[]; dataset_dir: string }>('/api/datasets'),
   deleteDataset: (name: string) =>
-    request<{ deleted: number; dataset: string }>(`/api/datasets/${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-    }),
-  rawSamples: (name: string, params: { limit?: number; offset?: number } = {}) =>
-    request<RawSamples>(`/api/datasets/${name}/raw${query(params)}`),
-  normalizedSamples: (
+    del<{ deleted: number }>(`/api/datasets/${encodeURIComponent(name)}`),
+  rawSamples: (
     name: string,
-    params: { q?: string; limit?: number; offset?: number } = {},
-  ) => request<NormalizedSamples>(`/api/datasets/${name}/samples${query(params)}`),
-  normalizedSample: (name: string, sampleId: string) =>
-    request<NormalizedSampleDetail>(
-      `/api/datasets/${name}/samples/${encodeURIComponent(sampleId)}`,
-    ),
+    params: { kind?: 'qa' | 'corpus'; limit?: number; offset?: number } = {},
+  ) => request<RawSamples>(`/api/datasets/${name}/raw${query(params)}`),
+  samples: (name: string, params: { q?: string; limit?: number; offset?: number } = {}) =>
+    request<SampleList>(`/api/datasets/${name}/samples${query(params)}`),
+  sample: (name: string, sampleId: string) =>
+    request<SampleDetail>(`/api/datasets/${name}/samples/${encodeURIComponent(sampleId)}`),
   corpus: (name: string, params: { q?: string; limit?: number; offset?: number } = {}) =>
-    request<CorpusDocs>(`/api/datasets/${name}/corpus${query(params)}`),
+    request<CorpusList>(`/api/datasets/${name}/corpus${query(params)}`),
+  metrics: (datasets: string[] = []) =>
+    request<MetricsView>(`/api/metrics${query({ datasets: datasets.join(',') })}`),
 
-  // --- 指标 ---
-  metricDefinitions: () => request<MetricDefinition[]>('/api/metrics/definitions'),
-  availableMetrics: (datasets: string[]) =>
-    request<AvailableMetrics>(`/api/metrics/available${query({ datasets: datasets.join(',') })}`),
-
-  // --- 层 ---
-  layers: () => request<{ index_layers: IndexLayer[] }>('/api/layers'),
-  indexLayer: (id: number) => request<Record<string, unknown>>(`/api/layers/index/${id}`),
-  layerDocs: (
+  // --- 编译层 ---
+  compiles: () => request<{ compiles: CompileRun[] }>('/api/compiles'),
+  compile: (id: number) => request<CompileRun>(`/api/compiles/${id}`),
+  compileDocs: (
     id: number,
-    params: { dataset?: string; gold_only?: boolean; q?: string; limit?: number; offset?: number } = {},
-  ) => request<LayerDocs>(`/api/layers/index/${id}/docs${query(params)}`),
-  layerDoc: (id: number, dataset: string, docId: string) =>
-    request<LayerDocDetail>(
-      `/api/layers/index/${id}/docs/${dataset}/${encodeURIComponent(docId)}`,
+    params: { dataset?: string; gold_only?: boolean; limit?: number; offset?: number } = {},
+  ) =>
+    request<Paged & { docs: CompileDoc[]; imported: number }>(
+      `/api/compiles/${id}/docs${query(params)}`,
     ),
+  compileSamples: (
+    id: number,
+    params: { dataset?: string; limit?: number; offset?: number } = {},
+  ) =>
+    request<Paged & { samples: Sample[] }>(`/api/compiles/${id}/samples${query(params)}`),
+  deleteCompile: (id: number) =>
+    del<{ deleted: number; space_id: string | null; note: string }>(`/api/compiles/${id}`),
 
+  // --- 查询层 ---
+  queryRun: (id: number) =>
+    request<CompileRun['queries'][number] & { selected: number; pending: number }>(
+      `/api/queries/${id}`,
+    ),
   responses: (
-    queryLayerId: number,
+    id: number,
     params: { dataset?: string; answer_mode?: string; limit?: number; offset?: number } = {},
-  ) => request<ResponseList>(`/api/layers/query/${queryLayerId}/responses${query(params)}`),
-  response: (queryLayerId: number, sampleId: string) =>
+  ) => request<ResponseList>(`/api/queries/${id}/responses${query(params)}`),
+  response: (id: number, sampleId: string) =>
     request<Record<string, unknown>>(
-      `/api/layers/query/${queryLayerId}/responses/${encodeURIComponent(sampleId)}`,
+      `/api/queries/${id}/responses/${encodeURIComponent(sampleId)}`,
     ),
+  deleteQuery: (id: number) => del<{ deleted: number }>(`/api/queries/${id}`),
 
-  evalLayer: (id: number) => request<EvalLayerDetail>(`/api/layers/eval/${id}`),
-  samples: (evalLayerId: number, params: { dataset?: string; limit?: number } = {}) =>
-    request<SampleList>(
-      `/api/layers/eval/${evalLayerId}/samples${query({ ...params, limit: params.limit ?? 500 })}`,
-    ),
-  worst: (evalLayerId: number, metric: string, dataset?: string, limit = 20) =>
-    request<WorstList>(
-      `/api/layers/eval/${evalLayerId}/worst${query({ metric, dataset, limit })}`,
-    ),
-  sample: (evalLayerId: number, sampleId: string) =>
-    request<SampleDetail>(
-      `/api/layers/eval/${evalLayerId}/samples/${encodeURIComponent(sampleId)}`,
-    ),
-  sampleLineage: (evalLayerId: number, sampleId: string) =>
-    request<SampleLineage>(
-      `/api/layers/eval/${evalLayerId}/samples/${encodeURIComponent(sampleId)}/lineage`,
-    ),
-
-  // --- 血缘与 diff ---
-  lineage: (pageId: string) => request<Lineage>(`/api/lineage/${encodeURIComponent(pageId)}`),
-  diff: (pageId: string, question = '') =>
-    request<Diff>(`/api/diff/${encodeURIComponent(pageId)}${query({ question })}`),
+  // --- 评测层 ---
+  evalRun: (id: number) => request<EvalDetail>(`/api/evals/${id}`),
+  evalSamples: (id: number, params: { dataset?: string; answer_mode?: string } = {}) =>
+    request<EvalSamples>(`/api/evals/${id}/samples${query(params)}`),
+  worst: (id: number, metric: string, dataset?: string, limit = 20) =>
+    request<WorstList>(`/api/evals/${id}/worst${query({ metric, dataset, limit })}`),
+  evalSample: (id: number, sampleId: string) =>
+    request<EvalSampleDetail>(`/api/evals/${id}/samples/${encodeURIComponent(sampleId)}`),
+  deleteEval: (id: number) => del<{ deleted: number }>(`/api/evals/${id}`),
 
   // --- 归因层 ---
-  badcases: (evalLayerId: number) => request<BadcaseList>(`/api/badcase/${evalLayerId}`),
-  analyzeSample: (evalLayerId: number, sampleId: string, useModel: boolean) =>
-    post<BatchAnalysis['results'][number]>(
-      `/api/badcase/${evalLayerId}/${encodeURIComponent(sampleId)}`,
-      { use_model: useModel },
-    ),
-  analyzeWorst: (
-    evalLayerId: number,
-    params: { metric: string; dataset?: string; limit?: number },
-    useModel: boolean,
-  ) =>
-    post<BatchAnalysis>(`/api/badcase/${evalLayerId}/batch/worst${query(params)}`, {
-      use_model: useModel,
-    }),
+  attribution: (id: number) => request<AttributionDetail>(`/api/attributions/${id}`),
+  deleteAttribution: (id: number) => del<{ deleted: number }>(`/api/attributions/${id}`),
+  lineage: (pageId: string, question = '') =>
+    request<Lineage>(`/api/lineage/${encodeURIComponent(pageId)}${query({ question })}`),
 
   // --- 任务层 ---
   stages: () => request<Stage[]>('/api/stages'),
   tasks: (status?: string) => request<Task[]>(`/api/tasks${query({ status })}`),
   task: (id: number, afterId = 0) =>
     request<TaskDetail>(`/api/tasks/${id}${query({ after_id: afterId })}`),
-  startTask: (stage: string, args: Record<string, unknown>) => post<Task>(`/api/tasks/${stage}`, args),
-  cancelTask: (id: number) => post<Task>(`/api/tasks/${id}/cancel`),
-  deleteTask: (id: number) =>
-    request<{ deleted: number }>(`/api/tasks/${id}`, { method: 'DELETE' }),
-  cleanupFinished: () => post<{ deleted: number }>('/api/tasks/cleanup/finished'),
-
-  // --- 标注 ---
-  addAnnotation: (payload: Record<string, unknown>) =>
-    post<{ id: number }>('/api/annotations', payload),
-  agreement: (level = 'sample') =>
-    request<{ compared: number; agreement: number | null; note: string }>(
-      `/api/annotations/agreement${query({ level })}`,
-    ),
+  startTask: (stage: string, args: Record<string, unknown>) =>
+    post<Task>(`/api/tasks/${stage}`, args),
+  // 链路测试起的是四条普通阶段任务，返回链首那条。
+  startChain: (args: Record<string, unknown>) => post<Task>('/api/chain', args),
+  pauseTask: (id: number) => post<Task>(`/api/tasks/${id}/pause`),
+  resumeTask: (id: number) => post<Task>(`/api/tasks/${id}/resume`),
+  deleteTask: (id: number) => del<{ deleted: number }>(`/api/tasks/${id}`),
+  cleanupTasks: () => post<{ deleted: number }>('/api/tasks/cleanup/inactive'),
+  audit: (stage?: string, limit = 200) =>
+    request<TaskDetail['logs']>(`/api/audit${query({ stage, limit })}`),
 }

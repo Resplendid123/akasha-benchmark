@@ -1,508 +1,186 @@
-import { useEffect, useId, useState } from 'react'
-import type { ComponentProps, FocusEvent } from 'react'
-import { api } from '../api'
-import type { AppConnection, ConnectionTest, ModelConfigsView, Provider } from '../types'
-import { Failed, Loading, Pass, useAction, useAsync } from '../ui'
+import { useEffect, useState } from 'react'
+import { api, getToken, setToken } from '../api'
+import type { Connection, ConnectionTest, ModelConfig, Provider } from '../types'
+import { Failed, Field, Loading, Pass, SecretField, useAction, useAsync } from '../ui'
 
-function selectInput(event: FocusEvent<HTMLInputElement | HTMLTextAreaElement>) {
-  event.currentTarget.select()
-}
-
-function SecretInput({
-  secretLabel = '密码',
-  ...props
-}: Omit<ComponentProps<'input'>, 'type'> & { secretLabel?: string }) {
-  const [visible, setVisible] = useState(false)
-  const generatedId = useId()
-  const id = props.id ?? generatedId
-  const action = `${visible ? '隐藏' : '显示'}${secretLabel}`
-
-  useEffect(() => {
-    if (!props.value) setVisible(false)
-  }, [props.value])
-
-  return (
-    <span className="secret-input">
-      <input {...props} id={id} type={visible ? 'text' : 'password'} />
-      <button
-        type="button"
-        className="secret-toggle"
-        aria-label={action}
-        aria-controls={id}
-        aria-pressed={visible}
-        title={action}
-        disabled={props.disabled}
-        onClick={() => setVisible((current) => !current)}
-      >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
-          stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
-          aria-hidden="true">
-          <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
-          <circle cx="12" cy="12" r="3" />
-          {!visible && <path d="m3 3 18 18" />}
-        </svg>
-      </button>
-    </span>
-  )
-}
-
+/** 配置层：Akasha 连接、它那边的模型配置、本地 judge / 归因端点。 */
 export function Settings() {
   return (
     <>
       <h2>配置</h2>
-      <div className="note warn">
-        <strong>当前配置连同密钥明文存储，只供测试环境使用。</strong>
-      </div>
-      <Connection />
-      <AkashaModels />
-      <ProviderPanel
-        role="judge"
-        title="评估模型"
-        hint="用于 LLM 评估，密钥由本平台保存。"
-      />
-      <ProviderPanel
-        role="analysis"
-        title="归因分析模型"
-        hint="用于 badcase 归因。"
-      />
+      <AccessToken />
+      <ConnectionForm />
+      <ModelConfigs />
+      <Providers role="judge" title="评估模型 judge" />
+      <Providers role="attribution" title="归因模型 attribute" />
     </>
   )
 }
 
-function Connection() {
+/** 令牌不对时 health 是 401，所以请求失败也要显示这一段 —— 否则没有地方改它。 */
+function AccessToken() {
+  const [saved, setSaved] = useState(getToken())
+  const [value, setValue] = useState(saved)
+  const health = useAsync(() => api.health(), [saved])
+  const required = Boolean(health.data?.settings.auth_required)
+
+  const apply = (next: string) => {
+    setToken(next)
+    setValue(next)
+    setSaved(next)
+  }
+
+  if (!required && !saved && !health.error) return null
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>访问令牌</h3>
+        {saved && !health.error && <Pass ok yes="已生效" />}
+      </div>
+      {health.error && <Failed error={health.error} />}
+
+      <div className="form-grid">
+        <SecretField
+          label="X-Auth-Token"
+          value={value}
+          onChange={setValue}
+          placeholder="启动时设的那个令牌"
+          wide
+        />
+      </div>
+
+      <div className="panel-actions">
+        <button className="action primary" disabled={value === saved} onClick={() => apply(value)}>
+          保存
+        </button>
+        <button className="action" disabled={!saved} onClick={() => apply('')}>
+          清除
+        </button>
+        {value !== saved && <span className="small muted">未保存</span>}
+      </div>
+    </div>
+  )
+}
+
+// 数值字段各自的下限。间隔可以是 0（不等待），超时与并发不行。
+const NUMBER_FIELDS = [
+  ['timeout_seconds', '请求超时（秒）', 1],
+  ['concurrency', '默认并发', 1],
+  ['request_interval_seconds', '请求间隔（秒）', 0],
+  ['poll_interval_seconds', '编译轮询间隔（秒）', 0],
+  ['poll_timeout_seconds', '编译轮询超时（秒）', 1],
+] as const
+
+type Form = Record<string, string>
+
+/** 数值也按字符串存：清空输入框要能留着空，不能悄悄变成 0。 */
+function toForm(data: Connection): Form {
+  const { compiles: _compiles, updated_at: _updated, ...rest } = data
+  return Object.fromEntries(Object.entries(rest).map(([key, value]) => [key, String(value)]))
+}
+
+function ConnectionForm() {
   const { data, error, loading, reload } = useAsync(() => api.connection(), [])
-  const [form, setForm] = useState<Record<string, unknown>>({})
-  const save = useAction<{ updated: string[]; connection: AppConnection }>()
+  const [form, setForm] = useState<Form>({})
+  const [loaded, setLoaded] = useState<Form>({})
+  const save = useAction<{ updated: string[] }>()
   const test = useAction<ConnectionTest>()
 
-  useEffect(() => setForm({}), [data?.updated_at])
-
-  if (loading) return <Loading what="Akasha 连接配置" />
-  if (error) return <Failed error={error} />
-  if (!data) return null
-
-  const value = (name: keyof AppConnection, fallback: unknown = '') =>
-    (form[name] ?? data[name] ?? fallback) as string | number
-  const set = (name: string, next: unknown) => setForm((f) => ({ ...f, [name]: next }))
-  const dirty = Object.keys(form).length > 0
-
-  return (
-    <div className="panel">
-      <div className="spread">
-        <h3 style={{ margin: 0 }}>Akasha 连接配置</h3>
-        <div className="row tight">
-          <button className="action" disabled={test.busy} onClick={() => test.run(() => api.testConnection())}>
-            {test.busy ? '测试中…' : '测试连接'}
-          </button>
-          <button
-            className="action primary"
-            disabled={save.busy || !dirty}
-            onClick={() =>
-              save.run(async () => {
-                const result = await api.saveConnection(form)
-                setForm({})
-                reload()
-                return result
-              })
-            }
-          >
-            {save.busy ? '保存中…' : '保存'}
-          </button>
-        </div>
-      </div>
-
-      <div className="grid2" style={{ marginTop: 10 }}>
-        <label className="field">
-          base_url（部署根地址）
-          <input
-            value={value('base_url') as string}
-            placeholder="http://localhost:3000"
-            onFocus={selectInput}
-            onChange={(event) => set('base_url', event.target.value)}
-          />
-        </label>
-        <label className="field">
-          email（必须是 OWNER 账号）
-          <input
-            value={value('email') as string}
-            placeholder="test@example.com"
-            onFocus={selectInput}
-            onChange={(event) => set('email', event.target.value)}
-          />
-        </label>
-        <label className="field">
-          password
-          <SecretInput
-            secretLabel="密码"
-            placeholder="12345678"
-            value={value('password') as string}
-            onFocus={selectInput}
-            onChange={(event) => set('password', event.target.value)}
-          />
-        </label>
-        <label className="field">
-          database_url（只读 PG）
-          <input
-            type="text"
-            placeholder="postgres://akasha:STRONG_DB_PASSWORD@localhost:5432/akasha"
-            value={value('database_url') as string}
-            onFocus={selectInput}
-            onChange={(event) => set('database_url', event.target.value)}
-          />
-        </label>
-      </div>
-
-      <h4>查询与编译参数</h4>
-      <div className="row">
-        {(
-          [
-            ['concurrency', '查询并发数'],
-            ['request_interval_seconds', '请求最小间隔（秒）'],
-            ['timeout_seconds', '单次 HTTP 超时（秒）'],
-            ['poll_interval_seconds', '编译状态轮询间隔（秒）'],
-            ['poll_timeout_seconds', '编译等待上限（秒）'],
-          ] as const
-        ).map(([name, label]) => (
-          <label key={name} className="field">
-            {label}
-            <input
-              type="number"
-              step="any"
-              style={{ minWidth: 110 }}
-              value={String(value(name))}
-              onFocus={selectInput}
-              onChange={(event) => set(name, Number(event.target.value))}
-            />
-          </label>
-        ))}
-      </div>
-
-      {data.ingested_layers.length > 0 && (
-        <div className="note plain small">
-          <strong>{data.ingested_layers.length} 个层已入库：</strong>
-          {data.ingested_layers.map((l) => ` #${l.id} ${l.label}（ws ${l.workspace_id ?? '—'}）`).join('、')}
-          。改 base_url 或 email 可能落到另一个 workspace，那些层的 page_map 只在
-          原来那个里有意义 —— 会有提示。
-        </div>
-      )}
-
-      {save.error && <div className="note bad">{save.error}</div>}
-      {test.error && <div className="note bad">连接失败：{test.error}</div>}
-      {test.result && <TestResult result={test.result} />}
-      {!test.result && data.last_checked_at && (
-        <div className="row tight small muted" style={{ marginTop: 8 }}>
-          <span>上次测试 {data.last_checked_at}</span>
-          <Pass ok={Boolean(data.last_check_ok)} yes="通过" no="失败" />
-          {data.last_check_role && data.last_check_role !== 'owner' && (
-            <span className="tag bad">非 owner</span>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function TestResult({ result }: { result: ConnectionTest }) {
-  const bad = !result.is_owner || result.blocked_layers.length > 0
-  return (
-    <div className={`note ${bad ? 'bad' : ''}`}>
-      <div className="row tight">
-        <Pass ok={result.ok} yes="连接成功" no="失败" />
-        <span className="small">
-          {result.user.email} · 角色 {result.user.role}
-        </span>
-        <Pass ok={result.is_owner} yes="OWNER" no="非 OWNER" />
-      </div>
-      <div className="small muted" style={{ marginTop: 4 }}>
-        服务端解析出的 workspace：<span className="mono">{result.workspace.name}</span>
-        （<span className="mono">{result.workspace.id}</span>）—— 这一项由服务端决定，
-        填不了也不用填。
-      </div>
-      {result.owner_warning && (
-        <div className="small" style={{ marginTop: 6 }}>
-          {result.owner_warning}
-        </div>
-      )}
-      {result.blocked_layers.length > 0 && (
-        <div className="small" style={{ marginTop: 6 }}>
-          <strong>{result.blocked_layers.length} 个已入库的层跑不了：</strong>
-          {result.blocked_layers.map((entry) => (
-            <div key={entry.id} style={{ marginTop: 4 }}>
-              #{entry.id} {entry.label} —— {entry.reason}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function AkashaModels() {
-  const { data, error, loading, reload } = useAsync(() => api.modelConfigs(), [])
-  const [pending, setPending] = useState<{ feature: string; initial: Record<string, string> } | null>(null)
-  const action = useAction<{ impact: string }>()
-
-  if (loading) return <Loading what="Akasha 模型配置" />
-  if (error)
-    return (
-      <div className="panel">
-        <h3 style={{ marginTop: 0 }}>Akasha 模型配置</h3>
-        <div className="note warn">
-          <strong>拿不到。</strong> {error}
-          <div className="small" style={{ marginTop: 4 }}>
-            先把上面的连接填好并测试通过。其余视图不需要它。
-          </div>
-        </div>
-      </div>
-    )
-  if (!data) return null
-
-  const configs = extractConfigs(data.live)
-
-  return (
-    <div className="panel">
-      <div className="spread">
-        <h3 style={{ margin: 0 }}>Akasha 模型配置</h3>
-        <span className="small muted">编译、向量化与问答用的模型</span>
-      </div>
-
-      <table style={{ marginTop: 8 }}>
-        <thead>
-          <tr>
-            <th>用途</th>
-            <th>provider</th>
-            <th>模型</th>
-            <th>base_url</th>
-            <th>影响</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {data.features.map((feature) => {
-            const entry = configs[feature]
-            const rebuild = feature === 'compiler' || feature === 'embedding'
-            return (
-              <tr key={feature}>
-                <td>{feature}</td>
-                <td className="small mono">{entry?.provider ?? '—'}</td>
-                <td className="small mono">{entry?.model ?? '—'}</td>
-                <td className="small mono muted truncate">{entry?.baseUrl ?? '—'}</td>
-                <td className="small">
-                  {rebuild ? (
-                    <span className="tag warn">需重编译</span>
-                  ) : (
-                    <span className="tag">无影响</span>
-                  )}
-                </td>
-                <td>
-                  <button
-                    className="action small"
-                    disabled={action.busy}
-                    onClick={() => {
-                      action.reset()
-                      setPending({ feature, initial: entry ?? {} })
-                    }}
-                  >
-                    修改
-                  </button>
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-
-      <DriftTable layers={data.index_layers} />
-
-      {pending && (
-        <ConfirmModelChange
-          key={pending.feature}
-          feature={pending.feature}
-          initial={pending.initial}
-          busy={action.busy}
-          error={action.error}
-          result={action.result}
-          onCancel={() => {
-            setPending(null)
-            action.reset()
-          }}
-          onConfirm={(payload) =>
-            action.run(async () => {
-              const result = await api.saveModelConfig(pending.feature, payload)
-              reload()
-              return result
-            })
-          }
-        />
-      )}
-    </div>
-  )
-}
-
-function DriftTable({ layers }: { layers: ModelConfigsView['index_layers'] }) {
-  if (layers.length === 0) return null
-  return (
-    <>
-      <h4>与既有层的快照比对</h4>
-      <table>
-        <thead>
-          <tr>
-            <th>层</th>
-            <th>embedding</th>
-            <th>compiler</th>
-          </tr>
-        </thead>
-        <tbody>
-          {layers.map((layer) => (
-            <tr key={layer.id}>
-              <td>
-                #{layer.id} <span className="tag accent">{layer.label}</span>
-              </td>
-              <td>
-                <Pass ok={layer.embedding_matches} yes="一致" no="已漂移" />
-              </td>
-              <td>
-                <Pass ok={layer.compiler_matches} yes="一致" no="已漂移" />
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </>
-  )
-}
-
-function ConfirmModelChange({
-  feature,
-  initial,
-  busy,
-  error,
-  result,
-  onCancel,
-  onConfirm,
-}: {
-  feature: string
-  initial: Record<string, string>
-  busy: boolean
-  error: string | null
-  result: { impact: string } | null
-  onCancel: () => void
-  onConfirm: (payload: Record<string, string>) => void
-}) {
-  const [model, setModel] = useState(initial.model ?? '')
-  const [baseUrl, setBaseUrl] = useState(initial.baseUrl ?? '')
-  const [apiKey, setApiKey] = useState('')
-  const [apiKeyTouched, setApiKeyTouched] = useState(false)
-  const rebuild = feature === 'compiler' || feature === 'embedding'
-
-  return (
-    <div className="panel" style={{ marginTop: 12 }}>
-      <h4 style={{ marginTop: 0 }}>修改 {feature} 配置</h4>
-
-      <div className={`note ${rebuild ? 'bad' : 'warn'}`}>
-        <strong>影响：</strong>{rebuild ? '需新建编译层并重新编译。' : '无影响。'}
-      </div>
-
-      <div className="grid2">
-        <label className="field">
-          model
-          <input
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-            onFocus={selectInput}
-            placeholder="gpt-4o-mini"
-          />
-        </label>
-        <label className="field">
-          base_url（API 根地址，含版本路径）
-          <input
-            value={baseUrl}
-            onChange={(event) => setBaseUrl(event.target.value)}
-            onFocus={selectInput}
-            placeholder="https://api.openai.com/v1"
-          />
-        </label>
-        <label className="field">
-          api_key
-          <SecretInput
-            secretLabel="API Key"
-            value={apiKey}
-            placeholder={apiKeyTouched ? '留空将清除密钥' : '留空保留当前密钥'}
-            onFocus={selectInput}
-            onChange={(event) => {
-              setApiKey(event.target.value)
-              setApiKeyTouched(true)
-            }}
-          />
-        </label>
-      </div>
-
-      {error && <div className="note bad">{error}</div>}
-      {result && <div className="note">{result.impact}</div>}
-
-      <div className="row" style={{ marginTop: 10 }}>
-        <button
-          className="action primary"
-          disabled={busy || !model || !baseUrl || result !== null}
-          onClick={() => {
-            const payload: Record<string, string> = { ...initial, model, baseUrl }
-            if (apiKeyTouched) payload.apiKey = apiKey
-            onConfirm(payload)
-          }}
-        >
-          {busy ? '提交中…' : '确认修改'}
-        </button>
-        <button className="action" disabled={busy} onClick={onCancel}>
-          {result ? '关闭' : '取消'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function extractConfigs(live: unknown): Record<string, Record<string, string>> {
-  const entries = (live as { configs?: unknown[] })?.configs ?? (Array.isArray(live) ? live : [])
-  const map: Record<string, Record<string, string>> = {}
-  for (const entry of entries as Array<Record<string, string>>) {
-    if (entry?.feature) map[entry.feature] = entry
-  }
-  return map
-}
-
-function ProviderPanel({
-  role,
-  title,
-  hint,
-}: {
-  role: 'judge' | 'analysis'
-  title: string
-  hint: string
-}) {
-  const { data, error, loading, reload } = useAsync(() => api.providers(role), [role])
-  const [form, setForm] = useState({ label: 'default', base_url: '', model: '', api_key: '' })
-  const save = useAction<{ id: number }>()
-  const remove = useAction<{ deleted: number }>()
-
   useEffect(() => {
-    const first = data?.[0]
-    if (first) {
-      setForm({ label: first.label, base_url: first.base_url, model: first.model, api_key: '' })
+    if (data) {
+      setForm(toForm(data))
+      setLoaded(toForm(data))
     }
   }, [data])
 
-  if (loading) return <Loading what={title} />
+  if (loading && !data) return <Loading what="连接配置" />
   if (error) return <Failed error={error} />
+  if (!data) return null
+
+  // 改过之后原来的保存结果与测试结论都不再对应当前表单。
+  const set = (key: string, value: string) => {
+    setForm((f) => ({ ...f, [key]: value }))
+    save.reset()
+    test.reset()
+  }
+  const revert = () => {
+    setForm(loaded)
+    save.reset()
+    test.reset()
+  }
+
+  const dirty = Object.keys(loaded).some((key) => form[key] !== loaded[key])
+  const invalid = NUMBER_FIELDS.filter(([key, , min]) => {
+    const value = Number(form[key])
+    return form[key]?.trim() === '' || !Number.isFinite(value) || value < min
+  })
+
+  const payload = () => ({
+    ...form,
+    ...Object.fromEntries(NUMBER_FIELDS.map(([key]) => [key, Number(form[key])])),
+  })
 
   return (
     <div className="panel">
-      <div className="spread">
-        <h3 style={{ margin: 0 }}>{title}</h3>
+      <div className="panel-head">
+        <h3>Akasha 连接</h3>
+        {dirty && <span className="tag warn">有未保存的改动</span>}
+      </div>
+
+      {save.error && <Failed error={save.error} />}
+      {test.error && <Failed error={test.error} />}
+      {save.result && (
+        <div className="note">已保存 {save.result.updated.length} 个字段。</div>
+      )}
+
+      <div className="form-grid">
+        <Field label="base_url">
+          <input value={form.base_url ?? ''} onChange={(e) => set('base_url', e.target.value)} />
+        </Field>
+        <Field label="登录邮箱">
+          <input value={form.email ?? ''} onChange={(e) => set('email', e.target.value)} />
+        </Field>
+        <SecretField
+          label="登录密码"
+          value={form.password ?? ''}
+          onChange={(value) => set('password', value)}
+        />
+        <SecretField
+          label="只读 PostgreSQL"
+          hint="归因链路用，可不填"
+          value={form.database_url ?? ''}
+          onChange={(value) => set('database_url', value)}
+          placeholder="postgresql://…"
+        />
+      </div>
+
+      <div className="form-grid compact">
+        {NUMBER_FIELDS.map(([key, label, min]) => (
+          <Field key={key} label={label}>
+            <input
+              type="number"
+              min={min}
+              value={form[key] ?? ''}
+              onChange={(e) => set(key, e.target.value)}
+            />
+          </Field>
+        ))}
+      </div>
+
+      {invalid.length > 0 && (
+        <div className="note bad">
+          <strong>这些字段要填数字：</strong>
+          {invalid.map(([, label, min]) => `${label}（≥ ${min}）`).join('、')}
+        </div>
+      )}
+
+      <div className="panel-actions">
         <button
           className="action primary"
-          disabled={save.busy || !form.base_url || !form.model}
+          disabled={save.busy || !dirty || invalid.length > 0}
           onClick={() =>
             save.run(async () => {
-              const result = await api.saveProvider(role, form)
+              const result = await api.saveConnection(payload())
               reload()
               return result
             })
@@ -510,97 +188,459 @@ function ProviderPanel({
         >
           {save.busy ? '保存中…' : '保存'}
         </button>
-      </div>
-      <p className="small muted">{hint}</p>
-
-      <div className="grid2">
-        <label className="field">
-          标签
-          <input
-            value={form.label}
-            placeholder="default"
-            onFocus={selectInput}
-            onChange={(event) => setForm({ ...form, label: event.target.value })}
-          />
-        </label>
-        <label className="field">
-          base_url（API 根地址，含版本路径）
-          <input
-            value={form.base_url}
-            placeholder="https://api.openai.com/v1"
-            onFocus={selectInput}
-            onChange={(event) => setForm({ ...form, base_url: event.target.value })}
-          />
-        </label>
-        <label className="field">
-          模型
-          <input
-            value={form.model}
-            placeholder="gpt-4o-mini"
-            onFocus={selectInput}
-            onChange={(event) => setForm({ ...form, model: event.target.value })}
-          />
-        </label>
-        <label className="field">
-          api_key
-          <SecretInput
-            secretLabel="API Key"
-            value={form.api_key}
-            placeholder="必填"
-            onFocus={selectInput}
-            onChange={(event) => setForm({ ...form, api_key: event.target.value })}
-          />
-        </label>
+        <button className="action" disabled={!dirty || save.busy} onClick={revert}>
+          放弃改动
+        </button>
+        <button
+          className="action"
+          disabled={test.busy}
+          onClick={() => test.run(() => api.testConnection())}
+        >
+          {test.busy ? '测试中…' : '测试连接'}
+        </button>
+        {dirty && <span className="small muted">测试连接用的是已保存的配置</span>}
       </div>
 
-      {save.error && <div className="note bad">{save.error}</div>}
-      {save.result && <div className="note">已保存。</div>}
-      {remove.error && <div className="note bad">{remove.error}</div>}
+      {test.result && (
+        <div className={`note${test.result.is_owner ? '' : ' warn'}`}>
+          <strong>连接成功。</strong> {test.result.user.email} · 角色 {test.result.user.role} ·{' '}
+          workspace {test.result.workspace.name ?? test.result.workspace.id}
+          <span style={{ marginLeft: 8 }}>
+            <Pass ok={test.result.is_owner} yes="owner" no="非 owner" />
+          </span>
+          {test.result.owner_warning && (
+            <div className="small" style={{ marginTop: 4 }}>
+              {test.result.owner_warning}
+            </div>
+          )}
+        </div>
+      )}
 
-      {data && data.length > 0 && (
-        <table style={{ marginTop: 10 }}>
+      {test.result && test.result.blocked_compiles.length > 0 && (
+        <div className="note bad">
+          <strong>{test.result.blocked_compiles.length} 次编译在当前连接下用不了。</strong>
+          <ul>
+            {test.result.blocked_compiles.map((entry) => (
+              <li key={entry.id} className="small">
+                <span className="mono">{entry.run_id}</span> · {entry.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+    </div>
+  )
+}
+
+/** 四项配置各自的标题与说明。改了要重新编译的那两项在 REBUILD 里。 */
+const FEATURE_LABELS: Record<string, { title: string }> = {
+  compiler: { title: '编译模型' },
+  embedding: { title: '嵌入模型' },
+  answer: { title: '回答模型' },
+  image: { title: '图像模型' },
+}
+
+const REBUILD = ['compiler', 'embedding']
+
+const BLANK_CONFIG = { model: '', baseUrl: '', apiKey: '' }
+
+/** 四项配置一张表，与 judge / 归因同一套：点「编辑」在下方展开表单。
+ *
+ * 没有新建与删除 —— 这四项是 Akasha 固定的 feature，只能改，不能增删。
+ */
+function ModelConfigs() {
+  const { data, error, loading, reload } = useAsync(() => api.modelConfigs(), [])
+  const [editing, setEditing] = useState<string | null>(null)
+  const [form, setForm] = useState(BLANK_CONFIG)
+  const save = useAction<{ impact: string; requires_new_compile: boolean }>()
+
+  // 保存后会 reload：只在首次加载时让位给 Loading，否则表格会连同刚出的结果一起闪掉。
+  if (loading && !data) return <Loading what="模型配置" />
+  if (error)
+    return (
+      <div className="panel">
+        <h3>Akasha 模型配置</h3>
+        <Failed error={error} />
+        <p className="small muted">这一段需要连上 Akasha。先把上面的连接配好并测试通过。</p>
+      </div>
+    )
+  if (!data) return null
+
+  const live: ModelConfig[] = Array.isArray(data.live) ? data.live : (data.live.configs ?? [])
+  const byFeature = new Map(live.map((entry) => [entry.feature, entry]))
+  const entry = editing === null ? undefined : byFeature.get(editing)
+  const meta = FEATURE_LABELS[editing ?? ''] ?? { title: editing ?? '' }
+
+  const set = (patch: Partial<typeof form>) => {
+    setForm({ ...form, ...patch })
+    save.reset()
+  }
+  const edit = (feature: string) => {
+    const current = byFeature.get(feature)
+    setEditing(feature)
+    setForm({ model: current?.model ?? '', baseUrl: current?.baseUrl ?? '', apiKey: '' })
+    save.reset()
+  }
+  const close = () => {
+    setEditing(null)
+    setForm(BLANK_CONFIG)
+    save.reset()
+  }
+
+  // 密钥留空且模型与 base_url 没动，这次保存什么也不会改。
+  const dirty =
+    form.apiKey !== '' ||
+    form.model !== (entry?.model ?? '') ||
+    form.baseUrl !== (entry?.baseUrl ?? '')
+
+  return (
+    <>
+      <div className="panel">
+        <h3>Akasha 模型配置</h3>
+
+        {save.error && <Failed error={save.error} />}
+        {save.result && (
+          <div className={`note${save.result.requires_new_compile ? ' warn' : ''}`}>
+            已保存。{save.result.impact}
+          </div>
+        )}
+
+        <table>
           <thead>
             <tr>
-              <th>标签</th>
+              <th>配置项</th>
               <th>模型</th>
-              <th>端点</th>
+              <th>base_url</th>
               <th>密钥</th>
               <th />
             </tr>
           </thead>
           <tbody>
-            {data.map((provider: Provider) => (
-              <tr key={provider.id}>
+            {data.features.map((feature) => {
+              const row = byFeature.get(feature)
+              const label = FEATURE_LABELS[feature] ?? { title: feature }
+              return (
+                <tr key={feature} className={feature === editing ? 'selected' : ''}>
+                  <td>
+                    <div className="stack">
+                      <span>
+                        {label.title}
+                        {REBUILD.includes(feature) && (
+                          <span className="tag warn" style={{ marginLeft: 6 }}>
+                            需重编译
+                          </span>
+                        )}
+                      </span>
+                      <span className="mono muted">{feature}</span>
+                    </div>
+                  </td>
+                  <td className="small mono">{row?.model ?? '—'}</td>
+                  <td className="small mono muted truncate">{row?.baseUrl ?? '—'}</td>
+                  <td>
+                    <Pass ok={Boolean(row?.apiKeySet)} yes="已设置" no="缺失" />
+                  </td>
+                  <td>
+                    <button className="action small" onClick={() => edit(feature)}>
+                      编辑
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+
+        {editing !== null && (
+          <>
+            <h4>
+              编辑{meta.title} <code className="small">{editing}</code>
+            </h4>
+
+            <div className="form-grid inline">
+              <Field label="模型">
+                <input value={form.model} onChange={(e) => set({ model: e.target.value })} />
+              </Field>
+              <Field label="base_url">
+                <input
+                  value={form.baseUrl}
+                  onChange={(e) => set({ baseUrl: e.target.value })}
+                  placeholder="https://api.example.com/v1"
+                />
+              </Field>
+              <SecretField
+                label="api_key"
+                hint="留空保留原值"
+                value={form.apiKey}
+                onChange={(value) => set({ apiKey: value })}
+              />
+            </div>
+
+            <div className="panel-actions">
+              <button
+                className="action primary"
+                disabled={save.busy || !dirty || !form.model || !form.baseUrl}
+                onClick={() => {
+                  const feature = editing
+                  if (
+                    REBUILD.includes(feature) &&
+                    !window.confirm(
+                      `${feature} 改了必须重新编译，已有编译的结果不再可比。确定要改吗？`,
+                    )
+                  )
+                    return
+                  save.run(async () => {
+                    const payload = Object.fromEntries(
+                      Object.entries(form).filter(([, value]) => value !== ''),
+                    )
+                    const result = await api.saveModelConfig(feature, payload)
+                    setEditing(null)
+                    setForm(BLANK_CONFIG)
+                    reload()
+                    return result
+                  })
+                }}
+              >
+                {save.busy ? '保存中…' : '保存到 Akasha'}
+              </button>
+              <button className="action" disabled={save.busy} onClick={close}>
+                取消
+              </button>
+              {!dirty && <span className="small muted">没有改动</span>}
+            </div>
+          </>
+        )}
+      </div>
+
+      <ConfigDrift features={data.features} compiles={data.compiles} />
+    </>
+  )
+}
+
+/** 现在的配置与各次编译的快照是否一致。四项放一张表里才看得出差在哪一项。 */
+function ConfigDrift({
+  features,
+  compiles,
+}: {
+  features: string[]
+  compiles: { id: number; run_id: string; drift: Record<string, boolean> }[]
+}) {
+  if (!compiles.some((entry) => Object.values(entry.drift).some(Boolean))) return null
+  return (
+    <div className="panel">
+      <h3>与已有编译的差异</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>编译</th>
+            {features.map((feature) => (
+              <th key={feature}>{feature}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {compiles.map((entry) => (
+            <tr key={entry.id}>
+              <td className="mono small">{entry.run_id}</td>
+              {features.map((feature) => (
+                <td key={feature}>
+                  <Pass ok={!entry.drift[feature]} yes="一致" no="已变" />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+const BLANK = { label: '', base_url: '', model: '', api_key: '' }
+
+/** 表单默认收起，由「新建端点」或表格里的「编辑」打开。
+ *
+ * 编辑必须带上 id：后端按 (role, label) 做 upsert，只按 label 提交会让「改个名字」
+ * 变成新增一条，原来那条还留着。
+ */
+function Providers({ role, title }: { role: 'judge' | 'attribution'; title: string }) {
+  const { data, error, loading, reload } = useAsync<Provider[]>(() => api.providers(role), [role])
+  // null 是收起来，'new' 是新建，数字是在改那一条。
+  const [mode, setMode] = useState<number | 'new' | null>(null)
+  const [form, setForm] = useState(BLANK)
+  const save = useAction<{ id: number }>()
+  const remove = useAction<unknown>()
+
+  const providers = data ?? []
+  const editing = typeof mode === 'number' ? mode : null
+  const set = (patch: Partial<typeof form>) => {
+    setForm({ ...form, ...patch })
+    save.reset()
+  }
+  const close = () => {
+    setMode(null)
+    setForm(BLANK)
+    save.reset()
+    remove.reset()
+  }
+  const create = () => {
+    setMode('new')
+    setForm(BLANK)
+    save.reset()
+    remove.reset()
+  }
+  const edit = (provider: Provider) => {
+    setMode(provider.id)
+    setForm({
+      label: provider.label,
+      base_url: provider.base_url,
+      model: provider.model,
+      api_key: '',
+    })
+    save.reset()
+    remove.reset()
+  }
+
+  // 新建时标签不能撞已有的，否则那一条会被悄悄覆盖。
+  const label = form.label.trim() || 'default'
+  const taken = providers.some((p) => p.label === label && p.id !== editing)
+
+  if (loading && !data) return <Loading what={title} />
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>{title}</h3>
+        <span className="small muted">{providers.length} 个端点</span>
+      </div>
+
+      {error && <Failed error={error} />}
+      {save.error && <Failed error={save.error} />}
+      {remove.error && <Failed error={remove.error} />}
+
+      {providers.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>标签</th>
+              <th>模型</th>
+              <th>base_url</th>
+              <th>密钥</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {providers.map((provider) => (
+              <tr key={provider.id} className={provider.id === editing ? 'selected' : ''}>
                 <td>{provider.label}</td>
                 <td className="small mono">{provider.model}</td>
                 <td className="small mono muted truncate">{provider.base_url}</td>
                 <td>
-                  {provider.api_key_set ? (
-                    <span className="tag ok">已设置</span>
-                  ) : (
-                    <span className="tag bad">未设置</span>
-                  )}
+                  <Pass ok={provider.api_key_set} yes="已设置" no="缺失" />
                 </td>
                 <td>
-                  <button
-                    className="action small danger"
-                    disabled={remove.busy}
-                    onClick={() =>
-                      remove.run(async () => {
-                        const result = await api.deleteProvider(provider.id)
-                        reload()
-                        return result
-                      })
-                    }
-                  >
-                    删除
-                  </button>
+                  <div className="row tight">
+                    <button className="action small" onClick={() => edit(provider)}>
+                      编辑
+                    </button>
+                    <button
+                      className="action small danger"
+                      disabled={remove.busy}
+                      onClick={() => {
+                        if (!window.confirm(`删除端点「${provider.label}」？\n\n引用它的评测与归因记录会失去关联。`))
+                          return
+                        remove.run(async () => {
+                          const result = await api.deleteProvider(provider.id)
+                          if (editing === provider.id) close()
+                          reload()
+                          return result
+                        })
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+
+      {providers.length === 0 && !error && mode === null && (
+        <p className="small muted">还没有配端点。</p>
+      )}
+
+      {save.result && <div className="note">已保存端点。</div>}
+
+      {mode !== null && (
+        <>
+          <h4>{editing === null ? '新建端点' : `编辑端点 #${editing}`}</h4>
+          <div className="form-grid inline">
+            <Field label="标签" hint="同一角色下不重名">
+              <input
+                value={form.label}
+                onChange={(e) => set({ label: e.target.value })}
+                placeholder="default"
+              />
+            </Field>
+            <Field label="模型">
+              <input value={form.model} onChange={(e) => set({ model: e.target.value })} />
+            </Field>
+            <Field label="base_url">
+              <input
+                value={form.base_url}
+                onChange={(e) => set({ base_url: e.target.value })}
+                placeholder="https://api.example.com/v1"
+              />
+            </Field>
+            <SecretField
+              label="api_key"
+              hint={editing === null ? undefined : '留空保留原值'}
+              value={form.api_key}
+              onChange={(value) => set({ api_key: value })}
+            />
+          </div>
+
+          {taken && (
+            <div className="note bad">
+              已经有一个叫「{label}」的端点了。换个标签，或者在上表里点它的「编辑」。
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="panel-actions">
+        {mode === null ? (
+          <button className="action" onClick={create}>
+            新建端点
+          </button>
+        ) : (
+          <>
+            <button
+              className="action primary"
+              disabled={save.busy || taken || !form.base_url || !form.model}
+              onClick={() =>
+                save.run(async () => {
+                  const result = await api.saveProvider(role, {
+                    ...form,
+                    label,
+                    ...(editing === null ? {} : { id: editing }),
+                  })
+                  setMode(null)
+                  setForm(BLANK)
+                  reload()
+                  return result
+                })
+              }
+            >
+              {save.busy ? '保存中…' : editing === null ? '创建端点' : '保存修改'}
+            </button>
+            <button className="action" disabled={save.busy} onClick={close}>
+              取消
+            </button>
+          </>
+        )}
+      </div>
     </div>
   )
 }

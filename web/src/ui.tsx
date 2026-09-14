@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api'
-import type { Metrics, RootCause } from './types'
+import type { Metrics, RootCause, RunStatus, TaskStatus } from './types'
 
 /** 缺失指标显示为 `—`，避免与数值 0 混淆。 */
 export function metric(values: Metrics, name: string, digits = 4): string {
@@ -24,21 +24,44 @@ export function useAsync<T>(
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [nonce, setNonce] = useState(0)
+  const hasData = useRef(false)
+  const inFlight = useRef(false)
+  const queued = useRef(false)
+
+  // 参数变了，手上的数据不再对应当前请求，回到加载态。
+  useEffect(() => {
+    hasData.current = false
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
 
   useEffect(() => {
     let alive = true
-    setLoading(true)
-    setError(null)
-    Promise.resolve().then(load)
+    // 已有数据时刷新不翻转 loading，否则轮询会把整页反复换成加载态。
+    if (!hasData.current) {
+      setLoading(true)
+      setError(null)
+    }
+    inFlight.current = true
+    Promise.resolve()
+      .then(load)
       .then((result) => {
-        if (alive) setData(result)
+        if (!alive) return
+        hasData.current = true
+        setData(result)
+        setError(null)
       })
       .catch((exc: unknown) => {
-        if (!alive) return
-        setError(exc instanceof ApiError ? exc.message : String(exc))
+        if (alive) setError(exc instanceof ApiError ? exc.message : String(exc))
       })
       .finally(() => {
-        if (alive) setLoading(false)
+        // 被后一次请求接替时不动这些状态，交给接替者收尾。
+        if (!alive) return
+        inFlight.current = false
+        setLoading(false)
+        if (queued.current) {
+          queued.current = false
+          setNonce((n) => n + 1)
+        }
       })
     return () => {
       alive = false
@@ -46,7 +69,16 @@ export function useAsync<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, nonce])
 
-  return { data, error, loading, reload: useCallback(() => setNonce((n) => n + 1), []) }
+  // 上一次没回来就只记一次待刷新，避免请求堆积，也不丢掉动作触发的刷新。
+  const reload = useCallback(() => {
+    if (inFlight.current) {
+      queued.current = true
+      return
+    }
+    setNonce((n) => n + 1)
+  }, [])
+
+  return { data, error, loading, reload }
 }
 
 export function useAction<T>(): {
@@ -72,10 +104,12 @@ export function useAction<T>(): {
     setBusy(true)
     setError(null)
     setResult(null)
-    Promise.resolve().then(task)
+    Promise.resolve()
+      .then(task)
       .then((value) => alive.current && setResult(value))
-      .catch((exc: unknown) =>
-        alive.current && setError(exc instanceof ApiError ? exc.message : String(exc)),
+      .catch(
+        (exc: unknown) =>
+          alive.current && setError(exc instanceof ApiError ? exc.message : String(exc)),
       )
       .finally(() => alive.current && setBusy(false))
   }, [])
@@ -92,6 +126,15 @@ export function useAction<T>(): {
   }
 }
 
+/** 有任务在跑时轮询。进度逐行提交，所以刷得到。 */
+export function usePoll(active: boolean, reload: () => void, ms = 3000) {
+  useEffect(() => {
+    if (!active) return
+    const timer = setInterval(reload, ms)
+    return () => clearInterval(timer)
+  }, [active, reload, ms])
+}
+
 export function Loading({ what }: { what: string }) {
   return <p className="muted">正在加载{what}…</p>
 }
@@ -99,23 +142,39 @@ export function Loading({ what }: { what: string }) {
 export function Failed({ error }: { error: string }) {
   return (
     <div className="note bad">
-      <strong>取数失败。</strong> {error}
+      <strong>请求失败。</strong> {error}
     </div>
   )
 }
 
-export function Empty({ children }: { children: React.ReactNode }) {
-  return <p className="muted">{children}</p>
+export const STATUS_TEXT: Record<TaskStatus, string> = {
+  queued: '排队中',
+  running: '进行中',
+  paused: '已暂停',
+  succeeded: '已完成',
+  failed: '失败',
+}
+
+const STATUS_CLASS: Record<TaskStatus, string> = {
+  queued: 'tag',
+  running: 'tag accent',
+  paused: 'tag warn',
+  succeeded: 'tag ok',
+  failed: 'tag bad',
+}
+
+export function StatusTag({ status }: { status: TaskStatus | RunStatus }) {
+  const key = status as TaskStatus
+  return <span className={STATUS_CLASS[key] ?? 'tag'}>{STATUS_TEXT[key] ?? status}</span>
 }
 
 /** answerMode 的显示。knowledge 之外的都要显眼 —— 它们的检索得分按定义为 0。 */
 export function ModeTag({ mode }: { mode: string | null }) {
   const label = mode ?? 'missing'
-  const kind = label === 'knowledge' ? 'ok' : 'warn'
-  return <span className={`tag ${kind}`}>{label}</span>
+  return <span className={`tag ${label === 'knowledge' ? 'ok' : 'warn'}`}>{label}</span>
 }
 
-export function Pass({ ok, yes = 'PASS', no = 'FAIL' }: { ok: boolean; yes?: string; no?: string }) {
+export function Pass({ ok, yes = '通过', no = '未通过' }: { ok: boolean; yes?: string; no?: string }) {
   return <span className={`tag ${ok ? 'ok' : 'bad'}`}>{ok ? yes : no}</span>
 }
 
@@ -157,8 +216,6 @@ export function Pager({
   onChange: (offset: number) => void
 }) {
   if (total <= limit) return null
-  const page = Math.floor(offset / limit) + 1
-  const pages = Math.ceil(total / limit)
   return (
     <div className="row tight small muted" style={{ marginTop: 10 }}>
       <button
@@ -169,7 +226,7 @@ export function Pager({
         ← 上一页
       </button>
       <span>
-        {page} / {pages}（共 {total} 条）
+        {Math.floor(offset / limit) + 1} / {Math.ceil(total / limit)}（共 {total} 条）
       </span>
       <button
         className="action small"
@@ -182,7 +239,7 @@ export function Pager({
   )
 }
 
-/** 一个可折叠的段。链路视图里六跳内容全展开会太长。 */
+/** 可折叠段。链路视图里内容全展开会太长。 */
 export function Collapsible({
   title,
   children,
@@ -207,7 +264,7 @@ export function Collapsible({
   )
 }
 
-/** 数据集选择器。多选，因为指标勾选范围由所选组合决定。 */
+/** 数据集多选。指标勾选范围由所选组合决定，所以是多选。 */
 export function DatasetPicker({
   all,
   selected,
@@ -217,8 +274,6 @@ export function DatasetPicker({
   selected: string[]
   onChange: (next: string[]) => void
 }) {
-  const toggle = (name: string) =>
-    onChange(selected.includes(name) ? selected.filter((n) => n !== name) : [...selected, name])
   return (
     <div className="row tight">
       {all.map((name) => (
@@ -226,11 +281,134 @@ export function DatasetPicker({
           <input
             type="checkbox"
             checked={selected.includes(name)}
-            onChange={() => toggle(name)}
+            onChange={() =>
+              onChange(
+                selected.includes(name)
+                  ? selected.filter((n) => n !== name)
+                  : [...selected, name],
+              )
+            }
           />
           {name}
         </label>
       ))}
     </div>
+  )
+}
+
+export function Field({
+  label,
+  children,
+  hint,
+  wide,
+}: {
+  label: string
+  children: React.ReactNode
+  hint?: string
+  /** 在 form-grid 里独占一行。 */
+  wide?: boolean
+}) {
+  return (
+    <label className={`field${wide ? ' wide' : ''}`}>
+      <span>
+        {label}
+        {hint && <span className="muted"> · {hint}</span>}
+      </span>
+      {children}
+    </label>
+  )
+}
+
+/** 眼睛与划掉的眼睛。只这两个图标，不值得为它引一个图标库。 */
+function EyeIcon({ off }: { off?: boolean }) {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {off ? (
+        <>
+          <path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c7 0 10 8 10 8a18.5 18.5 0 0 1-2.16 3.19m-2.72 2.42A9.7 9.7 0 0 1 12 20c-7 0-10-8-10-8a18.4 18.4 0 0 1 5.06-5.94" />
+          <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+          <path d="M2 2l20 20" />
+        </>
+      ) : (
+        <>
+          <path d="M2 12s3-8 10-8 10 8 10 8-3 8-10 8-10-8-10-8z" />
+          <circle cx="12" cy="12" r="3" />
+        </>
+      )}
+    </svg>
+  )
+}
+
+/** 密码与 api_key 统一走这里：默认遮住，自带显隐按钮。 */
+export function SecretField({
+  label,
+  value,
+  onChange,
+  hint,
+  placeholder,
+  wide,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  hint?: string
+  placeholder?: string
+  wide?: boolean
+}) {
+  const [shown, setShown] = useState(false)
+  return (
+    <Field label={label} hint={hint} wide={wide}>
+      <div className="secret-input">
+        <input
+          type={shown ? 'text' : 'password'}
+          value={value}
+          placeholder={placeholder}
+          autoComplete="off"
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <button
+          type="button"
+          className="secret-toggle"
+          title={shown ? '隐藏' : '显示'}
+          aria-label={shown ? '隐藏' : '显示'}
+          onClick={() => setShown(!shown)}
+        >
+          <EyeIcon off={shown} />
+        </button>
+      </div>
+    </Field>
+  )
+}
+
+/** 清理按钮。二次确认写在这里一处，各层不各写一遍。 */
+export function CleanupButton({
+  what,
+  detail,
+  onConfirm,
+  busy,
+}: {
+  what: string
+  detail: string
+  onConfirm: () => void
+  busy?: boolean
+}) {
+  return (
+    <button
+      className="action small danger"
+      disabled={busy}
+      onClick={() => window.confirm(`清理${what}？\n\n${detail}`) && onConfirm()}
+    >
+      清理
+    </button>
   )
 }

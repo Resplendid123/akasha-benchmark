@@ -1,25 +1,19 @@
-"""评估指标 judge 与确定性指标同属评测层；归因与人工标注独立存储。"""
+"""评估与归因共用的模型客户端，以及 faithfulness 判据。"""
 
 from . import faithfulness
 from .client import (
-    FAILURE_PARSE,
-    FAILURE_RATE_LIMIT,
-    FAILURE_REFUSAL,
-    FAILURE_TIMEOUT,
     JudgeClient,
     JudgeConfigError,
     JudgeProvider,
+    JudgeReply,
     parse_json_object,
 )
 
 __all__ = [
-    "FAILURE_PARSE",
-    "FAILURE_RATE_LIMIT",
-    "FAILURE_REFUSAL",
-    "FAILURE_TIMEOUT",
     "JudgeClient",
     "JudgeConfigError",
     "JudgeProvider",
+    "JudgeReply",
     "faithfulness",
     "parse_json_object",
 ]

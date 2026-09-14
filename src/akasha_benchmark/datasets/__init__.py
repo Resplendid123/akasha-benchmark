@@ -12,7 +12,7 @@ from .models import (
     make_sample_id,
 )
 from .registry import ADAPTER_CLASSES, DATASET_NAMES, all_adapters, get_adapter
-from .resolver import ResolvedDataset, normalized_dir, repo_relative, resolve, subset_dir
+from .resolver import ResolvedDataset, resolve
 
 __all__ = [
     "ADAPTER_CLASSES",
@@ -30,8 +30,5 @@ __all__ = [
     "get_adapter",
     "load_corpus",
     "make_sample_id",
-    "normalized_dir",
-    "repo_relative",
     "resolve",
-    "subset_dir",
 ]

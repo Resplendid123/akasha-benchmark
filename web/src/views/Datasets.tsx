@@ -1,106 +1,166 @@
 import { useState } from 'react'
 import { api } from '../api'
-import { Empty, Failed, Loading, Pager, useAction, useAsync } from '../ui'
+import type { DatasetEntry } from '../types'
+import { DatasetPicker, Failed, Loading, Pager, num, useAction, useAsync } from '../ui'
 
+/** 数据集层：原始文件的下载与校验，以及原始样例。 */
 export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
-  const { data, error, loading } = useAsync(() => api.adapters(), [])
-  const [open, setOpen] = useState<string | null>(null)
-  const download = useAction<void>()
+  const { data, error, loading, reload } = useAsync(() => api.datasets(), [])
+  const [selected, setSelected] = useState<string[]>([])
+  const [preview, setPreview] = useState<{ dataset: string; kind: 'qa' | 'corpus' } | null>(null)
+  const [reopened, setReopened] = useState(false)
+  const start = useAction<unknown>()
 
-  if (loading) return <Loading what="数据集" />
+  if (loading) return <Loading what="数据集状态" />
   if (error) return <Failed error={error} />
-  const entries = data?.adapters.filter((entry) => entry.implemented && entry.files_present) ?? []
-  const missing = data?.adapters.some((entry) => entry.implemented && !entry.files_present)
-  const downloadButton = (
-    <button
-      className="action primary"
-      disabled={download.busy}
-      onClick={() => download.run(async () => {
-        await api.startTask('download', {})
-        onOpenTasks()
-      })}
-    >
-      {download.busy ? '启动中…' : '下载数据集'}
-    </button>
-  )
+  if (!data) return null
+
+  const names = data.datasets.map((d) => d.name)
+  const targets = selected.length ? selected : names
+  // 全部就绪就不必再看下载那一栏；想重下由「重新下载」显式打开。
+  const allReady = data.datasets.every((d) => d.files_ready)
 
   return (
     <>
-      <h2>数据集</h2>
-      {download.error && <Failed error={download.error} />}
-      {entries.length === 0 ? (
-        <Empty>
-          <p>暂时还无数据集。</p>
-          {downloadButton}
-        </Empty>
-      ) : (
-        <>
-          {missing && <div style={{ margin: '12px 0' }}>{downloadButton}</div>}
-          <table>
-            <thead>
-              <tr>
-                <th>数据集</th>
-                <th>标注</th>
-                <th>样本文件</th>
-                <th>语料文件</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map((entry) => (
-                <tr key={entry.name} className={open === entry.name ? 'selected' : ''}>
-                  <td>{entry.name}</td>
-                  <td>{entry.provides.map((dependency) => (
-                    <span key={dependency} className="tag ok">{dependency}</span>
-                  ))}</td>
-                  <td className="small mono">{entry.qa_file}</td>
-                  <td className="small mono">{entry.corpus_file}</td>
-                  <td>
-                    <button
-                      className="action small"
-                      onClick={() => setOpen(open === entry.name ? null : entry.name)}
-                    >
-                      {open === entry.name ? '收起' : '原始样例'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
+      <div className="spread">
+        <h2>数据集</h2>
+        <div className="row tight">
+          {allReady && !reopened && (
+            <button className="action small" onClick={() => setReopened(true)}>
+              重新下载
+            </button>
+          )}
+          <button className="action small" onClick={reload}>
+            刷新
+          </button>
+        </div>
+      </div>
+
+      {start.error && <Failed error={start.error} />}
+
+      {(!allReady || reopened) && (
+        <div className="panel">
+          <div className="row">
+            <DatasetPicker all={names} selected={selected} onChange={setSelected} />
+            <button
+              className="action primary"
+              disabled={start.busy}
+              onClick={() =>
+                start.run(async () => {
+                  const task = await api.startTask('download', { datasets: targets })
+                  onOpenTasks()
+                  return task
+                })
+              }
+            >
+              {start.busy ? '启动中…' : `下载并校验（${targets.length} 组）`}
+            </button>
+            {reopened && (
+              <button className="action small" onClick={() => setReopened(false)}>
+                收起
+              </button>
+            )}
+          </div>
+        </div>
       )}
-      {open && <RawSamples key={open} dataset={open} />}
+
+      <table>
+        <thead>
+          <tr>
+            <th>数据集</th>
+            <th>文件</th>
+            <th>状态</th>
+            <th className="num">体积</th>
+            <th className="num">行数</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {data.datasets.flatMap((entry) =>
+            entry.files.map((file, index) => (
+              <tr key={file.file}>
+                {index === 0 && <td rowSpan={entry.files.length}>{entry.name}</td>}
+                <td className="small mono">{file.file}</td>
+                <td>
+                  {!file.present ? (
+                    <span className="tag bad">缺失</span>
+                  ) : file.error ? (
+                    <span className="tag bad" title={file.error}>
+                      解析失败
+                    </span>
+                  ) : (
+                    <span className="tag ok">就绪</span>
+                  )}
+                </td>
+                <td className="num">
+                  {file.size_bytes ? `${(file.size_bytes / 1e6).toFixed(2)} MB` : '—'}
+                </td>
+                <td className="num">{num(file.rows)}</td>
+                {index === 0 && (
+                  <td rowSpan={entry.files.length}>
+                    <div className="row tight">
+                      {(['qa', 'corpus'] as const).map((kind) => {
+                        const open = preview?.dataset === entry.name && preview.kind === kind
+                        return (
+                          <button
+                            key={kind}
+                            className={`action small${open ? ' primary' : ''}`}
+                            disabled={!entry.files_ready}
+                            onClick={() =>
+                              setPreview(open ? null : { dataset: entry.name, kind })
+                            }
+                          >
+                            {kind === 'qa' ? '样本' : '语料'}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </td>
+                )}
+              </tr>
+            )),
+          )}
+        </tbody>
+      </table>
+
+      {preview && (
+        <RawPreview
+          key={`${preview.dataset}:${preview.kind}`}
+          dataset={preview.dataset}
+          kind={preview.kind}
+        />
+      )}
     </>
   )
 }
 
-/** 原始样例查看器。整行原样给出，不裁字段 —— 裁了就看不到上游还有哪些字段没用上。 */
-function RawSamples({ dataset }: { dataset: string }) {
+/** 原始样例，一页一条。刻意不走适配器：这里要回答的是「上游给的是什么」。 */
+function RawPreview({ dataset, kind }: { dataset: string; kind: 'qa' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
   const limit = 1
   const { data, error, loading } = useAsync(
-    () => api.rawSamples(dataset, { limit, offset }),
-    [dataset, offset],
+    () => api.rawSamples(dataset, { kind, limit, offset }),
+    [dataset, kind, offset],
   )
+
+  if (loading) return <Loading what="原始样例" />
+  if (error) return <Failed error={error} />
+  if (!data) return null
+
+  const row = data.rows[0]
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
       <div className="spread">
-        <h3 style={{ margin: 0 }}>{dataset} 的原始样例</h3>
-        {data && <span className="small muted mono">{data.source_file}</span>}
+        <h3 style={{ margin: 0 }}>
+          {dataset} 原始{kind === 'qa' ? '样本' : '语料'}
+        </h3>
+        <span className="small muted mono">{data.source_file}</span>
       </div>
-      {loading && <Loading what="样例" />}
-      {error && <Failed error={error} />}
-      {data && (
-        <>
-          {data.rows.map((row, index) => (
-            <pre key={offset + index} className="block" style={{ marginBottom: 8 }}>
-              {JSON.stringify(row, null, 2)}
-            </pre>
-          ))}
-          <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />
-        </>
-      )}
+      <pre className="block tall">{row ? JSON.stringify(row, null, 2) : '（没有内容）'}</pre>
+      <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />
     </div>
   )
 }
+
+export type { DatasetEntry }

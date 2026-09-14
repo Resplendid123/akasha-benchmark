@@ -1,36 +1,87 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { NormalizedSampleDetail } from '../types'
-import { Failed, Loading, Pager, useAction, useAsync } from '../ui'
+import {
+  CleanupButton,
+  DatasetPicker,
+  Failed,
+  Loading,
+  Pager,
+  num,
+  useAction,
+  useAsync,
+} from '../ui'
 
-/** 归一化层：适配器状态 + 归一化后的任意样本。
- *
- * **没有适配器的源无法入库。** 这不是「暂时缺个功能」：原始数据的身份规则
- * （哪个字段当 doc_id、gold 怎么解析）必须逐组核对，猜不出来 —— 按字段存在性
- * 去猜的话，数据换个版本就会静默走错分支，而症状是一个看着挺合理的指标。
- */
+/** 归一化层：入 SQLite，不入 Akasha 库。 */
 export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
-  const { data, error, loading, reload } = useAsync(() => api.adapters(), [])
-  const [dataset, setDataset] = useState<string | null>(null)
-  const deletion = useAction<void>()
-  const normalization = useAction<void>()
+  const { data, error, loading, reload } = useAsync(() => api.datasets(), [])
+  const [selected, setSelected] = useState<string[]>([])
+  const [open, setOpen] = useState<{ dataset: string; kind: 'samples' | 'corpus' } | null>(null)
+  const [reopened, setReopened] = useState(false)
+  const start = useAction<unknown>()
+  const cleanup = useAction<unknown>()
 
-  if (loading) return <Loading what="适配器状态" />
+  if (loading) return <Loading what="归一化状态" />
   if (error) return <Failed error={error} />
   if (!data) return null
 
-  const ready = data.adapters.filter((a) => a.normalized)
-  const pending = data.adapters.filter((a) => a.implemented && a.files_present && !a.normalized)
-  const normalize = (datasets: string[]) => normalization.run(async () => {
-    await api.startTask('normalize', { datasets })
-    onOpenTasks()
-  })
+  const ready = data.datasets.filter((d) => d.files_ready)
+  const targets = selected.length ? selected : ready.map((d) => d.name)
+  // 能归一化的都已入库，就不必再看这一栏；想重做由「重新归一化」显式打开。
+  const allDone = ready.length > 0 && ready.every((d) => d.normalized)
 
   return (
     <>
-      <h2>归一化</h2>
-      {deletion.error && <Failed error={deletion.error} />}
-      {normalization.error && <Failed error={normalization.error} />}
+      <div className="spread">
+        <h2>归一化</h2>
+        <div className="row tight">
+          {allDone && !reopened && (
+            <button className="action small" onClick={() => setReopened(true)}>
+              重新归一化
+            </button>
+          )}
+          <button className="action small" onClick={reload}>
+            刷新
+          </button>
+        </div>
+      </div>
+
+      {start.error && <Failed error={start.error} />}
+      {cleanup.error && <Failed error={cleanup.error} />}
+
+      {(!allDone || reopened) && (
+        <div className="panel">
+          <div className="row">
+            <DatasetPicker
+              all={ready.map((d) => d.name)}
+              selected={selected}
+              onChange={setSelected}
+            />
+            <button
+              className="action primary"
+              disabled={start.busy || targets.length === 0}
+              onClick={() =>
+                start.run(async () => {
+                  const task = await api.startTask('normalize', { datasets: targets })
+                  onOpenTasks()
+                  return task
+                })
+              }
+            >
+              {start.busy ? '启动中…' : `归一化并验收（${targets.length} 组）`}
+            </button>
+            {reopened && (
+              <button className="action small" onClick={() => setReopened(false)}>
+                收起
+              </button>
+            )}
+          </div>
+          {ready.length < data.datasets.length && (
+            <div className="note warn">
+              有 {data.datasets.length - ready.length} 组的原始文件还没就绪，请先在「数据集」页下载。
+            </div>
+          )}
+        </div>
+      )}
 
       <table>
         <thead>
@@ -38,46 +89,30 @@ export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
             <th>数据集</th>
             <th>适配器</th>
             <th>拥有的标注</th>
-            <th>原始文件</th>
-            <th>已归一化</th>
-            <th className="num">QA</th>
+            <th>身份规则</th>
+            <th>状态</th>
+            <th className="num">样本</th>
             <th className="num">语料</th>
             <th />
           </tr>
         </thead>
         <tbody>
-          {data.adapters.map((entry) => (
-            <tr key={entry.name} className={dataset === entry.name ? 'selected' : ''}>
+          {data.datasets.map((entry) => (
+            <tr key={entry.name} className={open?.dataset === entry.name ? 'selected' : ''}>
               <td>{entry.name}</td>
-              <td className="small mono muted">
-                {entry.implemented ? (
-                  <>
-                    {entry.adapter}
-                    <span className="muted"> v{entry.adapter_version}</span>
-                  </>
-                ) : (
-                  <span className="tag">预留</span>
-                )}
-              </td>
+              <td className="small mono muted">{entry.adapter}</td>
               <td>
                 {entry.provides.map((d) => (
                   <span key={d} className="tag ok">
                     {d}
                   </span>
                 ))}
+                {entry.provides.length === 0 && <span className="tag">无</span>}
               </td>
-              <td>
-                {!entry.implemented ? (
-                  <span className="tag" title={entry.blocked_reason ?? ''}>
-                    待接入
-                  </span>
-                ) : entry.files_present ? (
-                  <span className="tag ok">在位</span>
-                ) : (
-                  <span className="tag bad" title={entry.blocked_reason ?? ''}>
-                    缺文件
-                  </span>
-                )}
+              <td className="small mono muted">
+                {Object.entries(entry.identity_rules)
+                  .map(([key, rule]) => `${key}=${rule}`)
+                  .join(' ')}
               </td>
               <td>
                 {entry.normalized ? (
@@ -88,158 +123,119 @@ export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
                   <span className="tag">未入库</span>
                 )}
               </td>
-              <td className="num">{entry.qa_rows ?? '—'}</td>
-              <td className="num">{entry.corpus_rows ?? '—'}</td>
+              <td className="num">{num(entry.qa_rows)}</td>
+              <td className="num">{num(entry.corpus_rows)}</td>
               <td>
-                {!entry.normalized && entry.implemented && (
-                  <button
-                    className="action small"
-                    disabled={!entry.files_present || normalization.busy}
-                    onClick={() => normalize([entry.name])}
-                  >
-                    归一化
-                  </button>
-                )}
-                <button
-                  className="action small"
-                  disabled={!entry.normalized}
-                  onClick={() => setDataset(dataset === entry.name ? null : entry.name)}
-                >
-                  {dataset === entry.name ? '收起' : '查看'}
-                </button>
-                {entry.normalized && (
-                  <button
-                    className="action small"
-                    disabled={deletion.busy}
-                    onClick={() => {
-                      if (!window.confirm(`删除 ${entry.name} 的归一化样本和语料？原始文件会保留。`)) return
-                      deletion.run(async () => {
-                        await api.deleteDataset(entry.name)
-                        setDataset((current) => current === entry.name ? null : current)
-                        reload()
-                      })
-                    }}
-                  >
-                    删除
-                  </button>
-                )}
+                <div className="row tight">
+                  {(['samples', 'corpus'] as const).map((kind) => {
+                    const active = open?.dataset === entry.name && open.kind === kind
+                    return (
+                      <button
+                        key={kind}
+                        className={`action small${active ? ' primary' : ''}`}
+                        disabled={!entry.normalized}
+                        onClick={() =>
+                          setOpen(active ? null : { dataset: entry.name, kind })
+                        }
+                      >
+                        {kind === 'samples' ? '样本' : '语料'}
+                      </button>
+                    )
+                  })}
+                  {entry.normalized && (
+                    <CleanupButton
+                      what={`${entry.name} 的归一化产物`}
+                      detail="样本与语料会从数据库删除，原始文件保留。已被编译层引用时会拒绝。"
+                      busy={cleanup.busy}
+                      onConfirm={() =>
+                        cleanup.run(async () => {
+                          const result = await api.deleteDataset(entry.name)
+                          setOpen((c) => (c?.dataset === entry.name ? null : c))
+                          reload()
+                          return result
+                        })
+                      }
+                    />
+                  )}
+                </div>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
 
-      {data.unclaimed_files.length > 0 && (
-        <div className="note warn">
-          <strong>{data.unclaimed_files.length} 个文件没有适配器认领，无法入库。</strong>
-          <div className="small mono" style={{ marginTop: 4 }}>
-            {data.unclaimed_files.join('、')}
-          </div>
-          <div className="small" style={{ marginTop: 6 }}>
-            {data.note}
-          </div>
-        </div>
+      {open && (
+        <Browser key={`${open.dataset}:${open.kind}`} dataset={open.dataset} tab={open.kind} />
       )}
-
-      {ready.length === 0 && (
-        <div style={{ marginTop: 14 }}>
-          <button
-            className="action primary"
-            disabled={pending.length === 0 || normalization.busy}
-            onClick={() => normalize(pending.map((entry) => entry.name))}
-          >
-            {normalization.busy ? '启动中…' : '开始归一化'}
-          </button>
-        </div>
-      )}
-
-      {dataset && <SampleBrowser key={dataset} dataset={dataset} />}
     </>
   )
 }
 
-/** 归一化后的样本浏览器。可搜索，可展开看单条与它的 gold 正文。 */
-function SampleBrowser({ dataset }: { dataset: string }) {
+/** 归一化后的样本与语料。样本是一张表，一页五条；语料每条是整段正文，一页一条。 */
+function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
   const [term, setTerm] = useState('')
   const [q, setQ] = useState('')
-  const [openSample, setOpenSample] = useState<string | null>(null)
-  const limit = 5
+  const [sampleId, setSampleId] = useState<string | null>(null)
+  const limit = tab === 'samples' ? 5 : 1
 
-  const { data, error, loading } = useAsync(
-    () => api.normalizedSamples(dataset, { q, limit, offset }),
-    [dataset, q, offset],
+  const samples = useAsync(
+    () => (tab === 'samples' ? api.samples(dataset, { q, limit, offset }) : Promise.resolve(null)),
+    [dataset, tab, q, offset],
   )
+  const corpus = useAsync(
+    () => (tab === 'corpus' ? api.corpus(dataset, { q, limit, offset }) : Promise.resolve(null)),
+    [dataset, tab, q, offset],
+  )
+  const active = tab === 'samples' ? samples : corpus
 
-  const search = () => {
-    setQ(term)
-    setOffset(0)
-  }
-
-  if (openSample) {
+  if (sampleId) {
     return (
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="spread">
           <h3 style={{ margin: 0 }}>{dataset} 样本详情</h3>
-          <button className="action small" onClick={() => setOpenSample(null)}>
-            ← 返回样本列表
+          <button className="action small" onClick={() => setSampleId(null)}>
+            ← 返回列表
           </button>
         </div>
-        <SampleDetail dataset={dataset} sampleId={openSample} />
+        <SampleDetail dataset={dataset} sampleId={sampleId} />
       </div>
     )
   }
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
-      <div className="spread">
-        <h3 style={{ margin: 0 }}>{dataset} 归一化后的样本</h3>
-        {data && (
-          <span className="small muted mono">
-            {data.adapter} v{data.adapter_version}
-          </span>
-        )}
-      </div>
-
-      <div className="row" style={{ margin: '10px 0' }}>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <h3 style={{ margin: 0 }}>
+          {dataset} {tab === 'samples' ? '样本' : '语料'}
+        </h3>
         <input
-          placeholder="按问题文本或 sample_id 搜索"
+          placeholder={tab === 'samples' ? '按问题或 sample_id 搜索' : '按标题或 doc_id 搜索'}
           value={term}
           onChange={(event) => setTerm(event.target.value)}
-          onKeyDown={(event) => event.key === 'Enter' && search()}
-          style={{ minWidth: 320 }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              setQ(term)
+              setOffset(0)
+            }
+          }}
+          style={{ minWidth: 280 }}
         />
-        <button className="action" onClick={search}>
+        <button
+          className="action"
+          onClick={() => {
+            setQ(term)
+            setOffset(0)
+          }}
+        >
           搜索
         </button>
-        {q && (
-          <button
-            className="action small"
-            onClick={() => {
-              setTerm('')
-              setQ('')
-              setOffset(0)
-            }}
-          >
-            清除
-          </button>
-        )}
       </div>
 
-      {data && (
-        <p className="small muted">
-          身份规则：
-          {Object.entries(data.identity_rules).map(([key, rule]) => (
-            <span key={key} className="tag" style={{ marginLeft: 4 }}>
-              {key}={rule}
-            </span>
-          ))}
-        </p>
-      )}
+      {active.loading && <Loading what="内容" />}
+      {active.error && <Failed error={active.error} />}
 
-      {loading && <Loading what="样本" />}
-      {error && <Failed error={error} />}
-      {data && (
+      {tab === 'samples' && samples.data && (
         <>
           <table>
             <thead>
@@ -251,12 +247,8 @@ function SampleBrowser({ dataset }: { dataset: string }) {
               </tr>
             </thead>
             <tbody>
-              {data.samples.map((sample) => (
-                <tr
-                  key={sample.sample_id}
-                  className="clickable"
-                  onClick={() => setOpenSample(sample.sample_id)}
-                >
+              {samples.data.samples.map((sample) => (
+                <tr key={sample.sample_id} onClick={() => setSampleId(sample.sample_id)}>
                   <td className="small mono">{sample.dataset_sample_id}</td>
                   <td className="small">{sample.question}</td>
                   <td className="num">{sample.gold_doc_ids.length}</td>
@@ -265,28 +257,50 @@ function SampleBrowser({ dataset }: { dataset: string }) {
               ))}
             </tbody>
           </table>
-          <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />
+          <Pager
+            total={samples.data.total}
+            offset={offset}
+            limit={limit}
+            onChange={setOffset}
+          />
         </>
       )}
 
+      {tab === 'corpus' && corpus.data && (
+        <>
+          {corpus.data.docs.map((doc) => (
+            <div key={doc.doc_id}>
+              <div className="small">
+                <span className="tag accent">{doc.doc_id}</span> {doc.title}
+              </div>
+              <pre className="block tall" style={{ marginTop: 4 }}>
+                {doc.text}
+                {doc.truncated && '\n\n…（已截断）'}
+              </pre>
+            </div>
+          ))}
+          {corpus.data.docs.length === 0 && <p className="small muted">没有内容。</p>}
+          <Pager total={corpus.data.total} offset={offset} limit={limit} onChange={setOffset} />
+        </>
+      )}
     </div>
   )
 }
 
 function SampleDetail({ dataset, sampleId }: { dataset: string; sampleId: string }) {
   const { data, error, loading } = useAsync(
-    () => api.normalizedSample(dataset, sampleId),
+    () => api.sample(dataset, sampleId),
     [dataset, sampleId],
   )
-
   if (loading) return <Loading what="样本明细" />
   if (error) return <Failed error={error} />
   if (!data) return null
 
   return (
-    <div className="panel" style={{ marginTop: 12 }}>
-      <h4 style={{ marginTop: 0 }}>{data.sample_id}</h4>
+    <div style={{ marginTop: 12 }}>
       <dl className="kv">
+        <dt>sample_id</dt>
+        <dd className="mono small">{data.sample_id}</dd>
         <dt>问题</dt>
         <dd>{data.question}</dd>
         <dt>参考答案</dt>
@@ -298,32 +312,27 @@ function SampleDetail({ dataset, sampleId }: { dataset: string; sampleId: string
       {data.missing_gold_doc_ids.length > 0 && (
         <div className="note bad">
           <strong>{data.missing_gold_doc_ids.length} 个 gold doc_id 不在语料里。</strong>
-          这是身份规则出错的信号：标注指向了一篇找不到的文档。
           <div className="small mono">{data.missing_gold_doc_ids.join('、')}</div>
         </div>
       )}
 
-      <GoldDocs docs={data.gold_docs} />
+      {data.gold_docs.length === 0 ? (
+        <p className="small muted">这个数据集没有 gold 文档标注。</p>
+      ) : (
+        <>
+          <h4>gold 文档（{data.gold_docs.length} 篇）</h4>
+          {data.gold_docs.map((doc) => (
+            <div key={doc.doc_id} style={{ marginBottom: 10 }}>
+              <div className="small">
+                <span className="tag accent">{doc.doc_id}</span> {doc.title}
+              </div>
+              <pre className="block" style={{ marginTop: 4 }}>
+                {doc.text}
+              </pre>
+            </div>
+          ))}
+        </>
+      )}
     </div>
-  )
-}
-
-function GoldDocs({ docs }: { docs: NormalizedSampleDetail['gold_docs'] }) {
-  if (docs.length === 0) return <p className="small muted">这个数据集没有 gold 文档标注。</p>
-  return (
-    <>
-      <h4>gold 文档（{docs.length} 篇）</h4>
-      {docs.map((doc) => (
-        <div key={doc.doc_id} style={{ marginBottom: 10 }}>
-          <div className="small">
-            <span className="tag accent">{doc.doc_id}</span> {doc.title}
-          </div>
-          <pre className="block" style={{ marginTop: 4 }}>
-            {doc.text}
-            {doc.text_truncated && '\n\n…（已截断）'}
-          </pre>
-        </div>
-      ))}
-    </>
   )
 }
