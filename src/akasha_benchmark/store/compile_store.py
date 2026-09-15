@@ -34,6 +34,7 @@ def update_compile_run(connection: sqlite3.Connection, compile_id: int, **fields
         "space_id",
         "space_name",
         "workspace_id",
+        "config_group",
         "model_configs_json",
         "quality_json",
         "pace_json",
@@ -126,14 +127,19 @@ def compile_docs(
     *,
     pending_only: bool = False,
 ) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM compile_doc WHERE compile_id = ?"
+    sql = (
+        "SELECT cd.*, COALESCE(corpus_doc.title, '') AS title "
+        "FROM compile_doc cd "
+        "LEFT JOIN corpus_doc ON corpus_doc.dataset = cd.dataset AND corpus_doc.doc_id = cd.doc_id "
+        "WHERE cd.compile_id = ?"
+    )
     params: list[Any] = [compile_id]
     if dataset:
-        sql += " AND dataset = ?"
+        sql += " AND cd.dataset = ?"
         params.append(dataset)
     if pending_only:
         sql += " AND page_id IS NULL"
-    return [dict(r) for r in connection.execute(sql + " ORDER BY dataset, doc_id", params)]
+    return [dict(r) for r in connection.execute(sql + " ORDER BY cd.dataset, cd.doc_id", params)]
 
 
 def record_page(

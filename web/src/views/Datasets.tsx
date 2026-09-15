@@ -15,7 +15,8 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
   if (error) return <Failed error={error} />
   if (!data) return null
 
-  const names = data.datasets.map((d) => d.name)
+  // 本地数据集不在下载源里，选它没有意义，所以下载栏只列可下载的。
+  const names = data.datasets.filter((d) => d.downloadable).map((d) => d.name)
   const targets = selected.length ? selected : names
   // 全部就绪时收起下载栏，由「重新下载」显式打开。
   const allReady = data.datasets.every((d) => d.files_ready)
@@ -44,7 +45,7 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
             <DatasetPicker all={names} selected={selected} onChange={setSelected} />
             <button
               className="action primary"
-              disabled={start.busy}
+              disabled={start.busy || !targets.length}
               onClick={() =>
                 start.run(async () => {
                   const task = await api.startTask('download', { datasets: targets })
@@ -83,7 +84,9 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
                 <td className="small mono">{file.file}</td>
                 <td>
                   {!file.present ? (
-                    <span className="tag bad">缺失</span>
+                    <span className="tag bad">
+                      {entry.downloadable ? '缺失' : '缺失（本地数据集）'}
+                    </span>
                   ) : file.error ? (
                     <span className="tag bad" title={file.error}>
                       解析失败

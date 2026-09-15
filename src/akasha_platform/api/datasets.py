@@ -27,7 +27,7 @@ MAX_PAGE = 200
 
 @router.get("/datasets")
 def datasets(request: Request) -> dict[str, Any]:
-    """四组数据集的原始文件状态与归一化状态，连同各自的身份规则与 provides。"""
+    """各组数据集的原始文件状态与归一化状态，连同各自的身份规则与 provides。"""
     with db(request) as connection:
         normalized = {row["name"]: row for row in data_store.list_datasets(connection)}
 
@@ -45,6 +45,9 @@ def datasets(request: Request) -> dict[str, Any]:
                 "adapter": type(adapter).__name__,
                 "provides": sorted(d.value for d in adapter.provides),
                 "identity_rules": adapter.identity_rules(),
+                "subset_strategy": adapter.subset_strategy.value,
+                # 假就是本地数据集：下载按钮跳过它，缺文件要手动放进 dataset/。
+                "downloadable": adapter.downloadable,
                 "expected_qa_rows": adapter.expected_qa_rows(),
                 "files": files[adapter.name],
                 "files_ready": present,
@@ -117,7 +120,7 @@ def normalized_samples(
     limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
     offset: int = 0,
 ) -> dict[str, Any]:
-    """归一化后的样本。``q`` 按问题文本或 sample_id 过滤。"""
+    """归一化后的样本。``q`` 按问题文本、sample_id 或参考答案过滤。"""
     with db(request) as connection:
         if data_store.get_dataset(connection, name) is None:
             raise HTTPException(404, f"{name} 还没归一化")
@@ -128,7 +131,9 @@ def normalized_samples(
         rows = [
             r
             for r in rows
-            if needle in r["question"].lower() or needle in r["sample_id"].lower()
+            if needle in r["question"].lower()
+            or needle in r["sample_id"].lower()
+            or any(needle in str(answer).lower() for answer in r["answers"])
         ]
     return {
         "dataset": name,

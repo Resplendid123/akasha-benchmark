@@ -121,7 +121,11 @@ class FakeClient:
         return {"id": f"page-{len(self.imported)}"}
 
     def compile_spaces(self, space_ids):
-        return {"acceptedRunCount": self.accepted_runs, "coalescedRunCount": 0}
+        return {
+            "acceptedRunCount": self.accepted_runs,
+            "coalescedRunCount": 0,
+            "runs": ([{"runId": "remote-run-1", "disposition": "created"}] if self.accepted_runs else []),
+        }
 
     def run_diagnostics_summary(self, space_ids):
         return {"statusCounts": dict(self.status_counts)}
@@ -324,6 +328,102 @@ def test_compile_waits_when_runs_are_still_active(ready_connection, monkeypatch)
     assert run["status"] == run_store.STATUS_SUCCEEDED
 
 
+def test_compile_progress_uses_current_run_not_space_history(ready_connection, monkeypatch):
+    """同一空间有历史 Run 时，进度与节奏只统计本次新 Run。"""
+    from akasha_benchmark.config import AkashaConfig
+
+    class Runs(FakeClient):
+        def __init__(self, config):
+            super().__init__(config)
+            self.polls = 0
+
+        def run_diagnostics(self, space_ids, *, limit=50):
+            self.polls += 1
+            current_status = "compiling" if self.polls < 3 else "succeeded"
+            return {
+                "items": [
+                    {
+                        "runId": "old",
+                        "spaceJobSequence": 1,
+                        "status": "succeeded",
+                        "runDurationMs": 999999,
+                        "progress": {"text": {"expected": 100, "succeeded": 100}},
+                    },
+                    {
+                        "runId": "current",
+                        "spaceJobSequence": 2,
+                        "status": current_status,
+                        "runDurationMs": 2000,
+                        "progress": {
+                            "text": {
+                                "expected": 4,
+                                "succeeded": 2 if current_status == "compiling" else 4,
+                                "failed": 0,
+                                "skipped": 0,
+                            }
+                        },
+                    },
+                ]
+            }
+
+    client = Runs(None)
+    result = compile._wait_for_compile(
+        context(ready_connection, {}),
+        client,
+        "space-1",
+        AkashaConfig(poll_interval_seconds=0, poll_timeout_seconds=1),
+        expect_runs=1,
+        baseline_run_ids={"old"},
+        baseline_sequence=1,
+    )
+    assert result["status_counts"] == {"succeeded": 1}
+    assert result["runs"][0]["runId"] == "current"
+
+
+def test_compile_does_not_finish_on_historical_run_before_new_run_appears(ready_connection):
+    """accepted Run 尚未出现在诊断列表时，不能拿历史 succeeded 冒充本次完成。"""
+    from akasha_benchmark.config import AkashaConfig
+
+    class Delayed(FakeClient):
+        def __init__(self, config):
+            super().__init__(config)
+            self.polls = 0
+
+        def run_diagnostics(self, space_ids, *, limit=50):
+            self.polls += 1
+            items = [
+                {
+                    "runId": "old",
+                    "spaceJobSequence": 1,
+                    "status": "succeeded",
+                    "progress": {"text": {"expected": 100, "succeeded": 100}},
+                }
+            ]
+            if self.polls > 1:
+                items.append(
+                    {
+                        "runId": "current",
+                        "spaceJobSequence": 2,
+                        "status": "succeeded",
+                        "progress": {"text": {"expected": 4, "succeeded": 4}},
+                    }
+                )
+            return {"items": items}
+
+    client = Delayed(None)
+    result = compile._wait_for_compile(
+        context(ready_connection, {}),
+        client,
+        "space-1",
+        AkashaConfig(poll_interval_seconds=0, poll_timeout_seconds=1),
+        expect_runs=1,
+        baseline_run_ids={"old"},
+        baseline_sequence=1,
+    )
+    assert client.polls == 2
+    assert result["runs"][0]["runId"] == "current"
+
+
 def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
     clients: list[FakeClient] = []
 
@@ -342,6 +442,9 @@ def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
     docs = compile_store.compile_docs(ready_connection, int(run["id"]))
     assert docs and all(doc["page_id"] for doc in docs)
     assert len(clients[0].imported) == len(docs)
+    assert task_store.get_task(ready_connection, ctx.task_id)["params"][
+        "remote_compile_run_ids"
+    ] == ["remote-run-1"]
     assert compile_store.compile_ready(ready_connection, int(run["id"]))["ready"] is True
 
 
@@ -349,7 +452,17 @@ def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
     clients: list[FakeClient] = []
 
     def factory(config):
-        client = FakeClient(config)
+        remote_run_id = f"remote-run-{len(clients) + 1}"
+
+        class Resumable(FakeClient):
+            def compile_spaces(self, space_ids):
+                return {
+                    "acceptedRunCount": 1,
+                    "coalescedRunCount": 0,
+                    "runs": [{"runId": remote_run_id, "disposition": "created"}],
+                }
+
+        client = Resumable(config)
         clients.append(client)
         return client
 
@@ -363,6 +476,9 @@ def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
     execute(compile.run, ctx)
     assert clients[1].imported == []
     assert first > 0
+    assert task_store.get_task(ready_connection, ctx.task_id)["params"][
+        "remote_compile_run_ids"
+    ] == ["remote-run-2"]
 
 
 # ------------------------------------------------------------ 查询闸门

@@ -130,6 +130,36 @@ def test_not_a_failure_outranks_every_failure_cause():
         assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
 
 
+def test_fully_supported_answer_is_not_a_failure_even_with_long_context():
+    """解释性答案完整包含参考答案时，不应因严格 EM 落到 unknown。"""
+    sample = _sample(
+        {
+            "em": 0.0,
+            "f1": 0.35,
+            "faithfulness": 1.0,
+            "hit@5": 1.0,
+            "full_coverage@5": 1.0,
+            "truncated_gold": 1.0,
+        }
+    )
+    sample["answer"] = (
+        "Roger Capellani died during the Battle of Dunkirk, which was fought "
+        "between the Allies and Nazi Germany."
+    )
+    sample["detail"]["reference_answers"] = ["the Allies and Nazi Germany"]
+    ruling = attribution.classify(sample, [])
+    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+    assert ruling["evidence"]["reference_answer_contained"] is True
+
+
+def test_faithfulness_alone_does_not_prove_answer_correctness():
+    ruling = attribution.classify(
+        _sample({"faithfulness": 1.0, "hit@5": 1.0, "full_coverage@5": 1.0}),
+        [],
+    )
+    assert ruling["root_cause"] != attribution.CAUSE_NOT_A_FAILURE
+
+
 def test_high_f1_alone_does_not_clear_a_sample():
     """高词汇重叠率不足以判定答案正确。"""
     ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 0.0, "f1": 0.9}), [])

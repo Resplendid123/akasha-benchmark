@@ -12,8 +12,10 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from akasha_benchmark.akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
+from akasha_benchmark.config import load_config
 from akasha_benchmark.stages import STAGES, chain, clean_params
-from akasha_benchmark.store import connect, task_store
+from akasha_benchmark.store import compile_store, connect, task_store
 from akasha_benchmark.task import Paused, TaskContext, execute
 
 from .settings import Settings
@@ -139,6 +141,7 @@ class TaskRunner:
                 raise TaskRejected(f"任务 #{task_id} 不存在")
             if task["status"] not in task_store.ACTIVE:
                 raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，不在运行")
+            self._cancel_remote_compile(connection, task, "Akasha-Benchmark task paused")
             with self._lock:
                 event = self._pauses.get(task_id)
             if event is None:
@@ -164,6 +167,16 @@ class TaskRunner:
         connection = connect(self.settings.db_path)
         try:
             try:
+                targets = (
+                    [task_store.get_task(connection, task_id)]
+                    if task_id is not None
+                    else task_store.list_tasks(connection, limit=500)
+                )
+                for task in targets:
+                    if task and task["status"] not in task_store.ACTIVE:
+                        self._cancel_remote_compile(
+                            connection, task, "Akasha-Benchmark task cleaned up"
+                        )
                 deleted = (
                     task_store.delete_task(connection, task_id)
                     if task_id is not None
@@ -177,6 +190,45 @@ class TaskRunner:
             connection.close()
 
     # --- 内部 ---
+
+    def _cancel_remote_compile(
+        self, connection, task: dict[str, Any], reason: str
+    ) -> None:
+        if task.get("stage") != "compile":
+            return
+        run_ids = task.get("params", {}).get("remote_compile_run_ids") or []
+        try:
+            with AkashaClient(load_config(connection)) as client:
+                client.login()
+                if not run_ids and task.get("target_kind") == "compile":
+                    compile_run = compile_store.get_compile_run(
+                        connection, int(task.get("target_id") or 0)
+                    )
+                    space_id = (compile_run or {}).get("space_id")
+                    if space_id:
+                        diagnostics = client.run_diagnostics([space_id], limit=50)
+                        run_ids = [
+                            str(run["runId"])
+                            for run in diagnostics.get("items") or []
+                            if run.get("runId")
+                            and str(run.get("status")) in ACTIVE_RUN_STATUSES
+                        ]
+                for run_id in run_ids:
+                    result = client.cancel_compile_run(str(run_id), reason)
+                    task_store.log(
+                        connection,
+                        task_id=int(task["id"]),
+                        stage="compile",
+                        level="info",
+                        message=(
+                            f"远端编译 Run {run_id} 已处理：{result.get('disposition', 'unknown')}，"
+                            f"清理 BullMQ job {result.get('removedJobCount', 0)} 个"
+                        ),
+                    )
+            connection.commit()
+        except (AkashaError, ValueError) as exc:
+            connection.rollback()
+            raise TaskRejected(f"远端编译 Run 取消失败，本地状态未变：{exc}") from exc
 
     def _require_free(self, connection, stage: str) -> None:
         for task in task_store.active_tasks(connection):

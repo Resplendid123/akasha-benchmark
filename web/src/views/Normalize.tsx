@@ -210,7 +210,7 @@ function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' 
           {dataset} {tab === 'samples' ? '样本' : '语料'}
         </h3>
         <input
-          placeholder={tab === 'samples' ? '按问题或 sample_id 搜索' : '按标题或 doc_id 搜索'}
+          placeholder={tab === 'samples' ? '按问题、答案或 sample_id 搜索' : '按标题或 doc_id 搜索'}
           value={term}
           onChange={(event) => setTerm(event.target.value)}
           onKeyDown={(event) => {

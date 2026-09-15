@@ -14,7 +14,6 @@ CONNECTION_FIELDS = (
     "password",
     "database_url",
     "timeout_seconds",
-    "concurrency",
     "request_interval_seconds",
     "poll_interval_seconds",
     "poll_timeout_seconds",
@@ -26,7 +25,7 @@ _FLOATS = {
     "poll_interval_seconds",
     "poll_timeout_seconds",
 }
-_INTS = {"concurrency"}
+_INTS: set[str] = set()
 
 ROLES = ("judge", "attribution")
 
@@ -36,9 +35,6 @@ _HOST_URLS = {"base_url", "database_url"}
 
 def _prefer_ipv4(url: str) -> str:
     """把主机名恰好是 ``localhost`` 的换成 ``127.0.0.1``。
-
-    Windows 上 ``localhost`` 会先解析到 ``::1``，而服务通常只听 IPv4，
-    于是每个请求都要先等 ``::1`` 被拒。写 ``[::1]`` 的不动。
     """
     parts = urlsplit(url)
     if parts.hostname != "localhost":
@@ -96,6 +92,7 @@ def upsert_provider(
     base_url: str,
     model: str,
     api_key: str,
+    concurrency: int = 1,
     provider_id: int | None = None,
 ) -> int:
     """存一个端点。给了 ``provider_id`` 就改那一行（可改 label），否则按
@@ -106,24 +103,26 @@ def upsert_provider(
         connection.execute(
             """
             UPDATE model_provider
-               SET label = ?, base_url = ?, model = ?, api_key = ?, updated_at = ?
+               SET label = ?, base_url = ?, model = ?, api_key = ?,
+                   concurrency = ?, updated_at = ?
              WHERE id = ? AND role = ?
             """,
-            (label, base_url, model, api_key, utc_now(), provider_id, role),
+            (label, base_url, model, api_key, concurrency, utc_now(), provider_id, role),
         )
         return provider_id
     connection.execute(
         """
         INSERT INTO model_provider
-            (role, label, base_url, model, api_key, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (role, label, base_url, model, api_key, concurrency, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(role, label) DO UPDATE SET
             base_url = excluded.base_url,
             model = excluded.model,
             api_key = excluded.api_key,
+            concurrency = excluded.concurrency,
             updated_at = excluded.updated_at
         """,
-        (role, label, base_url, model, api_key, utc_now()),
+        (role, label, base_url, model, api_key, concurrency, utc_now()),
     )
     row = connection.execute(
         "SELECT id FROM model_provider WHERE role = ? AND label = ?", (role, label)
@@ -147,3 +146,69 @@ def get_provider(connection: sqlite3.Connection, provider_id: int) -> dict[str, 
 
 def delete_provider(connection: sqlite3.Connection, provider_id: int) -> int:
     return connection.execute("DELETE FROM model_provider WHERE id = ?", (provider_id,)).rowcount
+
+
+# --- Akasha 模型配置组 ---
+
+
+def list_config_groups(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM akasha_config_group ORDER BY label"
+    return [dict(row) for row in connection.execute(sql)]
+
+
+def get_config_group(connection: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT * FROM akasha_config_group WHERE id = ?", (group_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def selected_config_group(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT * FROM akasha_config_group WHERE selected = 1 LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_config_group(
+    connection: sqlite3.Connection,
+    *,
+    label: str,
+    configs_json: str,
+    group_id: int | None = None,
+) -> int:
+    """存一组配置。给了 ``group_id`` 就改那一行（可改 label），否则按 label 认行。"""
+    if group_id is not None:
+        connection.execute(
+            "UPDATE akasha_config_group SET label = ?, configs_json = ?, updated_at = ? WHERE id = ?",
+            (label, configs_json, utc_now(), group_id),
+        )
+        return group_id
+    connection.execute(
+        """
+        INSERT INTO akasha_config_group (label, configs_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(label) DO UPDATE SET
+            configs_json = excluded.configs_json,
+            updated_at = excluded.updated_at
+        """,
+        (label, configs_json, utc_now()),
+    )
+    row = connection.execute(
+        "SELECT id FROM akasha_config_group WHERE label = ?", (label,)
+    ).fetchone()
+    return int(row["id"])
+
+
+def delete_config_group(connection: sqlite3.Connection, group_id: int) -> int:
+    return connection.execute(
+        "DELETE FROM akasha_config_group WHERE id = ?", (group_id,)
+    ).rowcount
+
+
+def set_selected_group(connection: sqlite3.Connection, group_id: int) -> None:
+    """置本组为选中，清掉其它组的选中。"""
+    connection.execute("UPDATE akasha_config_group SET selected = 0 WHERE selected = 1")
+    connection.execute(
+        "UPDATE akasha_config_group SET selected = 1 WHERE id = ?", (group_id,)
+    )

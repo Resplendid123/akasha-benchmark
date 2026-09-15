@@ -9,6 +9,7 @@ from .models import (
     CorpusDoc,
     DataDependency,
     DependencyError,
+    SubsetStrategy,
     make_sample_id,
 )
 from .registry import ADAPTER_CLASSES, DATASET_NAMES, all_adapters, get_adapter
@@ -26,6 +27,7 @@ __all__ = [
     "DatasetAdapter",
     "DependencyError",
     "ResolvedDataset",
+    "SubsetStrategy",
     "all_adapters",
     "get_adapter",
     "load_corpus",

@@ -22,6 +22,42 @@ from ._common import db, public_run, reject_if_busy, writable
 router = APIRouter(prefix="/api")
 
 
+@router.get("/evals/{eval_id}/samples")
+def eval_samples(
+    request: Request,
+    eval_id: int,
+    dataset: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """评测样本列表；逐条原始 LLM 响应在样本详情里按需读取。"""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    with db(request) as connection:
+        if eval_store.get_eval_run(connection, eval_id) is None:
+            raise HTTPException(404, f"评测 #{eval_id} 不存在")
+        rows = eval_store.sample_evals(connection, eval_id, dataset=dataset)
+        verdicts = eval_store.judge_verdicts(connection, eval_id, include_detail=False)
+        by_sample: dict[str, list[dict[str, Any]]] = {}
+        for verdict in verdicts:
+            summary = {**verdict, "detail": None}
+            by_sample.setdefault(verdict["sample_id"], []).append(summary)
+        samples = [
+            {
+                "sample_id": row["sample_id"],
+                "dataset": row["dataset"],
+                "question": row["detail"].get("question", ""),
+                "answer_mode": row["answer_mode"],
+                "http_status": row["http_status"],
+                "answer": row["answer"],
+                "metrics": eval_store.sample_metrics_of(connection, eval_id, row["sample_id"]),
+                "judge_verdicts": by_sample.get(row["sample_id"], []),
+            }
+            for row in rows[offset : offset + limit]
+        ]
+    return {"eval_id": eval_id, "total": len(rows), "offset": offset, "limit": limit, "samples": samples}
+
+
 @router.get("/evals/{eval_id}")
 def eval_detail(request: Request, eval_id: int) -> dict[str, Any]:
     """一次评测的全部汇总，按数据集与 scope 组织。"""
@@ -147,4 +183,11 @@ def lineage(request: Request, page_id: str, question: str = "") -> dict[str, Any
         raise HTTPException(503, str(exc)) from exc
     except BadPageId as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {**textdiff.build(chain, question), "base_url": config.base_url}
+    return {
+        **textdiff.build(chain, question),
+        "base_url": config.base_url,
+        # 逐块原始数据，供前端分页并标注 artifact / chunk。
+        "artifacts": chain["artifacts"],
+        "chunks": chain["chunks"],
+        "source_chunks": chain["source_chunks"],
+    }

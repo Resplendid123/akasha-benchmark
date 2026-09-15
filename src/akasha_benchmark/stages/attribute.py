@@ -11,17 +11,29 @@ from typing import Any
 
 from .. import attribution, textdiff
 from ..config import load_config
-from ..judge.client import JudgeClient, JudgeConfigError, parse_json_object
+from ..judge.client import JudgeConfigError, complete_many, parse_json_object
 from ..judge.providers import resolve_provider
 from ..lineage import BadPageId, LineageReader, LineageUnavailable
 from ..metrics import registry
-from ..store import attribution_store, compile_store, eval_store, query_store
+from ..store import attribution_store, compile_store, eval_store, loads, query_store
 from ..task import TaskContext
 
-DEFAULT_METRIC = "recall@5"
 DEFAULT_LIMIT = 10
-# 带模型的归因每条一次 LLM 调用，所以给条数设上限。
-MAX_LIMIT = 50
+MAX_LIMIT = 1000
+
+
+def _default_metric(eval_run: dict[str, Any]) -> str:
+    """选本次评测实际产出的第一个指标，避免依赖固定的 recall@5。"""
+    metrics = loads(eval_run.get("metrics_json"), [])
+    ks = loads(eval_run.get("ks_json"), [])
+    for name in metrics:
+        definition = registry.get_metric(name)
+        if definition.per_k:
+            if ks:
+                return f"{name}@{ks[0]}"
+        else:
+            return name
+    raise ValueError("这次评测没有可用于归因的指标")
 
 
 def _lineage_of(
@@ -76,7 +88,7 @@ def run(ctx: TaskContext) -> None:
         raise ValueError("这次评测对应的查询记录已不存在")
     compile_id = int(query_run["compile_id"])
 
-    metric = str(params.get("metric") or DEFAULT_METRIC)
+    metric = str(params.get("metric") or _default_metric(eval_run))
     try:
         definition = registry.get_metric(metric)
     except KeyError as exc:
@@ -158,18 +170,17 @@ def _analyze(
         ctx.log(f"续跑：已归因 {len(already)} 条，待归因 {len(todo)} 条")
 
     page_maps: dict[str, dict[str, str]] = {}
-    for position, row in enumerate(todo, 1):
-        ctx.checkpoint()
+
+    def prepare(row: dict[str, Any]) -> dict[str, Any] | None:
+        """主线程：读样本、算规则结论、拼 prompt。返回一条待落库的记录。"""
         dataset = row["dataset"]
         sample = eval_store.sample_eval(ctx.db, eval_id, row["sample_id"])
         if sample is None:
-            continue
+            return None
         sample["metrics"] = eval_store.sample_metrics_of(ctx.db, eval_id, row["sample_id"])
-
         if dataset not in page_maps:
             page_to_doc = compile_store.page_to_doc(ctx.db, compile_id, dataset)
             page_maps[dataset] = {doc: page for page, doc in page_to_doc.items()}
-
         lineage = _lineage_of(
             reader,
             list(sample["detail"].get("gold_doc_ids") or []),
@@ -177,42 +188,53 @@ def _analyze(
             sample["detail"].get("question") or "",
         )
         ruling = attribution.classify(sample, lineage)
+        prompt = attribution.build_prompt(sample, ruling, lineage) if provider is not None else None
+        return {"row": row, "dataset": dataset, "ruling": ruling, "prompt": prompt}
 
-        narrative: str | None = None
-        rule_based = True
-        latency_ms: int | None = None
-        if provider is not None:
-            system, user = attribution.build_prompt(sample, ruling, lineage)
-            with JudgeClient(provider) as client:
-                reply = client.complete(system, user)
-            latency_ms = reply.latency_ms
-            if reply.failure_kind:
-                ruling["evidence"]["model_error"] = reply.failure_kind
-            else:
-                try:
-                    payload = parse_json_object(reply.content or "")
-                except ValueError as exc:
-                    # 模型没按 schema 输出，规则结论照样写。
-                    ruling["evidence"]["model_error"] = f"parse_error: {exc}"
-                else:
-                    narrative = str(payload.get("narrative") or "").strip() or None
-                    ruling["evidence"]["model"] = {
-                        "contributing_factors": payload.get("contributing_factors"),
-                        "disagreement": payload.get("disagreement"),
-                        "confidence": payload.get("confidence"),
-                    }
-                    rule_based = False
-
-        attribution_store.record_attribution(
-            ctx.db,
-            attribution_id,
-            sample_id=row["sample_id"],
-            dataset=dataset,
-            root_cause=ruling["root_cause"],
-            evidence=ruling["evidence"],
-            narrative=narrative,
-            rule_based=rule_based,
-            latency_ms=latency_ms,
+    concurrency = max(1, provider.concurrency) if provider is not None else 1
+    done = 0
+    for start in range(0, len(todo), concurrency):
+        ctx.checkpoint()
+        batch = [p for p in (prepare(row) for row in todo[start : start + concurrency]) if p]
+        replies = (
+            complete_many(provider, [p["prompt"] for p in batch], concurrency)
+            if provider is not None
+            else [None] * len(batch)
         )
+        for item, reply in zip(batch, replies):
+            ruling = item["ruling"]
+            narrative: str | None = None
+            rule_based = True
+            latency_ms: int | None = None
+            if reply is not None:
+                latency_ms = reply.latency_ms
+                if reply.failure_kind:
+                    ruling["evidence"]["model_error"] = reply.failure_kind
+                else:
+                    try:
+                        payload = parse_json_object(reply.content or "")
+                    except ValueError as exc:
+                        # 模型没按 schema 输出，规则结论照样写。
+                        ruling["evidence"]["model_error"] = f"parse_error: {exc}"
+                    else:
+                        narrative = str(payload.get("narrative") or "").strip() or None
+                        ruling["evidence"]["model"] = {
+                            "contributing_factors": payload.get("contributing_factors"),
+                            "disagreement": payload.get("disagreement"),
+                            "confidence": payload.get("confidence"),
+                        }
+                        rule_based = False
+            attribution_store.record_attribution(
+                ctx.db,
+                attribution_id,
+                sample_id=item["row"]["sample_id"],
+                dataset=item["dataset"],
+                root_cause=ruling["root_cause"],
+                evidence=ruling["evidence"],
+                narrative=narrative,
+                rule_based=rule_based,
+                latency_ms=latency_ms,
+            )
         ctx.db.commit()
-        ctx.progress(position, len(todo), "归因")
+        done += len(todo[start : start + concurrency])
+        ctx.progress(done, len(todo), "归因")

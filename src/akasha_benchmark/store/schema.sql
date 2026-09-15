@@ -4,11 +4,10 @@
 CREATE TABLE IF NOT EXISTS akasha_connection (
     id                       INTEGER PRIMARY KEY CHECK (id = 1),
     base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3000',
-    email                    TEXT NOT NULL DEFAULT '',
-    password                 TEXT NOT NULL DEFAULT '',
-    database_url             TEXT NOT NULL DEFAULT '',  -- 只读 PG，归因链路用
+    email                    TEXT NOT NULL DEFAULT 'test@example.com',
+    password                 TEXT NOT NULL DEFAULT '12345678',
+    database_url             TEXT NOT NULL DEFAULT 'postgresql://akasha:STRONG_DB_PASSWORD@127.0.0.1:5432/akasha',  -- 只读 PG，归因链路用
     timeout_seconds          REAL NOT NULL DEFAULT 180.0,
-    concurrency              INTEGER NOT NULL DEFAULT 1, -- query并发
     request_interval_seconds REAL NOT NULL DEFAULT 0.5,
     poll_interval_seconds    REAL NOT NULL DEFAULT 10.0, -- 编译轮询间隔
     poll_timeout_seconds     REAL NOT NULL DEFAULT 7200.0,
@@ -24,8 +23,18 @@ CREATE TABLE IF NOT EXISTS model_provider (
     base_url    TEXT NOT NULL,
     model       TEXT NOT NULL,
     api_key     TEXT NOT NULL DEFAULT '',
+    concurrency INTEGER NOT NULL DEFAULT 1,  -- judge / 归因调用的并发数
     updated_at  TEXT NOT NULL,
     UNIQUE (role, label)
+);
+
+-- 本地保存的 Akasha 模型配置组，可整组应用到远端。apiKey 明文存在 configs_json 里。
+CREATE TABLE IF NOT EXISTS akasha_config_group (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT NOT NULL UNIQUE,
+    configs_json TEXT NOT NULL,   -- {feature: {model, baseUrl, apiKey, parameters}}
+    selected     INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL
 );
 
 -- --------------------------------------------- 数据集层 / 归一化层
@@ -69,6 +78,7 @@ CREATE TABLE IF NOT EXISTS compile_run (
     space_id           TEXT,             -- 本次编译随机创建的空间；查询打在它上面
     space_name         TEXT,             -- 随机 slug，只做展示与人工核对
     workspace_id       TEXT,             -- 那个空间属于哪个 workspace
+    config_group       TEXT,             -- 编译时选中的本地配置组标签
     model_configs_json TEXT,             -- 这一次编译跑在什么模型上
     quality_json       TEXT,             -- missingChunk / missingEmbedding / missingSource / stalePageCount
     pace_json          TEXT,             -- 每篇编译耗时的估算，见 _compile_pace

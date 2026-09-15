@@ -163,12 +163,14 @@ def test_verdicts_are_stored_per_metric(db, eval_id):
             metric=name,
             score=score,
             failure_kind=None,
-            detail=None,
+            detail={"raw_response": f"raw-{name}"},
         )
     db.commit()
 
     verdicts = {v["metric"]: v["score"] for v in eval_store.judge_verdicts(db, eval_id)}
     assert verdicts == {"faithfulness": 0.5, "answer_relevancy": 1.0}
+    assert eval_store.judge_verdicts(db, eval_id)[0]["detail"]["raw_response"]
+    assert eval_store.judge_verdicts(db, eval_id, include_detail=False)[0]["detail"] is None
 
 
 def test_resume_is_per_metric(db, eval_id):

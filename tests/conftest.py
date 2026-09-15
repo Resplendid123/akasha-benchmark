@@ -68,6 +68,44 @@ def dataset_dir(tmp_path: Path) -> Path:
     return directory
 
 
+# itfaq 形状：QA 只有 {id, question, answer}，语料 {id, title, text} 且正文自带 H1。
+ITFAQ_QA_ROWS = [
+    {"id": "qa_001", "question": "怎么申请手机？", "answer": "走 IT 设备申请流程。"},
+    {"id": "qa_002", "question": "显卡坏了怎么换？", "answer": "到 IT 现场登记后更换。"},
+    {"id": "qa_003", "question": "邮箱客户端登不上？", "answer": "改用客户端专用密码。"},
+]
+
+ITFAQ_CORPUS_ROWS = [
+    {"id": "doc_001", "title": "设备申请说明", "text": "# 设备申请说明\n\n填写申请单即可。"},
+    {"id": "doc_002", "title": "邮箱配置说明", "text": "# 邮箱配置说明\n\nIMAP 用 993 端口。"},
+]
+
+
+@pytest.fixture
+def itfaq_dataset_dir(tmp_path: Path) -> Path:
+    """itfaq 形状的原始文件。行数与适配器预期不符，所以测试要绕开行数校验。"""
+    directory = tmp_path / "itfaq"
+    directory.mkdir()
+    (directory / "itfaq.json").write_text(
+        json.dumps(ITFAQ_QA_ROWS, ensure_ascii=False), encoding="utf-8"
+    )
+    (directory / "itfaq_corpus.json").write_text(
+        json.dumps(ITFAQ_CORPUS_ROWS, ensure_ascii=False), encoding="utf-8"
+    )
+    return directory
+
+
+@pytest.fixture
+def itfaq_normalized(db, itfaq_dataset_dir: Path, monkeypatch):
+    """把假 itfaq 归一化进库，返回连接。"""
+    from akasha_benchmark.datasets.itfaq import ITFaqAdapter
+    from akasha_benchmark.stages import normalize
+
+    monkeypatch.setattr(ITFaqAdapter, "expected_qa_rows", lambda self: None)
+    normalize.normalize_dataset(db, "itfaq", None, itfaq_dataset_dir)
+    return db
+
+
 @pytest.fixture
 def normalized(db, dataset_dir: Path, monkeypatch):
     """把假数据集归一化进库，返回连接。"""

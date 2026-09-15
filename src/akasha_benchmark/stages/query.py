@@ -33,7 +33,6 @@ def _query_one(
         status, body, latency = response.status, response.body, response.latency_ms
         error = None
     except (AkashaError, httpx.RequestError, OSError) as exc:
-        # httpx.RequestError 不是 OSError 的子类，要单独列，否则网络抖动会让整个阶段崩掉。
         status, body, latency, error = 0, None, None, f"{type(exc).__name__}: {exc}"
 
     return {
@@ -88,7 +87,7 @@ def run(ctx: TaskContext) -> None:
 
     config = load_config(ctx.db)
     config.require_credentials()
-    concurrency = max(1, int(params.get("concurrency") or config.concurrency))
+    concurrency = max(1, int(params.get("concurrency") or 3))
 
     with AkashaClient(config) as client:
         client.login()

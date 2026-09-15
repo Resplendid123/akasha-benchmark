@@ -1,6 +1,14 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { CompileRun, EvalDetail, MetricsView, Provider, QueryRun } from '../types'
+import type {
+  CompileRun,
+  EvalDetail,
+  EvalSampleDetail,
+  EvalSampleList,
+  MetricsView,
+  Provider,
+  QueryRun,
+} from '../types'
 import {
   CleanupButton,
   Failed,
@@ -406,6 +414,123 @@ function Results({ evalId }: { evalId: number }) {
           )}
 
           <ScopeTable scopes={entry.scopes} />
+        </div>
+      ))}
+
+      <SampleResults evalId={evalId} dataset={dataset} />
+    </div>
+  )
+}
+
+function SampleResults({ evalId, dataset }: { evalId: number; dataset: string }) {
+  const [offset, setOffset] = useState(0)
+  const [openSample, setOpenSample] = useState<string | null>(null)
+  const limit = 5
+  const samples = useAsync<EvalSampleList>(
+    () => api.evalSamples(evalId, { dataset: dataset || undefined, limit, offset }),
+    [evalId, dataset, offset],
+  )
+
+  useEffect(() => {
+    setOffset(0)
+    setOpenSample(null)
+  }, [dataset])
+
+  // 原始响应覆盖整个样本列表，带返回按钮。
+  if (openSample) {
+    return (
+      <div style={{ marginTop: 18 }}>
+        <div className="spread">
+          <h4 style={{ margin: 0 }}>样本 {openSample}</h4>
+          <button className="action small" onClick={() => setOpenSample(null)}>
+            ← 返回样本列表
+          </button>
+        </div>
+        <EvalSampleView key={openSample} evalId={evalId} sampleId={openSample} />
+      </div>
+    )
+  }
+
+  if (samples.loading) return <Loading what="评测样本" />
+  if (samples.error) return <Failed error={samples.error} />
+  if (!samples.data || samples.data.total === 0) return null
+
+  return (
+    <div style={{ marginTop: 18 }}>
+      <h4>逐样本结果（展开查看 LLM 原始响应）</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>sample_id</th>
+            <th>问题</th>
+            <th>答案模式</th>
+            <th>指标</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {samples.data.samples.map((sample) => (
+            <tr key={sample.sample_id}>
+              <td className="mono small">{sample.sample_id}</td>
+              <td className="small">{sample.question}</td>
+              <td><ModeTag mode={sample.answer_mode} /></td>
+              <td className="small mono">{JSON.stringify(sample.metrics)}</td>
+              <td>
+                <button className="action small" onClick={() => setOpenSample(sample.sample_id)}>
+                  原始响应
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="row tight" style={{ marginTop: 8 }}>
+        <button
+          className="action small"
+          disabled={offset === 0}
+          onClick={() => setOffset(Math.max(0, offset - limit))}
+        >
+          上一页
+        </button>
+        <span className="small muted">
+          {offset + 1}–{Math.min(offset + limit, samples.data.total)} / {samples.data.total}
+        </span>
+        <button
+          className="action small"
+          disabled={offset + limit >= samples.data.total}
+          onClick={() => setOffset(offset + limit)}
+        >
+          下一页
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function EvalSampleView({ evalId, sampleId }: { evalId: number; sampleId: string }) {
+  const detail = useAsync<EvalSampleDetail>(() => api.evalSample(evalId, sampleId), [evalId, sampleId])
+  if (detail.loading) return <Loading what="样本明细" />
+  if (detail.error) return <Failed error={detail.error} />
+  if (!detail.data) return null
+  return (
+    <div className="panel flat" style={{ marginTop: 10 }}>
+      <dl className="kv">
+        <dt>问题</dt><dd>{detail.data.detail.question as string}</dd>
+        <dt>参考答案</dt>
+        <dd>{((detail.data.detail.reference_answers as string[]) ?? []).join(' / ') || '—'}</dd>
+        <dt>系统答案</dt><dd>{detail.data.answer || '—'}</dd>
+      </dl>
+      {detail.data.judge_verdicts.map((verdict) => (
+        <div key={verdict.metric} style={{ marginTop: 10 }}>
+          <strong>{verdict.metric}</strong>
+          <span className="tag" style={{ marginLeft: 6 }}>{verdict.score ?? verdict.failure_kind ?? '无定义'}</span>
+          <pre className="block tall" style={{ marginTop: 6 }}>
+            {String(
+              verdict.detail?.raw_response ??
+                verdict.detail?.raw_http_response ??
+                '（没有保存原始响应）',
+            )}
+          </pre>
         </div>
       ))}
     </div>

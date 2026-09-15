@@ -6,7 +6,8 @@
     2. 这些 QA 的 gold 全集作为语料必选集
     3. 从剩余语料随机补负样本
 
-narrativeqa 没有 gold 标注，改成整篇取文档，再取属于这些文档的问题。
+没有 gold 标注的两组走别的路，各自由适配器的 ``subset_strategy`` 声明：
+narrativeqa 整篇取文档再取属于这些文档的问题；itfaq 没有指回文档的字段，语料整份导入。
 
 一次编译一个空间，``run_id`` 固化这次的配置与模型快照。导入逐条提交，
 所以暂停后继续时跳过已导入的文档。
@@ -15,6 +16,7 @@ narrativeqa 没有 gold 标注，改成整篇取文档，再取属于这些文�
 from __future__ import annotations
 
 import random
+import re
 import sqlite3
 import time
 import uuid
@@ -24,17 +26,25 @@ from typing import Any
 
 from ..akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
 from ..config import AkashaConfig, load_config
-from ..datasets import DATASET_NAMES, CorpusDoc, DataDependency, get_adapter
-from ..store import compile_store, data_store, dumps, transaction
+from ..datasets import (
+    DATASET_NAMES,
+    CorpusDoc,
+    DataDependency,
+    SubsetStrategy,
+    get_adapter,
+)
+from ..store import compile_store, config_store, data_store, dumps, transaction
 from ..task import TaskContext
 
 DEFAULT_QA_LIMIT = 20
 DEFAULT_NEGATIVES_RATIO = 1.0
 DEFAULT_NARRATIVEQA_DOCS = 2
+_MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MARKDOWN_HEADING = re.compile(r"^\s*#+\s*.*$", re.MULTILINE)
 
 
 def default_seed() -> int:
-    """当天日期，形如 20260908。同一天起的编译抽同一批。"""
+    """当天日期，形如 20260915。同一天起的编译抽同一批。"""
     return int(datetime.now(UTC).strftime("%Y%m%d"))
 
 
@@ -82,6 +92,13 @@ def _safe_doc_id(doc_id: str) -> str:
     return doc_id
 
 
+def _has_indexable_text(text: str) -> bool:
+    """判断正文是否除标题、图片外仍有可编译文本。"""
+    body = _MARKDOWN_IMAGE.sub("", text or "")
+    body = _MARKDOWN_HEADING.sub("", body)
+    return bool(body.strip())
+
+
 def build_subset(
     connection: sqlite3.Connection,
     compile_id: int,
@@ -90,6 +107,7 @@ def build_subset(
     seed: int,
     qa_limit: int,
     negatives_ratio: float,
+    full_corpus: bool = False,
     narrativeqa_docs: int = DEFAULT_NARRATIVEQA_DOCS,
 ) -> dict[str, Any]:
     """抽一个数据集的子集写库，返回统计。"""
@@ -100,30 +118,49 @@ def build_subset(
     samples = data_store.samples_of(connection, adapter.name)
     corpus = data_store.corpus_of(connection, adapter.name)
     by_id = {doc["doc_id"]: doc for doc in corpus}
+    usable_doc_ids = {
+        doc_id for doc_id, doc in by_id.items() if _has_indexable_text(doc["text"])
+    }
     if not samples:
         raise ValueError(f"{adapter.name} 没有样本")
 
     # 随机源是 (数据集, seed) 而不含 run_id，同 seed 因此抽出同一批文档。
     rng = random.Random(f"{adapter.name}:{seed}")
 
-    if adapter.has(DataDependency.GOLD_DOCS):
-        if "hop_prefix" in samples[0]["metadata"]:
-            strategy = "stratified_by_hop"
-            picked = _stratified(samples, min(qa_limit, len(samples)), "hop_prefix", rng)
-        else:
-            strategy = "uniform_qa_then_gold_corpus"
-            ordered = sorted(samples, key=lambda s: s["sample_id"])
-            picked = sorted(
-                rng.sample(ordered, min(qa_limit, len(ordered))), key=lambda s: s["sample_id"]
-            )
+    strategy = adapter.subset_strategy
+    gold_strategies = (SubsetStrategy.QA_THEN_GOLD, SubsetStrategy.STRATIFIED_HOP)
+    # 声明要 gold 而数据集没有标注时报错，不静默产出空 gold 集。
+    if strategy in gold_strategies and not adapter.has(DataDependency.GOLD_DOCS):
+        raise ValueError(f"{adapter.name}: 策略 {strategy.value!r} 需要 gold 标注，但本组没有")
+
+    if full_corpus:
+        # 显式全量语料：QA 仍受 qa_limit 控制，语料不再按 gold/负样本抽样。
+        doc_ids = sorted(usable_doc_ids)
+        picked = sorted(
+            rng.sample(
+                sorted(samples, key=lambda s: s["sample_id"]), min(qa_limit, len(samples))
+            ),
+            key=lambda s: s["sample_id"],
+        )
         gold_ids = sorted({d for s in picked for d in s["gold_doc_ids"]})
-        pool = sorted(set(by_id) - set(gold_ids))
-        wanted = round(len(gold_ids) * negatives_ratio)
-        negatives = sorted(rng.sample(pool, min(wanted, len(pool))))
-        doc_ids = sorted(set(gold_ids) | set(negatives))
-    else:
+        negatives = (
+            sorted(set(doc_ids) - set(gold_ids))
+            if adapter.has(DataDependency.GOLD_DOCS)
+            else []
+        )
+    elif strategy is SubsetStrategy.FULL_CORPUS:
+        # itfaq：没有指回文档的字段，抽语料就无法保证被抽到的问题还答得上。
+        # 语料整份导入，所以 negatives_ratio 对这一组不起作用。
+        doc_ids = sorted(usable_doc_ids)
+        picked = sorted(
+            rng.sample(
+                sorted(samples, key=lambda s: s["sample_id"]), min(qa_limit, len(samples))
+            ),
+            key=lambda s: s["sample_id"],
+        )
+        gold_ids, negatives = [], []
+    elif strategy is SubsetStrategy.WHOLE_DOCS:
         # narrativeqa：整篇取文档，优先取 chunk 最少的（chunk 数决定编译成本）。
-        strategy = "whole_documents"
         chunks: dict[str, list[str]] = defaultdict(list)
         for doc in corpus:
             chunks[doc["doc_id"].rsplit("_", 1)[0]].append(doc["doc_id"])
@@ -140,6 +177,19 @@ def build_subset(
         if qa_limit and len(picked) > qa_limit:
             picked = sorted(rng.sample(picked, qa_limit), key=lambda s: s["sample_id"])
         gold_ids, negatives = [], []
+    else:
+        if strategy is SubsetStrategy.STRATIFIED_HOP:
+            picked = _stratified(samples, min(qa_limit, len(samples)), "hop_prefix", rng)
+        else:
+            ordered = sorted(samples, key=lambda s: s["sample_id"])
+            picked = sorted(
+                rng.sample(ordered, min(qa_limit, len(ordered))), key=lambda s: s["sample_id"]
+            )
+        gold_ids = sorted({d for s in picked for d in s["gold_doc_ids"]})
+        pool = sorted(usable_doc_ids - set(gold_ids))
+        wanted = round(len(gold_ids) * negatives_ratio)
+        negatives = sorted(rng.sample(pool, min(wanted, len(pool))))
+        doc_ids = sorted(set(gold_ids) | set(negatives))
 
     # 验收：每条样本的 gold 都要在子集语料内，否则 Recall 的上限不是 1。
     subset_ids = set(doc_ids)
@@ -163,9 +213,10 @@ def build_subset(
 
     return {
         "dataset": adapter.name,
-        "strategy": strategy,
+        "strategy": strategy.value,
         "samples": len(picked),
         "docs": len(doc_ids),
+        "empty_docs": len(by_id) - len(usable_doc_ids),
         "gold": len(gold_ids),
         "negatives": len(negatives),
     }
@@ -186,6 +237,10 @@ def _wait_for_compile(
     config: AkashaConfig,
     *,
     expect_runs: int = 0,
+    coalesced_runs: int = 0,
+    expected_run_ids: set[str] | None = None,
+    baseline_run_ids: set[str] | None = None,
+    baseline_sequence: int = 0,
 ) -> dict[str, Any]:
     """轮询到全部编译 Run 终态，返回 ``{status_counts, no_runs, timed_out}``。
 
@@ -193,18 +248,82 @@ def _wait_for_compile(
     但前者是压根没编译。``expect_runs`` 为 0 且看不到 Run 时立即返回。
     """
     deadline = time.monotonic() + config.poll_timeout_seconds
+    baseline_run_ids = baseline_run_ids or set()
+    expected_run_ids = expected_run_ids or set()
     while True:
         ctx.checkpoint()
-        summary = client.run_diagnostics_summary([space_id])
-        counts: dict[str, int] = summary.get("statusCounts") or {}
-        active = sum(n for name, n in counts.items() if name in ACTIVE_RUN_STATUSES)
+        runs: list[dict[str, Any]] = []
+        try:
+            runs = list((client.run_diagnostics([space_id], limit=50).get("items") or []))
+            diagnostics_ok = True
+        except AkashaError:
+            runs = []
+            diagnostics_ok = False
+        current = [
+            run
+            for run in runs
+            if str(run.get("runId") or run.get("id") or "") in expected_run_ids
+            or (
+                (str(run.get("runId") or run.get("id")) not in baseline_run_ids)
+                if run.get("runId") or run.get("id")
+                else int(run.get("spaceJobSequence") or 0) > baseline_sequence
+            )
+        ]
+        # coalesced 请求复用已有 Run；此时取当前空间最新的一条，而不是把历史 Run 合计。
+        if (
+            not current
+            and coalesced_runs
+            and runs
+            and any(run.get("runId") or run.get("id") or run.get("spaceJobSequence") for run in runs)
+        ):
+            current = [max(runs, key=lambda r: int(r.get("spaceJobSequence") or 0))]
+
+        if current:
+            counts: dict[str, int] = {}
+            for run in current:
+                status = str(run.get("status") or "unknown")
+                counts[status] = counts.get(status, 0) + 1
+            progress = {
+                key: sum(int((run.get("progress") or {}).get("text", {}).get(key) or 0) for run in current)
+                for key in ("expected", "succeeded", "failed", "skipped")
+            }
+            active = sum(n for name, n in counts.items() if name in ACTIVE_RUN_STATUSES)
+        elif expect_runs and diagnostics_ok and any(
+            run.get("runId") or run.get("id") or run.get("spaceJobSequence") for run in runs
+        ):
+            # 已知空间历史 Run，但本次 accepted Run 尚未出现在诊断列表中；继续等，
+            # 不能用包含历史 Run 的 summary 提前结束。
+            counts = {}
+            progress = {}
+            active = 1
+        else:
+            # 兼容旧服务/测试替身没有 Run 明细的情况；生产服务走上面的按 Run 过滤。
+            summary = client.run_diagnostics_summary([space_id])
+            counts = summary.get("statusCounts") or {}
+            progress = {}
+            active = sum(n for name, n in counts.items() if name in ACTIVE_RUN_STATUSES)
+
+        if current and progress.get("expected"):
+            ctx.log(
+                f"编译进度：{progress['succeeded'] + progress['skipped'] + progress['failed']}"
+                f"/{progress['expected']}（成功 {progress['succeeded']}，"
+                f"跳过 {progress['skipped']}，失败 {progress['failed']}）"
+            )
+        elif counts:
+            ctx.log(f"编译中：{counts}")
         if counts and active == 0:
-            return {"status_counts": counts, "no_runs": False, "timed_out": False}
+            return {
+                "status_counts": counts,
+                "no_runs": False,
+                "timed_out": False,
+                "runs": current,
+            }
         if not counts and expect_runs == 0:
             return {"status_counts": counts, "no_runs": True, "timed_out": False}
         if time.monotonic() > deadline:
             return {"status_counts": counts, "no_runs": not counts, "timed_out": True}
-        ctx.log(f"编译中：{counts}" if counts else "等待编译 Run 出现")
+        if not counts:
+            ctx.log("等待本次编译 Run 出现")
         time.sleep(config.poll_interval_seconds)
 
 
@@ -216,7 +335,7 @@ def _page_failures(client: AkashaClient, space_id: str) -> list[str]:
         return [f"读逐页日志失败：HTTP {exc.status}"]
 
     entries = log.get("items") or []
-    failed = [e for e in entries if e.get("status") == "failed"]
+    failed = [e for e in entries if e.get("status") in {"failed", "skipped"}]
     if not failed:
         return []
 
@@ -235,17 +354,19 @@ def _page_failures(client: AkashaClient, space_id: str) -> list[str]:
     return lines
 
 
-def _compile_pace(client: AkashaClient, space_id: str) -> dict[str, Any] | None:
+def _compile_pace(
+    client: AkashaClient, space_id: str, runs: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
     """每篇编译耗时的估算，取 Run 的墙钟时长除以页数。
 
     是估算而不是实测：单篇的起止时间拿不到，并发度大于 1 时这个值偏高。
     """
-    try:
-        report = client.run_diagnostics([space_id])
-    except AkashaError:
-        return None
-
-    runs = report.get("items") or []
+    if runs is None:
+        try:
+            report = client.run_diagnostics([space_id])
+        except AkashaError:
+            return None
+        runs = report.get("items") or []
     if not runs:
         return None
     total_ms = sum(int(r.get("runDurationMs") or 0) for r in runs)
@@ -289,6 +410,7 @@ def run(ctx: TaskContext) -> None:
     seed = int(params["seed"]) if params.get("seed") is not None else default_seed()
     qa_limit = int(params.get("qa_limit") or DEFAULT_QA_LIMIT)
     negatives_ratio = float(params.get("negatives_ratio", DEFAULT_NEGATIVES_RATIO))
+    full_corpus = bool(params.get("full_corpus", False))
     if qa_limit < 1:
         raise ValueError("每个数据集的 QA 数必须大于 0")
     if negatives_ratio < 0:
@@ -305,6 +427,7 @@ def run(ctx: TaskContext) -> None:
         seed=seed,
         qa_limit=qa_limit,
         negatives_ratio=negatives_ratio,
+        full_corpus=full_corpus,
     )
     if compile_id is None:
         if compile_store.compile_run_by_run_id(ctx.db, run_id):
@@ -320,7 +443,7 @@ def run(ctx: TaskContext) -> None:
         ctx.bind("compile", compile_id)
     ctx.log(f"编译 {run_id}（#{compile_id}），数据集 {', '.join(datasets)}")
 
-    _execute(ctx, compile_id, run_id, datasets, seed, qa_limit, negatives_ratio, config)
+    _execute(ctx, compile_id, run_id, datasets, seed, qa_limit, negatives_ratio, full_corpus, config)
 
 
 def _execute(
@@ -331,6 +454,7 @@ def _execute(
     seed: int,
     qa_limit: int,
     negatives_ratio: float,
+    full_corpus: bool,
     config: AkashaConfig,
 ) -> None:
     # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档，
@@ -348,10 +472,12 @@ def _execute(
                 seed=seed,
                 qa_limit=qa_limit,
                 negatives_ratio=negatives_ratio,
+                full_corpus=full_corpus,
             )
             ctx.log(
                 f"{dataset}: QA {stats['samples']}，语料 {stats['docs']} "
                 f"(gold {stats['gold']} / 负样本 {stats['negatives']})，策略 {stats['strategy']}"
+                + (f"，跳过无正文 {stats['empty_docs']} 篇" if stats["empty_docs"] else "")
             )
     else:
         ctx.log("子集已存在，跳过抽样")
@@ -381,12 +507,14 @@ def _execute(
             space_id = space.get("id")
             if not space_id:
                 raise RuntimeError(f"创建空间未返回 id：{space!r}")
+            group = config_store.selected_config_group(ctx.db)
             compile_store.update_compile_run(
                 ctx.db,
                 compile_id,
                 space_id=space_id,
                 space_name=slug,
                 workspace_id=workspace.get("id"),
+                config_group=group["label"] if group else None,
                 model_configs_json=dumps(client.get_model_configs()),
             )
             ctx.db.commit()
@@ -402,11 +530,43 @@ def _execute(
 
         # 等编译的总量拿不到，用「导入完 = 2/3」这一档，收尾时推到 3/3。
         ctx.progress(2, 3, "等待编译")
+        try:
+            before = client.run_diagnostics([space_id], limit=50).get("items") or []
+        except AkashaError:
+            before = []
+        baseline_run_ids = {
+            str(run.get("runId") or run.get("id")) for run in before if run.get("runId") or run.get("id")
+        }
+        baseline_sequence = max((int(run.get("spaceJobSequence") or 0) for run in before), default=0)
+        ctx.checkpoint()
         result = client.compile_spaces([space_id])
         accepted = int(result.get("acceptedRunCount") or 0)
         coalesced = int(result.get("coalescedRunCount") or 0)
+        remote_run_ids = {
+            str(run["runId"])
+            for run in result.get("runs") or []
+            if isinstance(run, dict) and run.get("runId")
+        }
+        if remote_run_ids:
+            ctx.freeze(remote_compile_run_ids=sorted(remote_run_ids))
+        if ctx.pause_requested:
+            for remote_run_id in remote_run_ids:
+                client.cancel_compile_run(
+                    remote_run_id, "Akasha-Benchmark task paused during compile submission"
+                )
+            ctx.checkpoint()
         ctx.log(f"已请求编译：accepted={accepted} coalesced={coalesced}")
-        wait = _wait_for_compile(ctx, client, space_id, config, expect_runs=accepted + coalesced)
+        wait = _wait_for_compile(
+            ctx,
+            client,
+            space_id,
+            config,
+            expect_runs=accepted + coalesced,
+            coalesced_runs=coalesced,
+            expected_run_ids=remote_run_ids,
+            baseline_run_ids=baseline_run_ids,
+            baseline_sequence=baseline_sequence,
+        )
         if wait["no_runs"]:
             # 一个 Run 都没有：page 停在「已上传、未编译」，没有源文本也没有 chunk。
             raise RuntimeError(
@@ -421,7 +581,7 @@ def _execute(
             )
         ctx.log(f"编译终态：{wait['status_counts']}")
 
-        pace = _compile_pace(client, space_id)
+        pace = _compile_pace(client, space_id, wait.get("runs") or None)
         if pace:
             compile_store.update_compile_run(ctx.db, compile_id, pace_json=dumps(pace))
             ctx.log(

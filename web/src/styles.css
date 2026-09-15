@@ -258,10 +258,10 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; cur
 
 pre.block {
   background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
-  padding: 10px 12px; overflow-x: auto; font-size: 12px; max-height: 340px; margin: 0;
+  padding: 10px 12px; overflow: auto; font-size: 12px; max-height: 340px; margin: 0;
   white-space: pre-wrap; word-break: break-word; color: var(--text);
 }
-pre.block.tall { max-height: 520px; }
+pre.block.tall { max-height: min(300px, 60vh); }
 
 .muted { color: var(--muted); }
 .small { font-size: 12px; }

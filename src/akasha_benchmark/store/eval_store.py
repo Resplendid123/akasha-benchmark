@@ -320,11 +320,14 @@ def judged_sample_ids(
     return {row["sample_id"] for row in connection.execute(sql, params)}
 
 
-def judge_verdicts(connection: sqlite3.Connection, eval_id: int) -> list[dict[str, Any]]:
+def judge_verdicts(
+    connection: sqlite3.Connection, eval_id: int, *, include_detail: bool = True
+) -> list[dict[str, Any]]:
+    """返回 Judge 结论；列表视图可跳过大段原始响应。"""
     return [
         {
             **{k: v for k, v in dict(row).items() if k != "detail_json"},
-            "detail": loads(row["detail_json"]),
+            "detail": loads(row["detail_json"]) if include_detail else None,
         }
         for row in connection.execute(
             "SELECT * FROM judge_verdict WHERE eval_id = ? ORDER BY sample_id", (eval_id,)

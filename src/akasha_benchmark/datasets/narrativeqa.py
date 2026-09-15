@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 from .base import DatasetAdapter
 from .corpus import CorpusIndex
-from .models import CanonicalSample, DataDependency, make_sample_id
+from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample_id
 
 
 class NarrativeQAAdapter(DatasetAdapter):
@@ -24,6 +24,7 @@ class NarrativeQAAdapter(DatasetAdapter):
     qa_filename: ClassVar[str] = "narrativeqa.json"
     corpus_filename: ClassVar[str] = "narrativeqa_corpus.json"
     provides: ClassVar[frozenset[DataDependency]] = frozenset({DataDependency.REFERENCE_ANSWERS})
+    subset_strategy: ClassVar[SubsetStrategy] = SubsetStrategy.WHOLE_DOCS
 
     def expected_qa_rows(self) -> int:
         return 293

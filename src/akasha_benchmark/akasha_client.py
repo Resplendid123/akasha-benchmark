@@ -1,14 +1,14 @@
 """Akasha 的 HTTP 客户端，只覆盖入库与查询用到的端点。
 
 认证：``POST /api/auth/login`` set 一个 httpOnly 的 ``authToken`` cookie，
-响应体为空，所以 httpx 的 cookie jar 就够了。workspace 由服务端解析。
+响应体为空。
 
 各端点的请求/响应形状：
 
 * ``POST /api/pages/import`` —— multipart，字段 ``file`` + ``spaceId``，
   返回创建的 page 对象（含 ``id``）
 * ``POST /api/llm-wiki/query`` —— ``{query, spaceIds[], type?, scoreThreshold?,
-  chatContext?}``；响应里没有 ``retrievalDiagnostics`` 与 ``retrievalScope``
+  chatContext?}``
 * ``POST /api/llm-wiki/admin/diagnostics/quality`` ——
   ``{summary, spaces[], topIssues[]}``，计数字段是 camelCase
 """
@@ -33,7 +33,7 @@ ACTIVE_RUN_STATUSES = frozenset(
 # 只重试瞬时故障：5xx 是服务端重启或代理抖动，429 是限流。4xx 不重试。
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 RETRYABLE_EXCEPTIONS = (httpx.TransportError,)
-MAX_RETRIES = 5
+MAX_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
 RETRY_MAX_DELAY = 30.0
 
@@ -59,7 +59,7 @@ def unwrap_envelope(body: Any) -> Any:
     """剥掉全局响应信封 ``{data, success, status}``。这里用到的端点全都套着它。
 
     判据收紧到信封自身的形状，而不是只看有没有 ``data`` —— 正常载荷里也可能
-    有一个叫 ``data`` 的字段。login 的信封没有 ``data`` 键，剥出来是 ``None``。
+    有 ``data`` 的字段。login 的信封没有 ``data`` 键，剥出来是 ``None``。
     """
     if not isinstance(body, dict):
         return body
@@ -128,7 +128,7 @@ class AkashaClient:
         raise_for_status: bool = True,
         retry: bool = True,
     ) -> Response:
-        """``retry=False`` 用于结果有歧义就会造成重复的写入端点，见 :meth:`import_page`。"""
+        """``retry=False`` 用于结果有歧义就会造成重复的写入端点。"""
         url = self.config.api(path)
         response, latency_ms = self._request_with_retry(
             method, url, json_body, files, data, retry
@@ -138,7 +138,6 @@ class AkashaClient:
             body: Any = response.json() if response.content else None
         except ValueError:
             body = response.text
-        # 统一剥信封，各阶段就能按模块开头记的形状直接读字段。
         body = unwrap_envelope(body)
 
         if raise_for_status and not response.is_success:
@@ -173,7 +172,6 @@ class AkashaClient:
                 )
             except RETRYABLE_EXCEPTIONS as exc:
                 self._last_request_at = time.monotonic()
-                # 原样抛出，不包成 AkashaError：查询层按 httpx.RequestError 捕获它。
                 if attempt >= max_retries:
                     raise
                 delay = self._retry_delay(attempt)
@@ -270,6 +268,13 @@ class AkashaClient:
         """立即建 Run，绕过 1 小时静默期。"""
         return self.post("llm-wiki/admin/compile-spaces", {"spaceIds": space_ids})
 
+    def cancel_compile_run(self, run_id: str, reason: str) -> dict[str, Any]:
+        """取消一个精确的编译 Run；服务端同时清理对应 BullMQ job。"""
+        return self.post(
+            f"llm-wiki/admin/compilation-runs/{run_id}/cancel",
+            {"reason": reason},
+        )
+
     def run_diagnostics_summary(self, space_ids: list[str]) -> dict[str, Any]:
         return self.post("llm-wiki/admin/diagnostics/summary", {"spaceIds": space_ids})
 
@@ -311,7 +316,7 @@ class AkashaClient:
         score_threshold: float | None = None,
         chat_context: list[str] | None = None,
     ) -> Response:
-        """跑一条知识查询。返回原始 Response，失败也能照样落盘。"""
+        """跑一条知识查询。返回原始 Response，失败也落盘。"""
         payload: dict[str, Any] = {"query": query, "spaceIds": space_ids, "type": query_type}
         if score_threshold is not None:
             payload["scoreThreshold"] = score_threshold

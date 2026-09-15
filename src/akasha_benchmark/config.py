@@ -12,16 +12,14 @@ API_PREFIX = "/api"
 
 @dataclass(frozen=True)
 class AkashaConfig:
-    # 用 127.0.0.1 而不是 localhost，见 config_store._prefer_ipv4。
     base_url: str = "http://127.0.0.1:3000"
     email: str = ""
     password: str = ""
     # 只读 PG，仅归因层的链路视图需要，不填则跳过那一段判据。
     database_url: str = ""
-    timeout_seconds: float = 180.0
-    concurrency: int = 1
+    timeout_seconds: float = 120.0
     request_interval_seconds: float = 0.5
-    poll_interval_seconds: float = 10.0
+    poll_interval_seconds: float = 30.0
     poll_timeout_seconds: float = 7200.0
 
     def api(self, path: str) -> str:

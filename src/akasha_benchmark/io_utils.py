@@ -11,7 +11,6 @@ CHUNK = 1 << 20
 
 
 def sha256_file(path: Path) -> str:
-    """分块读，所以 94MB 的输入也不贵。"""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while block := handle.read(CHUNK):

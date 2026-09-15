@@ -1,6 +1,6 @@
 """链路测试：用极小样本把编译到归因四层各跑成一条真实任务。
 
-不是第七个阶段，而是 compile/query/evaluate/attribute 四条普通任务，
+是 compile/query/evaluate/attribute 四条普通任务，
 由运行器按顺序推进，进度、日志、产物归属都和手动起的任务一样。
 
 每一步收尾时校验一次契约（``VERIFY``），不成立就让那条任务失败并断链。
@@ -123,7 +123,6 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
                 "name": f"{run_id}-a",
                 "metric": "recall@5",
                 "sample_limit": samples,
-                # 模型可选：规则判据在没配模型时也出结果。
                 "use_model": bool(params.get("use_model", False)),
                 "provider_id": params.get("provider_id"),
             },

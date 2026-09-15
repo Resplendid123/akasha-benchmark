@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .metrics import qa
+
 CAUSE_NOT_A_FAILURE = "not_a_failure"
 CAUSE_GENERATION_FALLBACK = "generation_fallback"
 CAUSE_COMPILED_AWAY = "compiled_away"
@@ -49,16 +51,38 @@ REMEDIES = {
 }
 
 
-def _answered_correctly(metrics: dict[str, float]) -> bool:
-    """答案是否算对：``answer_correctness`` 或 ``em`` 命中即成立。
+def _contains_reference(answer: str, references: list[str]) -> bool:
+    """参考答案的归一化 token 是否连续出现在系统答案中。"""
+    answer_tokens = qa.tokenize(answer)
+    for reference in references:
+        reference_tokens = qa.tokenize(reference)
+        width = len(reference_tokens)
+        if width and any(
+            answer_tokens[index : index + width] == reference_tokens
+            for index in range(len(answer_tokens) - width + 1)
+        ):
+            return True
+    return False
 
-    不拿 F1 高当判据 —— 它分不开「答对了被散文稀释」与「答错了但词有重叠」。
+
+def _answered_correctly(sample: dict[str, Any]) -> bool:
+    """答案是否算对：Judge correctness、EM 或参考答案完整包含即成立。
+
+    不拿 faithfulness 当正确性判据，它只证明陈述有上下文支持，不能证明答到了问题。
+    F1 也分不开「答对了被散文稀释」与「答错了但词有重叠」。
     """
+    metrics: dict[str, float] = sample.get("metrics") or {}
     correctness = metrics.get("answer_correctness")
     if correctness is not None and correctness >= 1.0:
         return True
     em = metrics.get("em")
-    return em is not None and em >= 1.0
+    if em is not None and em >= 1.0:
+        return True
+    detail = sample.get("detail") or {}
+    return _contains_reference(
+        str(sample.get("answer") or ""),
+        [str(value) for value in detail.get("reference_answers") or []],
+    )
 
 
 def _at_max_k(metrics: dict[str, float], prefix: str) -> float | None:
@@ -86,6 +110,10 @@ def classify(
     coverage = _at_max_k(metrics, "full_coverage@")
     truncated = float(metrics.get("truncated_gold", 0.0) or 0.0)
     graph_exclusive = metrics.get("graph_exclusive_gold_count")
+    reference_contained = _contains_reference(
+        str(sample.get("answer") or ""),
+        [str(value) for value in detail.get("reference_answers") or []],
+    )
 
     lost_terms: list[str] = []
     for entry in lineage or []:
@@ -100,12 +128,14 @@ def classify(
         "question_terms_lost": lost_terms,
         "graph_exclusive_gold_count": graph_exclusive,
         "f1": metrics.get("f1"),
+        "faithfulness": metrics.get("faithfulness"),
+        "reference_answer_contained": reference_contained,
         "gold_count": len(detail.get("gold_doc_ids") or []),
         "lineage_available": lineage is not None,
     }
 
     # 顺序即优先级，见模块开头。
-    if _answered_correctly(metrics):
+    if _answered_correctly(sample):
         cause = CAUSE_NOT_A_FAILURE
     elif answer_mode and answer_mode != "knowledge":
         cause = CAUSE_GENERATION_FALLBACK

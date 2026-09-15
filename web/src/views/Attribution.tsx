@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type {
   AttributionResult,
@@ -168,7 +168,7 @@ function NewAttribution({
   const metrics = useAsync<MetricsView>(() => api.metrics(), [])
   const providers = useAsync<Provider[]>(() => api.providers('attribution'), [])
   const [name, setName] = useState('')
-  const [metric, setMetric] = useState('recall@5')
+  const [metric, setMetric] = useState('')
   const [limit, setLimit] = useState(10)
   const [useModel, setUseModel] = useState(false)
   const [providerId, setProviderId] = useState<number | ''>('')
@@ -178,6 +178,11 @@ function NewAttribution({
   const candidates = (metrics.data?.definitions ?? [])
     .filter((d) => evalRun.metrics.includes(d.name))
     .flatMap((d) => (d.per_k ? evalRun.ks.map((k) => `${d.name}@${k}`) : [d.name]))
+
+  useEffect(() => {
+    const first = candidates[0]
+    if (first && !candidates.includes(metric)) setMetric(first)
+  }, [candidates.join(','), metric])
 
   return (
     <div style={{ marginTop: 12 }}>
@@ -262,7 +267,7 @@ function NewAttribution({
 }
 
 // 逐样本表的每页行数。
-const PAGE = 15
+const PAGE = 5
 
 /** 模型的归因结论。``disagreement`` 单独标红，它表示根因可能判错了。 */
 function ModelVerdict({ result }: { result: AttributionResult }) {
@@ -321,6 +326,26 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
 
   // 只切显示不切数据，根因计数与平均延迟都在全集上算。
   const shown = data.results.slice(offset, offset + PAGE)
+
+  // 样本链路覆盖整个结论框，带返回按钮。
+  if (openSample) {
+    return (
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="spread">
+          <h3 style={{ margin: 0 }}>样本 {openSample} 的链路</h3>
+          <button className="action small" onClick={() => setOpenSample(null)}>
+            ← 返回结论列表
+          </button>
+        </div>
+        <SampleChain
+          key={openSample}
+          evalId={evalId}
+          sampleId={openSample}
+          evidence={data.results.find((r) => r.sample_id === openSample)?.evidence ?? {}}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
@@ -385,13 +410,8 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
                 )}
               </td>
               <td>
-                <button
-                  className="action small"
-                  onClick={() =>
-                    setOpenSample(openSample === result.sample_id ? null : result.sample_id)
-                  }
-                >
-                  {openSample === result.sample_id ? '收起' : '看链路'}
+                <button className="action small" onClick={() => setOpenSample(result.sample_id)}>
+                  看链路
                 </button>
               </td>
             </tr>
@@ -412,17 +432,6 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
       {shown
         .filter((result) => result.narrative || result.evidence?.model || result.evidence?.model_error)
         .map((result) => <ModelVerdict key={result.sample_id} result={result} />)}
-
-      {openSample && (
-        <SampleChain
-          key={openSample}
-          evalId={evalId}
-          sampleId={openSample}
-          evidence={
-            data.results.find((r) => r.sample_id === openSample)?.evidence ?? {}
-          }
-        />
-      )}
     </div>
   )
 }

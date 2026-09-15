@@ -1,4 +1,4 @@
-"""数据集层：从 Hugging Face 下载 HippoRAG_2 的四组数据，下载后校验。
+"""数据集层：从 Hugging Face 下载 HippoRAG_2 的各组数据，下载后校验。
 
 来源：https://huggingface.co/datasets/osunlp/HippoRAG_2
 已存在且字节数符合预期的文件跳过，所以中断后继续即可。
@@ -118,7 +118,11 @@ def _fetch(local: str, endpoint: str, expected: int | None, dest: Path) -> str:
 
 
 def run(ctx: TaskContext) -> None:
-    """下载 + 校验。``datasets`` 为空时下载全部四组。"""
+    """下载 + 校验。``datasets`` 为空时覆盖全部已注册数据集。
+
+    ``downloadable`` 为假的是本地数据集，不在 HippoRAG_2 仓库里：只校验存在性。
+    选中项全是本地数据集时不解析站点，也就不发任何 HTTP。
+    """
     selected = list(ctx.params.get("datasets") or DATASET_NAMES)
     unknown = sorted(set(selected) - set(DATASET_NAMES))
     if unknown:
@@ -126,27 +130,29 @@ def run(ctx: TaskContext) -> None:
 
     dest = DEFAULT_DATASET_DIR
     dest.mkdir(parents=True, exist_ok=True)
-    wanted = [
-        name
-        for adapter in all_adapters()
-        if adapter.name in selected
-        for name in (adapter.qa_filename, adapter.corpus_filename)
+    chosen = [a for a in all_adapters() if a.name in selected]
+    wanted = [n for a in chosen for n in (a.qa_filename, a.corpus_filename)]
+    remote = [
+        n for a in chosen if a.downloadable for n in (a.qa_filename, a.corpus_filename)
     ]
+    for adapter in chosen:
+        if not adapter.downloadable:
+            ctx.log(f"{adapter.name}: 本地数据集，只校验不下载")
 
-    ctx.progress(0, len(wanted) + 1, "连接下载源")
-    endpoint, sizes = _resolve_endpoint(ctx)
+    if remote:
+        ctx.progress(0, len(remote) + 1, "连接下载源")
+        endpoint, sizes = _resolve_endpoint(ctx)
+        for index, local in enumerate(remote):
+            ctx.checkpoint()
+            ctx.progress(index, len(remote) + 1, f"下载 {local}")
+            outcome = _fetch(local, endpoint, sizes.get(REMOTE_NAMES.get(local, local)), dest)
+            ctx.log(f"{local}: {'已存在，跳过' if outcome == 'skipped' else '下载完成'}")
 
-    for index, local in enumerate(wanted):
-        ctx.checkpoint()
-        ctx.progress(index, len(wanted) + 1, f"下载 {local}")
-        outcome = _fetch(local, endpoint, sizes.get(REMOTE_NAMES.get(local, local)), dest)
-        ctx.log(f"{local}: {'已存在，跳过' if outcome == 'skipped' else '下载完成'}")
+        cache = dest / ".hf_cache"
+        if cache.exists():
+            shutil.rmtree(cache, ignore_errors=True)
 
-    cache = dest / ".hf_cache"
-    if cache.exists():
-        shutil.rmtree(cache, ignore_errors=True)
-
-    ctx.progress(len(wanted), len(wanted) + 1, "校验原始文件")
+    ctx.progress(len(remote), len(remote) + 1, "校验原始文件")
     broken = [
         entry
         for entry in file_status()
@@ -157,5 +163,5 @@ def run(ctx: TaskContext) -> None:
     if broken:
         raise RuntimeError(f"{len(broken)} 个原始文件校验失败")
 
-    ctx.progress(len(wanted) + 1, len(wanted) + 1, "下载与校验完成")
+    ctx.progress(len(remote) + 1, len(remote) + 1, "下载与校验完成")
     ctx.log(f"{len(wanted)} 个原始文件就绪")

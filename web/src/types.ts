@@ -46,7 +46,6 @@ export interface Connection {
   password: string
   database_url: string
   timeout_seconds: number
-  concurrency: number
   request_interval_seconds: number
   poll_interval_seconds: number
   poll_timeout_seconds: number
@@ -62,6 +61,7 @@ export interface ConnectionTest {
   blocked_compiles: { id: number; run_id: string; reason: string }[]
   owner_warning: string | null
   model_configs: unknown
+  group_drift: { id: number; label: string; drift: Record<string, boolean> } | null
 }
 
 export interface ModelConfig {
@@ -85,7 +85,28 @@ export interface Provider {
   base_url: string
   model: string
   api_key_set: boolean
+  concurrency: number
   updated_at: string
+}
+
+export interface AkashaConfigFeature {
+  model?: string
+  baseUrl?: string
+  apiKeySet?: boolean
+  parameters?: Record<string, unknown>
+}
+
+export interface AkashaConfigGroup {
+  id: number
+  label: string
+  selected: boolean
+  configs: Record<string, AkashaConfigFeature>
+  updated_at: string
+}
+
+export interface AkashaConfigsView {
+  features: string[]
+  groups: AkashaConfigGroup[]
 }
 
 /** 探测结果。ok 为假时 failure 是失败类别，detail 是 provider 回的原文。 */
@@ -115,6 +136,8 @@ export interface DatasetEntry {
   adapter: string
   provides: string[]
   identity_rules: Record<string, string>
+  subset_strategy: string
+  downloadable: boolean
   expected_qa_rows: number | null
   files: DatasetFile[]
   files_ready: boolean
@@ -252,6 +275,7 @@ export interface CompileRun {
   space_id: string | null
   space_name: string | null
   workspace_id: string | null
+  config_group: string | null
   status: RunStatus
   created_at: string
   finished_at: string | null
@@ -266,6 +290,7 @@ export interface CompileRun {
 export interface CompileDoc {
   dataset: string
   doc_id: string
+  title: string
   is_gold: number
   page_id: string | null
   error: string | null
@@ -343,6 +368,22 @@ export interface EvalSampleDetail {
   judge_verdicts: JudgeVerdict[]
 }
 
+export interface EvalSampleRow {
+  sample_id: string
+  dataset: string
+  question: string
+  answer_mode: string | null
+  http_status: number
+  answer: string | null
+  metrics: Metrics
+  judge_verdicts: JudgeVerdict[]
+}
+
+export interface EvalSampleList extends Paged {
+  eval_id: number
+  samples: EvalSampleRow[]
+}
+
 export interface JudgeVerdict {
   sample_id: string
   metric: string
@@ -404,4 +445,7 @@ export interface Lineage {
   question_terms_lost: string[]
   verdict: string
   base_url: string
+  artifacts: { title: string | null; page_type: string | null }[]
+  chunks: { title: string | null; chunk_role: string | null; text: string }[]
+  source_chunks: { text: string }[]
 }

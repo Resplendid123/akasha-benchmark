@@ -21,7 +21,7 @@
 
 1. **数据集层**：原始 JSON 下载到 `dataset/`，校验能否解析成 JSON 数组。
 2. **归一化层**：经适配器转成 `sample` / `corpus_doc` 进 SQLite，**不写 Akasha**。写库后验收 gold 是否都在语料内。
-3. **编译层**：按数据集抽子集（先 QA 后 corpus），创建 Akasha 空间，导入语料并编译，检查编译完整性。`compile_run` 记录本次抽样配置与模型快照。
+3. **编译层**：按数据集抽子集，创建 Akasha 空间，导入语料并编译，检查编译完整性。`compile_run` 记录本次抽样配置与模型快照。抽子集走哪条路由适配器的 `subset_strategy` 声明：有 gold 的先 QA 后 corpus（musique 按跳数分层），narrativeqa 整篇取文档，itfaq 没有「问题→文档」映射所以语料全量导入。
 4. **查询层**：在指定编译的空间中逐条查询，保存完整响应体。
 5. **评测层**：从响应算指标，需要时执行 Judge。确定性指标分别汇总为 `overall` 与 `knowledge_only`。
 6. **归因层**：规则判据从指标与链路推根因，模型可选地补一段因果叙述。

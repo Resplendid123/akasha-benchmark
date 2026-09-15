@@ -1,6 +1,6 @@
 """corpus 加载、doc_id 赋予，以及适配器解析 gold 要用的反查表。
 
-四组 corpus 的身份字段不统一，规则收在 :data:`CORPUS_ID_RULES`。
+各组 corpus 的身份字段不统一，规则收在 :data:`CORPUS_ID_RULES`。
 语料一律不去重：musique 的重复 title 是同名文档的不同段落，去重会丢 gold。
 """
 
@@ -78,24 +78,23 @@ class CorpusIndex:
 
 
 def assign_doc_id(dataset: str, row: dict[str, Any], row_index: int) -> str:
-    """按该数据集声明的规则赋 doc_id。"""
-    rule = CORPUS_ID_RULES[dataset]
-    if rule == "native_id":
-        if "idx" not in row:
+    """按该数据集声明的身份字段赋 doc_id；``row_idx`` 表示用行号。"""
+    field = CORPUS_ID_RULES[dataset]
+    if field == "row_idx":
+        # 用行号当身份的前提是这份 corpus 没有身份字段；有了说明数据换版。
+        present = sorted({"idx", "id"} & row.keys())
+        if present:
             raise ValueError(
-                f"{dataset}: corpus row {row_index} has no 'idx' but the identity "
-                f"rule is {rule!r}; upstream data shape changed"
-            )
-        return str(row["idx"])
-    if rule == "row_idx":
-        # 用行号当身份的前提是这份 corpus 没有 idx；有了说明数据换版。
-        if "idx" in row:
-            raise ValueError(
-                f"{dataset}: corpus row {row_index} unexpectedly has an 'idx' field "
-                f"while the identity rule is {rule!r}; re-check the data version"
+                f"{dataset}: corpus row {row_index} unexpectedly has {present} "
+                "while its identity rule is 'row_idx'; re-check the data version"
             )
         return str(row_index)
-    raise ValueError(f"{dataset}: unknown corpus identity rule {rule!r}")
+    if field not in row:
+        raise ValueError(
+            f"{dataset}: corpus row {row_index} has no {field!r} but that is its "
+            "declared identity field; upstream data shape changed"
+        )
+    return str(row[field])
 
 
 def load_corpus(dataset: str, path: Path) -> CorpusIndex:

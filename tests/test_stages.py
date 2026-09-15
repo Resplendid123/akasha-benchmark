@@ -8,8 +8,9 @@ import pytest
 
 from akasha_benchmark.datasets import DataDependency, get_adapter
 from akasha_benchmark.metrics import registry
-from akasha_benchmark.stages import clean_params, compile, evaluate, normalize
+from akasha_benchmark.stages import attribute, clean_params, compile, evaluate, normalize
 from akasha_benchmark.store import (
+    attribution_store,
     compile_store,
     data_store,
     eval_store,
@@ -128,6 +129,28 @@ def test_subset_negatives_ratio_zero_keeps_only_gold(normalized):
     assert all(d["is_gold"] for d in compile_store.compile_docs(normalized, compile_id))
 
 
+def test_full_corpus_keeps_every_document(normalized):
+    compile_id = compile_store.create_compile_run(
+        normalized, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=1, negatives_ratio=1.0
+    )
+    normalized.commit()
+    stats = compile.build_subset(
+        normalized,
+        compile_id,
+        "hotpotqa",
+        seed=1,
+        qa_limit=1,
+        negatives_ratio=1.0,
+        full_corpus=True,
+    )
+
+    docs = compile_store.compile_docs(normalized, compile_id)
+    assert {doc["doc_id"] for doc in docs} == {"0", "1", "2", "3"}
+    assert all(doc["title"] for doc in docs)
+    assert stats["docs"] == 4
+    assert stats["gold"] + stats["negatives"] == 4
+
+
 def test_markdown_uses_heading_for_title(normalized):
     """heading 承担 title，文件名承担 doc_id，两者独立，所以重复 title 不影响身份。"""
     markdown = compile.markdown_of(normalized, "hotpotqa", "0")
@@ -137,6 +160,11 @@ def test_markdown_uses_heading_for_title(normalized):
 def test_unsafe_doc_id_is_rejected():
     with pytest.raises(ValueError):
         compile._safe_doc_id("../escape")
+
+
+def test_image_only_document_has_no_indexable_text():
+    assert not compile._has_indexable_text("# 标题\n\n![image](files/example.png)")
+    assert compile._has_indexable_text("# 标题\n\n这里有可检索的正文。")
 
 
 # ------------------------------------------------------------ 评测
@@ -266,6 +294,47 @@ def test_evaluate_rejects_rebuilt_subset(normalized):
         )
 
 
+def test_attribution_can_use_judge_metric(normalized):
+    """归因依据必须使用本次评测实际产出的指标，而不是固定 recall@5。"""
+    compile_id, query_id, eval_id = _fixture_chain(
+        normalized, {"answerMode": "knowledge", "answer": "Rita Moreno"}
+    )
+    sample_id = compile_store.compile_samples(normalized, compile_id)[0]["sample_id"]
+    eval_store.record_judge_verdict(
+        normalized,
+        eval_id,
+        sample_id=sample_id,
+        metric="faithfulness",
+        score=0.25,
+        failure_kind=None,
+        detail={"raw_response": '{"claims": []}'},
+    )
+    sample = compile_store.compile_samples(normalized, compile_id)[0]
+    eval_store.record_sample_eval(
+        normalized,
+        eval_id,
+        sample_id=sample_id,
+        dataset=sample["dataset"],
+        answer_mode="knowledge",
+        http_status=200,
+        answer="Rita Moreno",
+        detail={"question": sample["question"], "gold_doc_ids": sample["gold_doc_ids"]},
+        metrics={},
+    )
+    eval_store.restore_judge_metrics(normalized, eval_id, "faithfulness")
+    normalized.commit()
+
+    normalized.execute(
+        "UPDATE eval_run SET metrics_json = ? WHERE id = ?", ('["faithfulness"]', eval_id)
+    )
+    _task_row(normalized)
+    attribute.run(context(normalized, {"eval_id": eval_id, "use_model": False}))
+
+    run = attribution_store.list_attribution_runs(normalized, eval_id)[0]
+    assert run["metric"] == "faithfulness"
+    assert attribution_store.attribution_results(normalized, int(run["id"]))
+
+
 def test_omitted_metrics_are_not_faked_as_zero():
     """narrativeqa 没有 gold 标注，整族检索指标必须省略而不是记 0。"""
     adapter = get_adapter("narrativeqa")
@@ -330,20 +399,10 @@ def test_evaluate_resume_restores_judge_scores_and_summary(normalized, monkeypat
         evaluate, "resolve_provider", lambda *args: JudgeProvider("https://x", "m", "k")
     )
 
-    class NoCalls:
-        def __init__(self, provider):
-            pass
+    def no_calls(*args, **kwargs):
+        pytest.fail("续跑不应重复调用已完成的 Judge")
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def complete(self, *args):
-            pytest.fail("续跑不应重复调用已完成的 Judge")
-
-    monkeypatch.setattr(evaluate, "JudgeClient", NoCalls)
+    monkeypatch.setattr(evaluate, "complete_many", no_calls)
     ctx = TaskContext(
         task_id=task_id,
         stage="evaluate",

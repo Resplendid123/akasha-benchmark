@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 from .base import DatasetAdapter
 from .common import gold_titles_from_supporting_facts, resolve_gold_doc_ids
 from .corpus import CorpusIndex
-from .models import CanonicalSample, DataDependency, make_sample_id
+from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample_id
 
 # 本集的 context 句子用空格拼接（hotpotqa 是空串），差异见 common.py。
 SENTENCE_JOINER = " "
@@ -27,6 +27,7 @@ class TwoWikiMultihopQAAdapter(DatasetAdapter):
     provides: ClassVar[frozenset[DataDependency]] = frozenset(
         {DataDependency.GOLD_DOCS, DataDependency.REFERENCE_ANSWERS}
     )
+    subset_strategy: ClassVar[SubsetStrategy] = SubsetStrategy.QA_THEN_GOLD
 
     def expected_qa_rows(self) -> int:
         return 1000

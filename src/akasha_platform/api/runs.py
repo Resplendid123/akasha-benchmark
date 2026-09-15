@@ -1,7 +1,8 @@
 """编译层与查询层的读取与清理。
 
 清理就是删主表那一行：产物表全部 ``ON DELETE CASCADE``，所以一条 DELETE
-清掉这一层及其下游的全部数据库内容。远端的 space 与审计日志都不删。
+清掉这一层及其下游的全部数据库内容。编译层清理前会取消空间中的活动 Run，
+远端 space 与审计日志保留。
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from akasha_benchmark.akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
+from akasha_benchmark.config import load_config
 from akasha_benchmark.store import (
     attribution_store,
     compile_store,
@@ -104,17 +107,35 @@ def compile_docs(
 
 @router.delete("/compiles/{compile_id}")
 def delete_compile(request: Request, compile_id: int) -> dict[str, Any]:
-    """清理一次编译及其下游的查询、评测、归因。远端 space 不删。"""
+    """取消活动的远端 Run，再清理编译及其下游；远端 space 保留。"""
     with writable(request) as connection:
         row = compile_store.get_compile_run(connection, compile_id)
         if row is None:
             raise HTTPException(404, f"编译 #{compile_id} 不存在")
         reject_if_busy(connection, "compile", compile_id)
+        cancelled = 0
+        removed_jobs = 0
+        if row.get("space_id"):
+            try:
+                with AkashaClient(load_config(connection)) as client:
+                    client.login()
+                    runs = client.run_diagnostics([row["space_id"]], limit=50).get("items") or []
+                    for run in runs:
+                        if run.get("runId") and str(run.get("status")) in ACTIVE_RUN_STATUSES:
+                            result = client.cancel_compile_run(
+                                str(run["runId"]), "Akasha-Benchmark compile cleaned up"
+                            )
+                            cancelled += result.get("disposition") == "cancelled"
+                            removed_jobs += int(result.get("removedJobCount") or 0)
+            except (AkashaError, ValueError) as exc:
+                raise HTTPException(502, f"远端编译取消失败，本地记录未删除：{exc}") from exc
         removed = compile_store.delete_compile_run(connection, compile_id)
     return {
         "deleted": removed,
         "space_id": row["space_id"],
-        "note": "数据库内容已清理；Akasha 那边的空间没有删除，可自行处理。",
+        "cancelled_runs": cancelled,
+        "removed_bullmq_jobs": removed_jobs,
+        "note": "数据库内容已清理，活动编译 Run 已取消；Akasha 空间没有删除。",
     }
 
 

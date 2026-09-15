@@ -214,7 +214,7 @@ def test_provider_id_updates_in_place(db):
 
 
 def test_connection_updates_only_given_fields(db):
-    config_store.update_connection(db, base_url="http://a", email="e@x")
+    config_store.update_connection(db, base_url="http://a", email="e@x", password="")
     db.commit()
     row = config_store.get_connection_row(db)
     assert row["base_url"] == "http://a"

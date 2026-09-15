@@ -1,9 +1,10 @@
-"""四个适配器的名称与别名注册表。"""
+"""各适配器的名称与别名注册表。"""
 
 from __future__ import annotations
 
 from .base import DatasetAdapter
 from .hotpotqa import HotpotQAAdapter
+from .itfaq import ITFaqAdapter
 from .musique import MusiqueAdapter
 from .narrativeqa import NarrativeQAAdapter
 from .two_wiki import TwoWikiMultihopQAAdapter
@@ -13,6 +14,7 @@ ADAPTER_CLASSES: tuple[type[DatasetAdapter], ...] = (
     TwoWikiMultihopQAAdapter,
     MusiqueAdapter,
     NarrativeQAAdapter,
+    ITFaqAdapter,
 )
 
 DATASET_NAMES: tuple[str, ...] = tuple(cls.name for cls in ADAPTER_CLASSES)

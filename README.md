@@ -40,6 +40,8 @@ make web           # 前端 :5173
 ## 数据
 
 `akasha_bench.db` 保存配置、归一化数据和运行结果，原始数据文件保存在 `dataset/`。
+四组 HippoRAG_2 数据集由数据集页下载；`itfaq`（628 条中文 IT 支持问答、42 篇文档）
+是本地数据集，不在下载源里，需手动放进 `dataset/`。
 后端启动时按 `src/akasha_benchmark/store/schema.sql` 建表。该文件定义完整结构，不提供旧数据库迁移。
 
 一次编译对应一个 `run_id`，记录抽样配置与模型快照。查询前比对当前模型配置与快照：
@@ -53,7 +55,7 @@ embedding 不一致时拒绝执行；compiler、answer 或 image 不一致时记
 
 ## 指标口径
 
-- 按数据集标注检查指标依赖。缺少依赖的指标省略并记录原因，不计为 0 分；例如 narrativeqa 缺少 gold 文档标注，无法计算依赖它的检索指标。
+- 按数据集标注检查指标依赖。缺少依赖的指标省略并记录原因，不计为 0 分；例如 narrativeqa 与 itfaq 缺少 gold 文档标注，无法计算依赖它的检索指标。
 - 检索指标按 `retrievedSources` 算，不用 `citations`（后者已被裁剪过）。
 - 检索指标基于响应实际返回的 `retrievedSources`；列表为空时相应检索得分为 0。报告提供全样本与 `knowledge` 子集的均值，应结合回答模式分布和 HTTP 失败数解读，均值差不能直接表示拒答比例或根因。
 - Judge 跳过或失败的条目不计入评分均值。单项 Judge 的失败率超过 10% 时，评测任务标记为失败。

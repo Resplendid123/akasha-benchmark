@@ -44,7 +44,7 @@ export function Query({
   if (!compiles.data) return null
 
   const ready = runs.filter((c) => c.readiness.ready)
-  const compile = runs.find((c) => c.id === activeCompile) ?? ready[0] ?? null
+  const compile = ready.find((c) => c.id === activeCompile) ?? ready[0] ?? null
 
   return (
     <>
@@ -130,7 +130,7 @@ export function Query({
                           className="action small"
                           onClick={() => setOpenQuery(openQuery === run.id ? null : run.id)}
                         >
-                          {openQuery === run.id ? '收起' : '看响应'}
+                          {openQuery === run.id ? '收起' : '响应'}
                         </button>
                         <button
                           className="action small"
@@ -186,7 +186,7 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
         onChange={setSelected}
       />
       <div className="row" style={{ marginTop: 10 }}>
-        <Field label="查询名称" hint="留空自动生成；续跑请到任务页继续原任务">
+        <Field label="查询名称" hint="留空自动生成">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="自动" />
         </Field>
         <Field label="每组样本数" hint="留空则跑全部">
@@ -207,7 +207,7 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
             placeholder="默认"
           />
         </Field>
-        <Field label="并发" hint="不影响结果，只影响快慢">
+        <Field label="并发" hint="并发查询">
           <input
             type="number"
             min={1}
@@ -248,12 +248,29 @@ function Responses({ queryId }: { queryId: number }) {
   const [mode, setMode] = useState('')
   const [offset, setOffset] = useState(0)
   const [sampleId, setSampleId] = useState<string | null>(null)
-  const limit = 10
+  const limit = 5
 
   const { data, error, loading } = useAsync(
     () => api.responses(queryId, { answer_mode: mode || undefined, limit, offset }),
     [queryId, mode, offset],
   )
+
+  // 完整响应覆盖整个列表框，带返回按钮。
+  if (sampleId) {
+    return (
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="spread">
+          <h3 style={{ margin: 0 }}>
+            查询 #{queryId} · 样本 {sampleId}
+          </h3>
+          <button className="action small" onClick={() => setSampleId(null)}>
+            ← 返回响应列表
+          </button>
+        </div>
+        <FullResponse key={sampleId} queryId={queryId} sampleId={sampleId} />
+      </div>
+    )
+  }
 
   if (loading) return <Loading what="响应" />
   if (error) return <Failed error={error} />
@@ -308,11 +325,8 @@ function Responses({ queryId }: { queryId: number }) {
               <td className="num">{row.citation_count}</td>
               <td className="num">{num(row.latency_ms)}</td>
               <td>
-                <button
-                  className="action small"
-                  onClick={() => setSampleId(sampleId === row.sample_id ? null : row.sample_id)}
-                >
-                  {sampleId === row.sample_id ? '收起' : '完整响应'}
+                <button className="action small" onClick={() => setSampleId(row.sample_id)}>
+                  完整响应
                 </button>
               </td>
             </tr>
@@ -320,8 +334,6 @@ function Responses({ queryId }: { queryId: number }) {
         </tbody>
       </table>
       <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />
-
-      {sampleId && <FullResponse key={sampleId} queryId={queryId} sampleId={sampleId} />}
     </div>
   )
 }

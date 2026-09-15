@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 
 from .base import DatasetAdapter
 from .corpus import CorpusIndex
-from .models import CanonicalSample, DataDependency, make_sample_id
+from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample_id
 
 HOP_PREFIXES = ("2hop", "3hop1", "3hop2", "4hop1", "4hop2", "4hop3")
 
@@ -47,6 +47,7 @@ class MusiqueAdapter(DatasetAdapter):
     provides: ClassVar[frozenset[DataDependency]] = frozenset(
         {DataDependency.GOLD_DOCS, DataDependency.REFERENCE_ANSWERS}
     )
+    subset_strategy: ClassVar[SubsetStrategy] = SubsetStrategy.STRATIFIED_HOP
 
     def expected_qa_rows(self) -> int:
         return 1000

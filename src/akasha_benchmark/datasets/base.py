@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
 from .corpus import CorpusIndex
-from .models import CanonicalSample, DataDependency
+from .models import CanonicalSample, DataDependency, SubsetStrategy
 
 
 class DatasetAdapter(ABC):
@@ -23,6 +23,10 @@ class DatasetAdapter(ABC):
     corpus_filename: ClassVar[str]
     # 这个数据集拥有哪些标注，决定哪些指标算得出来。
     provides: ClassVar[frozenset[DataDependency]]
+    # 编译抽子集走哪条路。
+    subset_strategy: ClassVar[SubsetStrategy]
+    # 假就是本地数据集：下载阶段只校验存在性，不发 HTTP。
+    downloadable: ClassVar[bool] = True
     version: ClassVar[str] = "1"
 
     def has(self, dependency: DataDependency) -> bool:

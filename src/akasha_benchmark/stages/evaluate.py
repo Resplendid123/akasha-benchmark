@@ -21,8 +21,8 @@ from ..judge import (
     faithfulness,
 )
 from ..judge.client import (
-    JudgeClient,
     JudgeProvider,
+    complete_many,
     parse_json_object,
 )
 from ..judge.providers import resolve_provider
@@ -52,7 +52,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def resolve_metrics(selected: list[str] | None) -> list[str]:
-    """校验勾选的指标名，空表示全量。拼错的名字报错而不是忽略。"""
+    """校验勾选的指标名，空表示全量。"""
     if not selected:
         return sorted(registry.METRIC_REGISTRY)
     unknown = sorted(set(selected) - set(registry.METRIC_REGISTRY))
@@ -108,7 +108,6 @@ def evaluate_dataset(
         sample = samples.get(row["sample_id"])
         if sample is None:
             raise ValueError(f"{dataset}: 样本 {row['sample_id']!r} 有响应但不在这次编译的子集里")
-        # 按 ID 匹配后再比一次问题文本，抓「ID 对得上而内容变了」。
         if row["question"] != sample["question"]:
             raise ValueError(f"{row['sample_id']}: 响应与子集的问题文本不一致，子集被重建过")
 
@@ -231,6 +230,80 @@ def _judge_task(
     raise ValueError(f"没有实现 judge 指标 {metric!r}")
 
 
+def _record_reply(
+    ctx: TaskContext, eval_id: int, metric: str, row: dict[str, Any], parse: Any, reply: Any
+) -> None:
+    """把一条 judge 回复写库。失败该条记 None，不记 0。"""
+    if reply.failure_kind:
+        eval_store.record_judge_verdict(
+            ctx.db,
+            eval_id,
+            sample_id=row["sample_id"],
+            metric=metric,
+            score=None,
+            failure_kind=reply.failure_kind,
+            latency_ms=reply.latency_ms,
+            detail={
+                "raw_response": reply.content,
+                "raw_http_response": (reply.raw or "")[:2000],
+            },
+        )
+        return
+    try:
+        score, reasoning = parse(parse_json_object(reply.content or ""))
+    except ValueError as exc:
+        # 模型没按 schema 输出，记 parse_error 而不是猜一个分数。
+        eval_store.record_judge_verdict(
+            ctx.db,
+            eval_id,
+            sample_id=row["sample_id"],
+            metric=metric,
+            score=None,
+            failure_kind="parse_error",
+            detail={
+                "error": str(exc)[:300],
+                "raw_response": reply.content,
+                "raw_http_response": (reply.raw or "")[:2000],
+            },
+        )
+        ctx.log(
+            f"{metric} parse_error sample={row['sample_id']}: "
+            f"{exc}\n--- reply.raw ---\n{(reply.raw or '')[:3500]}",
+            level="warning",
+        )
+        return
+    eval_store.record_judge_verdict(
+        ctx.db,
+        eval_id,
+        sample_id=row["sample_id"],
+        metric=metric,
+        score=score,
+        failure_kind=None,
+        detail={
+            **reasoning,
+            "raw_response": reply.content,
+            "raw_http_response": (reply.raw or "")[:2000],
+        },
+    )
+    ctx.log(
+        f"{metric} sample={row['sample_id']} score={score} "
+        f"--- reply.raw ---\n{(reply.raw or '')[:3500]}",
+        level="info",
+    )
+    if score is not None:
+        eval_store.record_sample_eval(
+            ctx.db,
+            eval_id,
+            sample_id=row["sample_id"],
+            dataset=row["dataset"],
+            answer_mode=row["answer_mode"],
+            http_status=row["http_status"],
+            answer=row["answer"] or "",
+            detail=row["detail"],
+            metrics={metric: score},
+        )
+
+
 def _judge(
     ctx: TaskContext,
     eval_id: int,
@@ -253,9 +326,15 @@ def _judge_one(
     rows = [r for r in eval_store.sample_evals(ctx.db, eval_id) if r["sample_id"] not in already]
     if already:
         ctx.log(f"{metric} 续跑：已判 {len(already)} 条，待判 {len(rows)} 条")
-    with JudgeClient(provider) as client:
-        for position, row in enumerate(rows, 1):
-            ctx.checkpoint()
+
+    concurrency = max(1, provider.concurrency)
+    done = 0
+    # 分批：主线程拼 prompt、并发调用、按序落库，暂停只等当前批收尾。
+    for start in range(0, len(rows), concurrency):
+        ctx.checkpoint()
+        batch = rows[start : start + concurrency]
+        pending: list[tuple[dict[str, Any], Any, tuple[str, str]]] = []
+        for row in batch:
             response = query_store.response_of(ctx.db, query_id, row["sample_id"])
             body = (response or {}).get("response") or {}
             references = (row["detail"] or {}).get("reference_answers") or []
@@ -279,57 +358,16 @@ def _judge_one(
                 )
             else:
                 prompt, parse = task
-                reply = client.complete(*prompt)
-                if reply.failure_kind:
-                    eval_store.record_judge_verdict(
-                        ctx.db,
-                        eval_id,
-                        sample_id=row["sample_id"],
-                        metric=metric,
-                        score=None,
-                        failure_kind=reply.failure_kind,
-                        latency_ms=reply.latency_ms,
-                        detail={"raw": (reply.raw or "")[:500]},
-                    )
-                else:
-                    try:
-                        score, reasoning = parse(parse_json_object(reply.content or ""))
-                    except ValueError as exc:
-                        # 模型没按 schema 输出，记 parse_error 而不是猜一个分数。
-                        eval_store.record_judge_verdict(
-                            ctx.db,
-                            eval_id,
-                            sample_id=row["sample_id"],
-                            metric=metric,
-                            score=None,
-                            failure_kind="parse_error",
-                            detail={"error": str(exc)[:300]},
-                        )
-                    else:
-                        eval_store.record_judge_verdict(
-                            ctx.db,
-                            eval_id,
-                            sample_id=row["sample_id"],
-                            metric=metric,
-                            score=score,
-                            failure_kind=None,
-                            detail=reasoning,
-                        )
-                        if score is not None:
-                            eval_store.record_sample_eval(
-                                ctx.db,
-                                eval_id,
-                                sample_id=row["sample_id"],
-                                dataset=row["dataset"],
-                                answer_mode=row["answer_mode"],
-                                http_status=row["http_status"],
-                                answer=row["answer"] or "",
-                                detail=row["detail"],
-                                metrics={metric: score},
-                            )
-            ctx.db.commit()
-            if position % 5 == 0 or position == len(rows):
-                ctx.progress(position, len(rows), metric)
+                pending.append((row, parse, prompt))
+
+        replies = complete_many(provider, [p for _, _, p in pending], concurrency)
+        for (row, parse, _), reply in zip(pending, replies):
+            _record_reply(ctx, eval_id, metric, row, parse, reply)
+
+        ctx.db.commit()
+        done += len(batch)
+        if start % (concurrency * 5) == 0 or done == len(rows):
+            ctx.progress(done, len(rows), metric)
 
     summary = eval_store.judge_summary(ctx.db, eval_id, metric)
     for dataset, mean, count in eval_store.judge_means_by_dataset(ctx.db, eval_id, metric):

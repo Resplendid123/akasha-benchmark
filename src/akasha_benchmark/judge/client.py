@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import json
+import queue
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +56,7 @@ class JudgeProvider:
     api_key: str = ""
     timeout_seconds: float = 120.0
     provider_id: int | None = None
+    concurrency: int = 1
 
     def resolve_key(self) -> str:
         key = (self.api_key or "").strip()
@@ -184,6 +187,39 @@ class JudgeClient:
                 return JudgeReply(None, FAILURE_PARSE, response.text[:500], response.status_code)
 
             return JudgeReply(content, None, response.text[:2000], 200)
+
+
+def complete_many(
+    provider: JudgeProvider, prompts: list[tuple[str, str]], concurrency: int
+) -> list[JudgeReply]:
+    """并发跑一批 ``(system, user)``，按输入顺序返回结果。
+
+    每个 worker 一个独立 ``JudgeClient``：httpx.Client 不宜跨线程共用。
+    只有网络调用进线程池，调用方在主线程解析与落库。
+    """
+    if concurrency <= 1 or len(prompts) <= 1:
+        with JudgeClient(provider) as client:
+            return [client.complete(system, user) for system, user in prompts]
+
+    workers = min(concurrency, len(prompts))
+    clients = [JudgeClient(provider) for _ in range(workers)]
+    try:
+        pool: queue.Queue[JudgeClient] = queue.Queue()
+        for client in clients:
+            pool.put(client)
+
+        def task(prompt: tuple[str, str]) -> JudgeReply:
+            borrowed = pool.get()
+            try:
+                return borrowed.complete(*prompt)
+            finally:
+                pool.put(borrowed)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(task, prompts))
+    finally:
+        for client in clients:
+            client.close()
 
 
 def parse_json_object(content: str) -> dict[str, Any]:

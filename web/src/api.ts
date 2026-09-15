@@ -1,4 +1,5 @@
 import type {
+  AkashaConfigsView,
   AttributionDetail,
   CompileDoc,
   CompileRun,
@@ -8,6 +9,7 @@ import type {
   DatasetEntry,
   EvalDetail,
   EvalSampleDetail,
+  EvalSampleList,
   Lineage,
   MetricsView,
   ModelConfigsView,
@@ -107,6 +109,21 @@ export const api = {
   deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
   // 真调一次这个端点，发一句 hi。
   probeProvider: (id: number) => post<ProviderProbe>(`/api/providers/${id}/probe`),
+  // Akasha 模型配置组：本地多组，可整组应用到远端。
+  akashaConfigs: () => request<AkashaConfigsView>('/api/akasha-configs'),
+  saveAkashaConfig: (payload: Record<string, unknown>) =>
+    put<{ id: number; label: string }>('/api/akasha-configs', payload),
+  deleteAkashaConfig: (id: number) => del<{ deleted: number }>(`/api/akasha-configs/${id}`),
+  applyAkashaConfig: (id: number) =>
+    post<{ applied: string[]; requires_new_compile: boolean; impact: string }>(
+      `/api/akasha-configs/${id}/apply`,
+    ),
+  exportConfig: () => request<Record<string, unknown>>('/api/config/export'),
+  importConfig: (data: Record<string, unknown>) =>
+    post<{ connection: string[]; providers: number; akasha_configs: number }>(
+      '/api/config/import',
+      data,
+    ),
 
   // --- 数据集层与归一化层 ---
   datasets: () => request<{ datasets: DatasetEntry[]; dataset_dir: string }>('/api/datasets'),
@@ -135,7 +152,13 @@ export const api = {
       `/api/compiles/${id}/docs${query(params)}`,
     ),
   deleteCompile: (id: number) =>
-    del<{ deleted: number; space_id: string | null; note: string }>(`/api/compiles/${id}`),
+    del<{
+      deleted: number
+      space_id: string | null
+      cancelled_runs: number
+      removed_bullmq_jobs: number
+      note: string
+    }>(`/api/compiles/${id}`),
 
   // --- 查询层 ---
   responses: (
@@ -150,6 +173,8 @@ export const api = {
 
   // --- 评测层 ---
   evalRun: (id: number) => request<EvalDetail>(`/api/evals/${id}`),
+  evalSamples: (id: number, params: { dataset?: string; limit?: number; offset?: number } = {}) =>
+    request<EvalSampleList>(`/api/evals/${id}/samples${query(params)}`),
   evalSample: (id: number, sampleId: string) =>
     request<EvalSampleDetail>(`/api/evals/${id}/samples/${encodeURIComponent(sampleId)}`),
   deleteEval: (id: number) => del<{ deleted: number }>(`/api/evals/${id}`),

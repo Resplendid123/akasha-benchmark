@@ -17,28 +17,43 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 # doc_id / sample_id 的口径收在这里一处，预处理与评测两侧都从这里读。
-# native_id 用原生标识字段；row_idx 用原始全量文件行号，抽子集后不重新编号。
-# corpus 行身份：hotpotqa 与 narrativeqa 有原生 "idx"，2wiki 与 musique 用行号
-# （musique 的 title 有歧义时用 (title, text) 消歧）。
+# corpus 行身份：值是原生身份字段名，或哨兵 "row_idx" 表示用原始全量文件行号
+# （抽子集后不重新编号）。musique 的 title 有歧义时用 (title, text) 消歧。
 CORPUS_ID_RULES: dict[str, str] = {
-    "hotpotqa": "native_id",
+    "hotpotqa": "idx",
     "2wikimultihopqa": "row_idx",
     "musique": "row_idx",
-    "narrativeqa": "native_id",
+    "narrativeqa": "idx",
+    "itfaq": "id",
 }
 
-# 样本身份。hotpotqa / 2wiki 的原生字段是 "_id"，musique 是 "id"；
+# 样本身份。hotpotqa / 2wiki 的原生字段是 "_id"，musique 与 itfaq 是 "id"；
 # narrativeqa 没有原生 QA ID，用它在全量文件里的行号字符串。
 SAMPLE_ID_RULES: dict[str, str] = {
     "hotpotqa": "native_id",
     "2wikimultihopqa": "native_id",
     "musique": "native_id",
     "narrativeqa": "row_idx",
+    "itfaq": "native_id",
 }
 
 
 class DependencyError(RuntimeError):
     """数据集缺少某个指标所需的数据依赖时抛出，而不是返回 0.0。"""
+
+
+class SubsetStrategy(StrEnum):
+    """编译抽子集走哪条路。适配器声明，``stages/compile`` 按声明分派。"""
+
+    # 先均匀抽 QA，再取它们的 gold 加负样本。
+    QA_THEN_GOLD = "uniform_qa_then_gold_corpus"
+    # 同上，但 QA 按跳数分层 —— musique 不分层几乎全是 2hop。
+    STRATIFIED_HOP = "stratified_by_hop"
+    # 整篇取文档，再取属于这些文档的问题。要求样本带 document_id。
+    WHOLE_DOCS = "whole_documents"
+    # 语料全量导入，只抽 QA。给「没有 gold 也没有问题→文档映射」的数据集用：
+    # 抽语料就无法保证被抽到的问题还答得上。
+    FULL_CORPUS = "full_corpus"
 
 
 class DataDependency(StrEnum):
@@ -92,7 +107,13 @@ class CorpusDoc(BaseModel):
 
         导入服务取首个 heading 当 page title，所以 heading 负责 title、
         文件名负责 doc_id，重复 title 因此不影响身份追踪。
+
+        正文首行已经是这个 heading 时不再加一遍（itfaq 的语料自带）。
+        比的是首行精确相等：musique 有正文以 ``# `` 开头的表格片段，那些不算。
         """
+        first = self.text.lstrip().splitlines()[0] if self.text.strip() else ""
+        if first == f"# {self.title}":
+            return f"{self.text.strip()}\n"
         return f"# {self.title}\n\n{self.text}\n"
 
 

@@ -8,9 +8,11 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from akasha_benchmark.datasets import DATASET_NAMES
 from akasha_benchmark.stages import STAGES, StageSpec
 from akasha_benchmark.store import (
     compile_store,
+    config_store,
     connect,
     query_store,
     run_store,
@@ -121,6 +123,84 @@ def test_pause_stops_at_checkpoint_and_resume_continues(settings, monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("action", ["pause", "cleanup"])
+def test_compile_task_action_cancels_remote_bullmq_run(settings, db, monkeypatch, action):
+    """暂停和清理通过 Akasha 控制面取消精确 Run，不暂停共享 BullMQ 队列。"""
+    calls: list[tuple[str, str]] = []
+
+    class FakeAkasha:
+        def __init__(self, config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def login(self):
+            pass
+
+        def cancel_compile_run(self, run_id, reason):
+            calls.append((run_id, reason))
+            return {"disposition": "cancelled", "removedJobCount": 2}
+
+    monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
+    task_id = task_store.create_task(
+        db,
+        stage="compile",
+        params={"remote_compile_run_ids": ["run-1"]},
+    )
+    task_store.transition(
+        db, task_id, task_store.RUNNING if action == "pause" else task_store.PAUSED
+    )
+    db.commit()
+
+    runner = TaskRunner(settings)
+    getattr(runner, action)(task_id)
+
+    assert [run_id for run_id, _ in calls] == ["run-1"]
+    assert calls[0][1].startswith("Akasha-Benchmark task")
+
+
+def test_cleanup_finds_active_remote_run_for_legacy_compile_task(settings, db, monkeypatch):
+    """旧任务没保存 runId 时，用绑定空间找活动 Run。"""
+    calls: list[str] = []
+
+    class FakeAkasha:
+        def __init__(self, config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def login(self):
+            pass
+
+        def run_diagnostics(self, space_ids, *, limit=50):
+            return {"items": [{"runId": "active-run", "status": "compiling"}]}
+
+        def cancel_compile_run(self, run_id, reason):
+            calls.append(run_id)
+            return {"disposition": "cancelled", "removedJobCount": 1}
+
+    monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
+    compile_id = compile_store.create_compile_run(
+        db, run_id="legacy", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
+    )
+    compile_store.update_compile_run(db, compile_id, space_id="space-1")
+    task_id = task_store.create_task(db, stage="compile", params={})
+    task_store.set_task_target(db, task_id, "compile", compile_id)
+    task_store.transition(db, task_id, task_store.FAILED)
+    db.commit()
+
+    TaskRunner(settings).cleanup(task_id)
+    assert calls == ["active-run"]
+
+
 def test_running_task_cannot_be_cleaned_up(settings, monkeypatch):
     """在跑的任务不许删 —— 那会留下一个没人认领的线程还在写库。"""
     release = threading.Event()
@@ -194,7 +274,8 @@ def test_health_and_stages(client):
 
 def test_datasets_route_reports_missing_files(client):
     body = client.get("/api/datasets").json()
-    assert len(body["datasets"]) == 4
+    # 跟注册表比，而不是写死条数 —— 加一组适配器不该让这条测试失败。
+    assert {d["name"] for d in body["datasets"]} == set(DATASET_NAMES)
     entry = next(d for d in body["datasets"] if d["name"] == "hotpotqa")
     assert entry["normalized"] is False
     assert "sample_id" in entry["identity_rules"]
@@ -212,17 +293,18 @@ def test_metrics_route_narrows_by_dataset(client):
 
 
 def test_connection_put_only_updates_given_fields(client):
-    client.put("/api/connection", json={"base_url": "http://x", "email": "a@b"})
+    client.put("/api/connection", json={"base_url": "http://x", "email": "a@b", "password": ""})
     body = client.get("/api/connection").json()
     assert body["base_url"] == "http://x"
     assert body["password"] == ""
 
+    # 只提交 password，base_url 不该被动。
     client.put("/api/connection", json={"password": "p"})
     body = client.get("/api/connection").json()
     assert body["base_url"] == "http://x"
     assert body["password"] == "p"
 
-    assert client.put("/api/connection", json={"concurrency": "many"}).status_code == 422
+    assert client.put("/api/connection", json={"timeout_seconds": "many"}).status_code == 422
 
 
 def test_provider_api_key_never_leaves_the_backend(client):
@@ -335,6 +417,163 @@ def test_provider_probe_reports_missing_key(client):
 
 def test_provider_probe_404s_on_unknown_endpoint(client):
     assert client.post("/api/providers/9999/probe").status_code == 404
+
+
+def test_provider_stores_and_returns_concurrency(client):
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "concurrency": 4},
+    )
+    provider = client.get("/api/providers?role=judge").json()[0]
+    assert provider["concurrency"] == 4
+
+    from akasha_benchmark.judge.providers import resolve_provider
+
+    connection = connect(client.app.state.settings.db_path)
+    try:
+        provider_id = config_store.upsert_provider(
+            connection,
+            role="judge",
+            label="k",
+            base_url="https://x/v1",
+            model="m",
+            api_key="key",
+            concurrency=3,
+        )
+        connection.commit()
+        resolved = resolve_provider(connection, provider_id, "judge")
+    finally:
+        connection.close()
+    assert resolved.concurrency == 3
+
+
+def test_akasha_config_group_roundtrip_hides_keys(client):
+    client.put(
+        "/api/akasha-configs",
+        json={
+            "label": "g1",
+            "configs": {
+                "compiler": {"model": "c", "baseUrl": "https://x/v1", "apiKey": "secret"},
+            },
+        },
+    )
+    body = client.get("/api/akasha-configs").json()
+    group = body["groups"][0]
+    assert group["label"] == "g1"
+    assert group["configs"]["compiler"]["apiKeySet"] is True
+    assert "apiKey" not in group["configs"]["compiler"]
+
+    # 密钥留空保留原值。
+    client.put(
+        "/api/akasha-configs",
+        json={"id": group["id"], "label": "g1", "configs": {"compiler": {"model": "c2"}}},
+    )
+    connection = connect(client.app.state.settings.db_path, read_only=True)
+    try:
+        stored = config_store.list_config_groups(connection)[0]
+    finally:
+        connection.close()
+    from akasha_benchmark.store import loads
+
+    configs = loads(stored["configs_json"], {})
+    assert configs["compiler"]["apiKey"] == "secret"
+    assert configs["compiler"]["model"] == "c2"
+
+
+def test_akasha_config_delete(client):
+    client.put("/api/akasha-configs", json={"label": "a", "configs": {}})
+    client.put("/api/akasha-configs", json={"label": "b", "configs": {}})
+    groups = {g["label"]: g["id"] for g in client.get("/api/akasha-configs").json()["groups"]}
+
+    assert client.delete(f"/api/akasha-configs/{groups['a']}").status_code == 200
+    labels = [g["label"] for g in client.get("/api/akasha-configs").json()["groups"]]
+    assert labels == ["b"]
+
+
+def test_akasha_config_apply_pushes_all_features(client, monkeypatch):
+    client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
+    client.put(
+        "/api/akasha-configs",
+        json={
+            "label": "g",
+            "configs": {"answer": {"model": "a", "baseUrl": "https://x/v1", "apiKey": "k"}},
+        },
+    )
+    group_id = client.get("/api/akasha-configs").json()["groups"][0]["id"]
+
+    from akasha_platform.api import config as config_api
+
+    pushed = []
+
+    class Fake:
+        def __init__(self, cfg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def login(self):
+            pass
+
+        def put_model_config(self, feature, payload):
+            pushed.append((feature, payload))
+            return {}
+
+    monkeypatch.setattr(config_api, "AkashaClient", Fake)
+    body = client.post(f"/api/akasha-configs/{group_id}/apply").json()
+    assert set(body["applied"]) == set(config_api.FEATURES)
+    assert all(payload["provider"] == "openai-compatible" for _, payload in pushed)
+
+    # 应用后该组即为选中。
+    selected = [g for g in client.get("/api/akasha-configs").json()["groups"] if g["selected"]]
+    assert [g["id"] for g in selected] == [group_id]
+
+
+def test_config_export_includes_plaintext_secrets(client):
+    client.put("/api/connection", json={"password": "pw", "email": "e@x"})
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "sk"},
+    )
+    client.put(
+        "/api/akasha-configs",
+        json={"label": "g", "configs": {"answer": {"model": "a", "apiKey": "gk"}}},
+    )
+    body = client.get("/api/config/export").json()
+    assert body["connection"]["password"] == "pw"
+    assert body["providers"][0]["api_key"] == "sk"
+    assert body["akasha_configs"][0]["configs"]["answer"]["apiKey"] == "gk"
+
+
+def test_config_import_round_trips_export(client):
+    client.put("/api/connection", json={"password": "pw", "email": "e@x", "base_url": "http://y"})
+    client.put(
+        "/api/providers/judge",
+        json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "sk"},
+    )
+    client.put(
+        "/api/akasha-configs",
+        json={"label": "g", "configs": {"answer": {"model": "a", "apiKey": "gk"}}},
+    )
+    exported = client.get("/api/config/export").json()
+
+    # 清一遍再导回：导入后应与导出前一致。
+    client.put("/api/connection", json={"password": "", "email": "", "base_url": ""})
+    assert client.post("/api/config/import", json=exported).status_code == 200
+
+    back = client.get("/api/config/export").json()
+    assert back["connection"]["password"] == "pw"
+    assert back["connection"]["base_url"] == "http://y"
+    assert back["providers"][0]["api_key"] == "sk"
+    assert back["akasha_configs"][0]["configs"]["answer"]["apiKey"] == "gk"
+
+
+def test_config_import_rejects_bad_role(client):
+    payload = {"providers": [{"role": "nonsense", "label": "d", "base_url": "u", "model": "m"}]}
+    assert client.post("/api/config/import", json=payload).status_code == 422
 
 
 def test_connection_test_flags_compiles_in_another_workspace(client, db_path, monkeypatch):
@@ -498,7 +737,21 @@ def test_missing_records_return_404(client):
         assert client.get(path).status_code == 404, path
 
 
-def test_compile_cleanup_reports_untouched_space(client, db_path):
+def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, monkeypatch):
+    calls: list[str] = []
+
+    class FakeAkasha:
+        def __init__(self, config): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def login(self): pass
+        def run_diagnostics(self, space_ids, *, limit=50):
+            return {"items": [{"runId": "run-1", "status": "compiling"}]}
+        def cancel_compile_run(self, run_id, reason):
+            calls.append(run_id)
+            return {"disposition": "cancelled", "removedJobCount": 2}
+
+    monkeypatch.setattr("akasha_platform.api.runs.AkashaClient", FakeAkasha)
     connection = connect(db_path)
     try:
         compile_id = compile_store.create_compile_run(
@@ -512,7 +765,10 @@ def test_compile_cleanup_reports_untouched_space(client, db_path):
     body = client.delete(f"/api/compiles/{compile_id}").json()
     assert body["deleted"] == 1
     assert body["space_id"] == "space-1"
-    assert "没有删除" in body["note"]
+    assert body["cancelled_runs"] == 1
+    assert body["removed_bullmq_jobs"] == 2
+    assert calls == ["run-1"]
+    assert "空间没有删除" in body["note"]
 
 
 def test_cleanup_refused_while_a_task_writes_the_record(client, db_path):
