@@ -45,6 +45,12 @@
 存储按 `compile_store`、`query_store`、`eval_store`、`attribution_store` 分文件，直接执行 SQL。
 `run_store` 只维护共享状态与上下游依赖；模型端点解析集中在 `judge/providers.py`。
 
+数据库以 `store/schema.sql` 定义最终结构，不提供迁移或旧结构兼容分支。
+`compile_sample`、`query_sample` 只存运行与样本的关联，数据集名从 `sample` 读取；
+`sample_metric` 通过复合外键归属 `sample_eval`，数据集名从评测样本读取，删除评测样本时自动清理指标。
+查询的回答模式从完整 `response_json` 解析，不重复存列。
+查询的问题文本、评测明细、运行模型配置保留为执行时快照；汇总表保存各次评测的结果与有效样本数。
+
 ## 执行前检查与报告口径
 
 - **账号权限**：编译前要求账号角色为 owner。

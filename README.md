@@ -43,6 +43,8 @@ make web           # 前端 :5173
 四组 HippoRAG_2 数据集由数据集页下载；`itfaq`（628 条中文 IT 支持问答、42 篇文档）
 是本地数据集，不在下载源里，需手动放进 `dataset/`。
 后端启动时按 `src/akasha_benchmark/store/schema.sql` 建表。该文件定义完整结构，不提供旧数据库迁移。
+结构变更后使用新数据库：停止后端，将旧库连同 `-wal` / `-shm` 文件一并移走，
+再启动后端建库；也可通过 `AKASHA_PLATFORM_DB` 指定新路径。配置可在重建前从配置页导出，重建后导入。
 
 一次编译对应一个 `run_id`，记录抽样配置与模型快照。查询前比对当前模型配置与快照：
 embedding 不一致时拒绝执行；compiler、answer 或 image 不一致时记录警告。

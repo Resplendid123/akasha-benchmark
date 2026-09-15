@@ -5,8 +5,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from .data_store import sample_from_row
 from .db import dumps, loads, utc_now
-from .run_store import STATUS_RUNNING, STATUS_SUCCEEDED
+from .run_store import STATUS_RUNNING, STATUS_SUCCEEDED, get_run
 
 
 def create_compile_run(
@@ -53,8 +54,7 @@ def update_compile_run(connection: sqlite3.Connection, compile_id: int, **fields
 
 
 def get_compile_run(connection: sqlite3.Connection, compile_id: int) -> dict[str, Any] | None:
-    row = connection.execute("SELECT * FROM compile_run WHERE id = ?", (compile_id,)).fetchone()
-    return dict(row) if row else None
+    return get_run(connection, "compile", compile_id)
 
 
 def compile_run_by_run_id(connection: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
@@ -79,14 +79,16 @@ def replace_compile_subset(
 ) -> None:
     """写入一个数据集的子集。重抽样先删旧行，免得残留被一起导入。"""
     connection.execute(
-        "DELETE FROM compile_sample WHERE compile_id = ? AND dataset = ?", (compile_id, dataset)
+        "DELETE FROM compile_sample WHERE compile_id = ? "
+        "AND sample_id IN (SELECT sample_id FROM sample WHERE dataset = ?)",
+        (compile_id, dataset),
     )
     connection.execute(
         "DELETE FROM compile_doc WHERE compile_id = ? AND dataset = ?", (compile_id, dataset)
     )
     connection.executemany(
-        "INSERT INTO compile_sample (compile_id, sample_id, dataset) VALUES (?, ?, ?)",
-        [(compile_id, sample_id, dataset) for sample_id in sample_ids],
+        "INSERT INTO compile_sample (compile_id, sample_id) VALUES (?, ?)",
+        [(compile_id, sample_id) for sample_id in sample_ids],
     )
     connection.executemany(
         "INSERT INTO compile_doc (compile_id, dataset, doc_id, is_gold) VALUES (?, ?, ?, ?)",
@@ -98,24 +100,16 @@ def compile_samples(
     connection: sqlite3.Connection, compile_id: int, dataset: str | None = None
 ) -> list[dict[str, Any]]:
     sql = """
-        SELECT s.*, cs.dataset AS subset_dataset
+        SELECT s.*
         FROM compile_sample cs JOIN sample s ON s.sample_id = cs.sample_id
         WHERE cs.compile_id = ?
     """
     params: list[Any] = [compile_id]
     if dataset:
-        sql += " AND cs.dataset = ?"
+        sql += " AND s.dataset = ?"
         params.append(dataset)
     return [
-        {
-            "sample_id": row["sample_id"],
-            "dataset": row["dataset"],
-            "dataset_sample_id": row["dataset_sample_id"],
-            "question": row["question"],
-            "answers": loads(row["answers_json"], []),
-            "gold_doc_ids": loads(row["gold_doc_ids_json"], []),
-            "metadata": loads(row["metadata_json"], {}),
-        }
+        sample_from_row(row)
         for row in connection.execute(sql + " ORDER BY s.sample_id", params)
     ]
 
@@ -182,7 +176,8 @@ def compile_stats(connection: sqlite3.Connection, compile_id: int) -> dict[str, 
     )
     per_dataset = {row["dataset"]: dict(row) for row in rows}
     samples = connection.execute(
-        "SELECT dataset, COUNT(*) AS n FROM compile_sample WHERE compile_id = ? GROUP BY dataset",
+        "SELECT s.dataset, COUNT(*) AS n FROM compile_sample cs "
+        "JOIN sample s ON s.sample_id = cs.sample_id WHERE cs.compile_id = ? GROUP BY s.dataset",
         (compile_id,),
     )
     for row in samples:

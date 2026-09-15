@@ -165,61 +165,14 @@ def test_verdicts_are_stored_per_metric(db, eval_id):
             failure_kind=None,
             detail={"raw_response": f"raw-{name}"},
         )
-    db.commit()
+    assert eval_store.judged_sample_ids(db, eval_id, "faithfulness") == {"s1"}
+    assert eval_store.judged_sample_ids(db, eval_id, "context_relevancy") == set()
+    assert eval_store.judged_sample_ids(db, eval_id) == {"s1"}
 
     verdicts = {v["metric"]: v["score"] for v in eval_store.judge_verdicts(db, eval_id)}
     assert verdicts == {"faithfulness": 0.5, "answer_relevancy": 1.0}
     assert eval_store.judge_verdicts(db, eval_id)[0]["detail"]["raw_response"]
     assert eval_store.judge_verdicts(db, eval_id, include_detail=False)[0]["detail"] is None
-
-
-def test_resume_is_per_metric(db, eval_id):
-    """续跑要逐指标问：判过 faithfulness 的样本不能让另一个指标整批跳过。"""
-    eval_store.record_judge_verdict(
-        db,
-        eval_id,
-        sample_id="s1",
-        metric="faithfulness",
-        score=1.0,
-        failure_kind=None,
-        detail=None,
-    )
-    db.commit()
-
-    assert eval_store.judged_sample_ids(db, eval_id, "faithfulness") == {"s1"}
-    assert eval_store.judged_sample_ids(db, eval_id, "answer_relevancy") == set()
-    # 不带指标名时是全部，供汇总用。
-    assert eval_store.judged_sample_ids(db, eval_id) == {"s1"}
-
-
-def test_latency_mean_excludes_skipped(db, eval_id):
-    """跳过的条目没发过调用，不能进延迟均值 —— 那会把均值拉低。"""
-    eval_store.record_judge_verdict(
-        db,
-        eval_id,
-        sample_id="s1",
-        metric="faithfulness",
-        score=1.0,
-        failure_kind=None,
-        detail=None,
-        latency_ms=2000,
-    )
-    # 跳过：无定义，没有调用。
-    eval_store.record_judge_verdict(
-        db,
-        eval_id,
-        sample_id="s2",
-        metric="faithfulness",
-        score=None,
-        failure_kind=None,
-        detail={"skipped": "x"},
-        latency_ms=None,
-    )
-    db.commit()
-
-    summary = eval_store.judge_summary(db, eval_id, "faithfulness")
-    assert summary["latency_mean"] == 2000
-    assert summary["total"] == 2
 
 
 @pytest.mark.parametrize("status", [200, 400], ids=["success", "failure"])
@@ -238,29 +191,26 @@ def test_judge_reply_carries_latency(status):
     assert reply.latency_ms is not None and reply.latency_ms >= 0
 
 
-def test_summary_scopes_to_one_metric(db, eval_id):
-    """失败率要按指标算：一个指标全失败不该把另一个的失败率也拉高。"""
-    eval_store.record_judge_verdict(
-        db,
-        eval_id,
-        sample_id="s1",
-        metric="faithfulness",
-        score=1.0,
-        failure_kind=None,
-        detail=None,
-    )
-    eval_store.record_judge_verdict(
-        db,
-        eval_id,
-        sample_id="s1",
-        metric="answer_relevancy",
-        score=None,
-        failure_kind="http:429",
-        detail=None,
-    )
-    db.commit()
+def test_judge_summary_separates_scores_failures_and_skipped_calls(db, eval_id):
+    for sample_id, metric, score, failure, latency in (
+        ("s1", "faithfulness", 1.0, None, 2000),
+        ("s2", "faithfulness", 0.5, None, 0),
+        ("s3", "faithfulness", None, None, None),
+        ("s1", "answer_relevancy", None, "rate_limit", 4000),
+    ):
+        eval_store.record_judge_verdict(
+            db, eval_id, sample_id=sample_id, metric=metric, score=score,
+            failure_kind=failure, latency_ms=latency, detail=None,
+        )
 
-    assert eval_store.judge_summary(db, eval_id, "faithfulness")["failure_rate"] == 0.0
+    summary = eval_store.judge_summary(db, eval_id)
+    assert summary == {
+        "total": 4, "scored": 2, "failed": 1, "mean": 0.75,
+        "latency_mean": 2000, "failure_rate": 0.25,
+        "failures_by_kind": {"rate_limit": 1},
+    }
+    faithfulness = eval_store.judge_summary(db, eval_id, "faithfulness")
+    assert faithfulness["total"] == 3
+    assert faithfulness["failure_rate"] == 0.0
+    assert faithfulness["latency_mean"] == 1000
     assert eval_store.judge_summary(db, eval_id, "answer_relevancy")["failure_rate"] == 1.0
-    # 不分指标时是两条的合计。
-    assert eval_store.judge_summary(db, eval_id)["total"] == 2

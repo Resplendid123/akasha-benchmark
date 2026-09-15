@@ -25,7 +25,6 @@ _FLOATS = {
     "poll_interval_seconds",
     "poll_timeout_seconds",
 }
-_INTS: set[str] = set()
 
 ROLES = ("judge", "attribution")
 
@@ -59,14 +58,12 @@ def sanitize_connection(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             if key in _FLOATS:
                 cleaned[key] = float(value)
-            elif key in _INTS:
-                cleaned[key] = int(value)
             elif key in _HOST_URLS:
                 cleaned[key] = _prefer_ipv4(str(value).strip())
             else:
                 cleaned[key] = str(value)
         except (TypeError, ValueError) as exc:
-            kind = "number" if key in _FLOATS | _INTS else "string"
+            kind = "number" if key in _FLOATS else "string"
             raise ValueError(f"{key}: expected a {kind}, got {value!r}") from exc
     return cleaned
 

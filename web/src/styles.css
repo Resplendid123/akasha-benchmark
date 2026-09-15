@@ -1,12 +1,4 @@
-/* 白色主题。
- *
- * 颜色不只是配色：这个界面上「缺失」与「0」是两种不同的状态，
- * 「算不了」与「没勾选」是两种不同的原因 —— 它们必须在视觉上分得开，
- * 所以 tag 与 note 各有三档语义色，而不是统一一个灰。
- *
- * 对比度按 WCAG AA 取：正文 #1f2430 对白底约 14:1，muted #5b6472 约 5.4:1,
- * 三档语义色的文字都取深色调（不是原来的亮色调），落在 4.5:1 以上。
- */
+/* 语义色区分缺失、不可计算与失败；正文和状态文字保持 WCAG AA 对比度。 */
 
 :root {
   --bg: #ffffff;
@@ -72,7 +64,6 @@ code, pre, .mono { font-family: var(--mono); }
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .nav button:disabled { color: #a4acb9; cursor: not-allowed; }
-/* 层号：让「第几层」在视觉上就是有序的。 */
 .nav .step {
   font-family: var(--mono); font-size: 11px; color: var(--muted);
   min-width: 12px;
@@ -84,7 +75,6 @@ code, pre, .mono { font-family: var(--mono); }
 h2 { font-size: 19px; margin: 0 0 4px; letter-spacing: -0.01em; }
 h3 { font-size: 15px; margin: 22px 0 8px; }
 h4 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
-/* 链路的分段标题：比 h4 更轻，因为它是 h4 之下的一层。 */
 h5 {
   font-size: 12px; margin: 12px 0 5px; color: var(--muted);
   font-weight: 600; text-transform: none;
@@ -101,16 +91,13 @@ h5 {
 }
 .panel.flat { box-shadow: none; background: transparent; }
 
-/* 面板首行的标题不再各自写 marginTop: 0。 */
 .panel > h3:first-child,
 .panel > .panel-head:first-child h3 { margin-top: 0; }
-/* 标题在左，状态在右。 */
 .panel-head {
   display: flex; justify-content: space-between; align-items: baseline;
   gap: 12px; flex-wrap: wrap;
 }
 .panel-head h3 { margin-bottom: 8px; }
-/* 面板底部的操作区：一条分隔线之下，各面板同一位置。 */
 .panel-actions {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
@@ -151,15 +138,10 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 tbody tr:hover { background: var(--panel-2); }
 tbody tr.selected { background: var(--accent-soft); }
 
-/* 记录表共用一套节奏：剩余宽度按内容比例摊给各数据列，操作列只占按钮那么宽
-   并钉在右侧。
-
-   剩余宽度不能集中给某一列：给第一列，第一二列之间被推开一道大缝；给操作列，
-   缝就跑到最后一列与按钮之间。摊开之后每列都宽松一点，哪儿都没有大缝。 */
+/* 数据列分摊剩余宽度，操作列收窄并靠右，避免列间出现大块空白。 */
 .records-table { table-layout: auto; }
 .records-table td { white-space: nowrap; }
-/* 记录列表里一律左对齐。这里的数字是 1-3 位的计数，右对齐换不来可读性，
-   只会让同一行里左右混排。右对齐留给明细表 —— 那里要纵向比量级。 */
+/* 记录列表统一左对齐；明细表保留数字右对齐，方便纵向比较。 */
 .records-table th.num,
 .records-table td.num { text-align: left; }
 .records-table th:last-child,
@@ -265,7 +247,6 @@ pre.block.tall { max-height: min(300px, 60vh); }
 
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
-/* 名称在上、代号在下。三段字挤在一行会看不清哪段是哪段。 */
 .stack { display: flex; flex-direction: column; gap: 1px; }
 .stack > .mono { font-size: 11px; }
 .mode-group { margin-bottom: 18px; }
@@ -302,7 +283,6 @@ pre.block.tall { max-height: min(300px, 60vh); }
 .metric-grid label { font-size: 13px; }
 .metric-grid label.unavailable { color: #a4acb9; cursor: not-allowed; }
 
-/* 链路概览：一行读完「gold → 编译 → 检索 → 引用」，断在哪一步一眼看到。 */
 .chain-summary {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding: 8px 12px; margin: 6px 0 10px;
@@ -310,7 +290,6 @@ pre.block.tall { max-height: min(300px, 60vh); }
 }
 .chain-summary strong { font-family: var(--mono); }
 
-/* 指标分族：一族一块，标题行带全选。 */
 .metric-family { margin-bottom: 12px; }
 .metric-family > .spread { margin-bottom: 4px; }
 .metric-family + .metric-family { border-top: 1px solid var(--border); padding-top: 10px; }

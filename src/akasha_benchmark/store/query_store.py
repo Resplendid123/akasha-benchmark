@@ -6,7 +6,7 @@ import sqlite3
 from typing import Any
 
 from .db import dumps, loads, utc_now
-from .run_store import STATUS_RUNNING
+from .run_store import STATUS_RUNNING, get_run
 
 
 def create_query_run(
@@ -39,8 +39,7 @@ def create_query_run(
 
 
 def get_query_run(connection: sqlite3.Connection, query_id: int) -> dict[str, Any] | None:
-    row = connection.execute("SELECT * FROM query_run WHERE id = ?", (query_id,)).fetchone()
-    return dict(row) if row else None
+    return get_run(connection, "query", query_id)
 
 
 def query_run_by_name(connection: sqlite3.Connection, name: str) -> dict[str, Any] | None:
@@ -68,8 +67,8 @@ def freeze_query_samples(
 ) -> None:
     """固化这一轮要问哪些样本，续跑据此算待办。"""
     connection.executemany(
-        "INSERT OR IGNORE INTO query_sample (query_id, sample_id, dataset) VALUES (?, ?, ?)",
-        [(query_id, s["sample_id"], s["dataset"]) for s in samples],
+        "INSERT OR IGNORE INTO query_sample (query_id, sample_id) VALUES (?, ?)",
+        [(query_id, s["sample_id"]) for s in samples],
     )
 
 
@@ -77,7 +76,10 @@ def query_samples(connection: sqlite3.Connection, query_id: int) -> list[dict[st
     return [
         dict(r)
         for r in connection.execute(
-            "SELECT * FROM query_sample WHERE query_id = ? ORDER BY sample_id", (query_id,)
+            "SELECT qs.*, s.dataset FROM query_sample qs "
+            "JOIN sample s ON s.sample_id = qs.sample_id "
+            "WHERE qs.query_id = ? ORDER BY qs.sample_id",
+            (query_id,),
         )
     ]
 
@@ -88,7 +90,7 @@ def pending_query_samples(connection: sqlite3.Connection, query_id: int) -> list
         dict(r)
         for r in connection.execute(
             """
-            SELECT qs.sample_id, qs.dataset, s.question
+            SELECT qs.sample_id, s.dataset, s.question
             FROM query_sample qs
             JOIN sample s ON s.sample_id = qs.sample_id
             LEFT JOIN query_response qr
@@ -113,18 +115,16 @@ def record_response(
     error: str | None,
     response: Any,
 ) -> None:
-    mode = response.get("answerMode") if isinstance(response, dict) else None
     connection.execute(
         """
         INSERT INTO query_response
             (query_id, sample_id, dataset, question, http_status,
-             latency_ms, error, answer_mode, response_json, requested_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             latency_ms, error, response_json, requested_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(query_id, sample_id) DO UPDATE SET
             http_status = excluded.http_status,
             latency_ms = excluded.latency_ms,
             error = excluded.error,
-            answer_mode = excluded.answer_mode,
             response_json = excluded.response_json,
             requested_at = excluded.requested_at
         """,
@@ -136,11 +136,19 @@ def record_response(
             http_status,
             latency_ms,
             error,
-            mode,
             dumps(response) if response is not None else None,
             utc_now(),
         ),
     )
+
+
+def _response(row: sqlite3.Row) -> dict[str, Any]:
+    body = loads(row["response_json"])
+    return {
+        **{k: v for k, v in dict(row).items() if k != "response_json"},
+        "response": body,
+        "answer_mode": body.get("answerMode") if isinstance(body, dict) else None,
+    }
 
 
 def responses_of(
@@ -152,10 +160,7 @@ def responses_of(
         sql += " AND dataset = ?"
         params.append(dataset)
     return [
-        {
-            **{k: v for k, v in dict(row).items() if k != "response_json"},
-            "response": loads(row["response_json"]),
-        }
+        _response(row)
         for row in connection.execute(sql + " ORDER BY sample_id", params)
     ]
 
@@ -167,12 +172,7 @@ def response_of(
         "SELECT * FROM query_response WHERE query_id = ? AND sample_id = ?",
         (query_id, sample_id),
     ).fetchone()
-    if row is None:
-        return None
-    return {
-        **{k: v for k, v in dict(row).items() if k != "response_json"},
-        "response": loads(row["response_json"]),
-    }
+    return _response(row) if row else None
 
 
 def delete_failed_responses(connection: sqlite3.Connection, query_id: int) -> int:

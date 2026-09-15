@@ -133,7 +133,7 @@ def clean_params(stage: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def describe() -> list[dict[str, Any]]:
-    """各阶段的参数与代价。前端的任务表单据此生成。"""
+    """各阶段的参数与代价，供 API 和前端展示。"""
     return [
         {
             "stage": spec.name,

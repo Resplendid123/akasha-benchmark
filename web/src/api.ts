@@ -97,17 +97,11 @@ export const api = {
     put<{ updated: string[]; connection: Connection }>('/api/connection', payload),
   testConnection: () => post<ConnectionTest>('/api/connection/test'),
   modelConfigs: () => request<ModelConfigsView>('/api/model-configs'),
-  saveModelConfig: (feature: string, payload: Record<string, unknown>) =>
-    put<{ feature: string; requires_new_compile: boolean; impact: string }>(
-      `/api/model-configs/${feature}`,
-      payload,
-    ),
   providers: (role?: 'judge' | 'attribution') =>
     request<Provider[]>(`/api/providers${query({ role })}`),
   saveProvider: (role: 'judge' | 'attribution', payload: Record<string, unknown>) =>
     put<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, payload),
   deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
-  // 真调一次这个端点，发一句 hi。
   probeProvider: (id: number) => post<ProviderProbe>(`/api/providers/${id}/probe`),
   // Akasha 模型配置组：本地多组，可整组应用到远端。
   akashaConfigs: () => request<AkashaConfigsView>('/api/akasha-configs'),

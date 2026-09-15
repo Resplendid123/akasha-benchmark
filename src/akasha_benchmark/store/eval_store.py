@@ -6,7 +6,7 @@ import sqlite3
 from typing import Any
 
 from .db import dumps, loads, utc_now
-from .run_store import STATUS_RUNNING
+from .run_store import STATUS_RUNNING, get_run
 
 
 def create_eval_run(
@@ -38,8 +38,7 @@ def create_eval_run(
 
 
 def get_eval_run(connection: sqlite3.Connection, eval_id: int) -> dict[str, Any] | None:
-    row = connection.execute("SELECT * FROM eval_run WHERE id = ?", (eval_id,)).fetchone()
-    return dict(row) if row else None
+    return get_run(connection, "eval", eval_id)
 
 
 def eval_run_by_name(connection: sqlite3.Connection, name: str) -> dict[str, Any] | None:
@@ -64,7 +63,7 @@ def delete_eval_run(connection: sqlite3.Connection, eval_id: int) -> int:
 
 def clear_eval_results(connection: sqlite3.Connection, eval_id: int, dataset: str) -> None:
     """重算确定性结果；已有 Judge 分数由 verdict 重新写入指标表。"""
-    for table in ("sample_metric", "sample_eval", "metric_summary", "dataset_eval"):
+    for table in ("sample_eval", "metric_summary", "dataset_eval"):
         connection.execute(
             f"DELETE FROM {table} WHERE eval_id = ? AND dataset = ?", (eval_id, dataset)
         )
@@ -73,8 +72,8 @@ def clear_eval_results(connection: sqlite3.Connection, eval_id: int, dataset: st
 def restore_judge_metrics(connection: sqlite3.Connection, eval_id: int, metric: str) -> None:
     connection.execute(
         """
-        INSERT INTO sample_metric (eval_id, sample_id, dataset, metric, value)
-        SELECT j.eval_id, j.sample_id, s.dataset, j.metric, j.score
+        INSERT INTO sample_metric (eval_id, sample_id, metric, value)
+        SELECT j.eval_id, j.sample_id, j.metric, j.score
         FROM judge_verdict j
         JOIN sample_eval s ON s.eval_id = j.eval_id AND s.sample_id = j.sample_id
         WHERE j.eval_id = ? AND j.metric = ? AND j.score IS NOT NULL
@@ -111,11 +110,11 @@ def record_sample_eval(
     )
     connection.executemany(
         """
-        INSERT INTO sample_metric (eval_id, sample_id, dataset, metric, value)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO sample_metric (eval_id, sample_id, metric, value)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(eval_id, sample_id, metric) DO UPDATE SET value = excluded.value
         """,
-        [(eval_id, sample_id, dataset, name, float(value)) for name, value in metrics.items()],
+        [(eval_id, sample_id, name, float(value)) for name, value in metrics.items()],
     )
 
 
@@ -260,14 +259,14 @@ def samples_ranked_by(
 ) -> list[dict[str, Any]]:
     """按某个指标排序的样本，即归因层的「最差 N 条」。"""
     sql = """
-        SELECT sm.sample_id, sm.dataset, sm.value, se.answer_mode, se.answer
+        SELECT sm.sample_id, se.dataset, sm.value, se.answer_mode, se.answer
         FROM sample_metric sm
         JOIN sample_eval se ON se.eval_id = sm.eval_id AND se.sample_id = sm.sample_id
         WHERE sm.eval_id = ? AND sm.metric = ?
     """
     params: list[Any] = [eval_id, metric]
     if dataset:
-        sql += " AND sm.dataset = ?"
+        sql += " AND se.dataset = ?"
         params.append(dataset)
     sql += f" ORDER BY sm.value {'ASC' if ascending else 'DESC'}, sm.sample_id LIMIT ?"
     params.append(limit)
@@ -366,7 +365,8 @@ def judge_summary(
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN score IS NOT NULL THEN 1 ELSE 0 END) AS scored,
                SUM(CASE WHEN failure_kind IS NOT NULL THEN 1 ELSE 0 END) AS failed,
-               AVG(score) AS mean
+               AVG(score) AS mean,
+               AVG(latency_ms) AS latency_mean
         FROM judge_verdict WHERE eval_id = ?{scope}
         """,
         (eval_id, *extra),
@@ -380,18 +380,12 @@ def judge_summary(
             (eval_id, *extra),
         )
     }
-    # 只算真发过调用的条目：跳过的没有 latency。
-    latency = connection.execute(
-        "SELECT AVG(latency_ms) AS mean FROM judge_verdict "
-        f"WHERE eval_id = ? AND latency_ms IS NOT NULL{scope}",
-        (eval_id, *extra),
-    ).fetchone()
     return {
         "total": total,
         "scored": row["scored"] or 0,
         "failed": row["failed"] or 0,
         "mean": row["mean"],
-        "latency_mean": latency["mean"],
+        "latency_mean": row["latency_mean"],
         "failure_rate": (row["failed"] or 0) / total if total else 0.0,
         "failures_by_kind": kinds,
     }

@@ -4,8 +4,7 @@ import type { Metrics, RootCause, RunStatus, TaskStatus } from './types'
 
 /** 缺失指标显示为 `—`，与数值 0 区分开。 */
 export function metric(values: Metrics, name: string, digits = 4): string {
-  const value = values[name]
-  return value === undefined ? '—' : value.toFixed(digits)
+  return num(values[name], digits)
 }
 
 export function percent(value: number | null | undefined, digits = 1): string {
@@ -16,7 +15,6 @@ export function num(value: number | null | undefined, digits = 0): string {
   return value === null || value === undefined ? '—' : value.toFixed(digits)
 }
 
-/** 毫秒转成人读的时长，跨度从毫秒到小时。 */
 export function duration(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || ms < 0) return '—'
   if (ms < 1000) return `${Math.round(ms)}ms`
@@ -64,7 +62,6 @@ export function Timing({
   )
 }
 
-/** 后端的 UTC 时间戳按 Asia/Shanghai 显示。 */
 export function formatDateTime(value: string | null | undefined): string {
   if (!value) return '—'
   const date = new Date(value)
@@ -191,7 +188,6 @@ export function useAction<T>(): {
   }
 }
 
-/** 有任务在跑时定时刷新。 */
 export function usePoll(active: boolean, reload: () => void, ms = 3000) {
   useEffect(() => {
     if (!active) return
@@ -229,8 +225,7 @@ const STATUS_CLASS: Record<TaskStatus, string> = {
 }
 
 export function StatusTag({ status }: { status: TaskStatus | RunStatus }) {
-  const key = status as TaskStatus
-  return <span className={STATUS_CLASS[key] ?? 'tag'}>{STATUS_TEXT[key] ?? status}</span>
+  return <span className={STATUS_CLASS[status] ?? 'tag'}>{STATUS_TEXT[status] ?? status}</span>
 }
 
 /** answerMode 的显示。非 knowledge 用警告色，它们的检索得分按定义为 0。 */
@@ -253,7 +248,6 @@ export function Bar({ value, kind }: { value: number; kind?: 'ok' | 'bad' }) {
 
 /** 根因的中文名与色档。generation_fallback 用警告色，它不是检索问题。 */
 const ROOT_CAUSE_LABELS: Record<RootCause, { text: string; kind: string }> = {
-  // 唯一一个「没问题」的分类，用 ok 色。
   not_a_failure: { text: '答案正确', kind: 'ok' },
   generation_fallback: { text: '生成端拒答', kind: 'warn' },
   compiled_away: { text: '编译丢词', kind: 'bad' },
@@ -270,7 +264,6 @@ export function CauseTag({ cause }: { cause: string | null }) {
   return <span className={`tag ${entry?.kind ?? ''}`}>{entry?.text ?? cause}</span>
 }
 
-/** 分页控件。总数不超过一页时不渲染。 */
 export function Pager({
   total,
   offset,
@@ -306,7 +299,6 @@ export function Pager({
   )
 }
 
-/** 可折叠段。链路视图里内容全展开会太长。 */
 export function Collapsible({
   title,
   children,
@@ -386,7 +378,6 @@ export function Field({
   )
 }
 
-/** 眼睛与划掉的眼睛。只这两个图标，不值得为它引一个图标库。 */
 function EyeIcon({ off }: { off?: boolean }) {
   return (
     <svg
@@ -416,7 +407,6 @@ function EyeIcon({ off }: { off?: boolean }) {
   )
 }
 
-/** 密码与 api_key 统一走这里：默认遮住，自带显隐按钮。 */
 export function SecretField({
   label,
   value,

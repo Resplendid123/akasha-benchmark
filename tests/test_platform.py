@@ -532,22 +532,6 @@ def test_akasha_config_apply_pushes_all_features(client, monkeypatch):
     assert [g["id"] for g in selected] == [group_id]
 
 
-def test_config_export_includes_plaintext_secrets(client):
-    client.put("/api/connection", json={"password": "pw", "email": "e@x"})
-    client.put(
-        "/api/providers/judge",
-        json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "sk"},
-    )
-    client.put(
-        "/api/akasha-configs",
-        json={"label": "g", "configs": {"answer": {"model": "a", "apiKey": "gk"}}},
-    )
-    body = client.get("/api/config/export").json()
-    assert body["connection"]["password"] == "pw"
-    assert body["providers"][0]["api_key"] == "sk"
-    assert body["akasha_configs"][0]["configs"]["answer"]["apiKey"] == "gk"
-
-
 def test_config_import_round_trips_export(client):
     client.put("/api/connection", json={"password": "pw", "email": "e@x", "base_url": "http://y"})
     client.put(
@@ -559,6 +543,9 @@ def test_config_import_round_trips_export(client):
         json={"label": "g", "configs": {"answer": {"model": "a", "apiKey": "gk"}}},
     )
     exported = client.get("/api/config/export").json()
+    assert exported["connection"]["password"] == "pw"
+    assert exported["providers"][0]["api_key"] == "sk"
+    assert exported["akasha_configs"][0]["configs"]["answer"]["apiKey"] == "gk"
 
     # 清一遍再导回：导入后应与导出前一致。
     client.put("/api/connection", json={"password": "", "email": "", "base_url": ""})
@@ -653,12 +640,14 @@ def test_provider_rename_updates_the_same_row(client):
 
     body = client.put(
         "/api/providers/judge",
-        json={"id": created["id"], "label": "gpt4", "base_url": "https://x/v1", "model": "m"},
+        json={"id": created["id"], "label": "gpt4", "base_url": "https://y/v1", "model": "m2"},
     ).json()
     assert body["id"] == created["id"]
 
     providers = client.get("/api/providers?role=judge").json()
-    assert [p["label"] for p in providers] == ["gpt4"]
+    assert [(p["id"], p["label"], p["base_url"], p["model"]) for p in providers] == [
+        (created["id"], "gpt4", "https://y/v1", "m2")
+    ]
     assert providers[0]["api_key_set"] is True
 
 

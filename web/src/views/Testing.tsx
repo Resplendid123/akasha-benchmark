@@ -5,7 +5,7 @@ import { Failed, Field, Loading, useAction, useAsync } from '../ui'
 
 const DATASETS = ['hotpotqa', '2wikimultihopqa', 'musique']
 
-/** 测试层：轻量的一次完整六层链路。 */
+/** 测试层：用小样本运行编译、查询、评测、归因四阶段。 */
 export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
   const datasets = useAsync(() => api.datasets(), [])
   const judges = useAsync<Provider[]>(() => api.providers('judge'), [])

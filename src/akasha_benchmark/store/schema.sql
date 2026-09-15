@@ -90,7 +90,6 @@ CREATE TABLE IF NOT EXISTS compile_run (
 CREATE TABLE IF NOT EXISTS compile_sample (
     compile_id INTEGER NOT NULL REFERENCES compile_run(id) ON DELETE CASCADE,
     sample_id  TEXT NOT NULL REFERENCES sample(sample_id) ON DELETE CASCADE,
-    dataset    TEXT NOT NULL,
     PRIMARY KEY (compile_id, sample_id)
 );
 
@@ -121,8 +120,7 @@ CREATE TABLE IF NOT EXISTS query_run (
 
 CREATE TABLE IF NOT EXISTS query_sample (
     query_id  INTEGER NOT NULL REFERENCES query_run(id) ON DELETE CASCADE,
-    sample_id TEXT NOT NULL,
-    dataset   TEXT NOT NULL,
+    sample_id TEXT NOT NULL REFERENCES sample(sample_id) ON DELETE CASCADE,
     PRIMARY KEY (query_id, sample_id)
 );
 
@@ -134,7 +132,6 @@ CREATE TABLE IF NOT EXISTS query_response (
     http_status   INTEGER NOT NULL,
     latency_ms    INTEGER,
     error         TEXT,
-    answer_mode   TEXT,
     response_json TEXT,   -- 完整响应体，避免为了看新字段重跑
     requested_at  TEXT NOT NULL,
     PRIMARY KEY (query_id, sample_id)
@@ -165,12 +162,12 @@ CREATE TABLE IF NOT EXISTS sample_eval (
 );
 
 CREATE TABLE IF NOT EXISTS sample_metric (
-    eval_id   INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
+    eval_id   INTEGER NOT NULL,
     sample_id TEXT NOT NULL,
-    dataset   TEXT NOT NULL,
     metric    TEXT NOT NULL,
     value     REAL NOT NULL,
-    PRIMARY KEY (eval_id, sample_id, metric)
+    PRIMARY KEY (eval_id, sample_id, metric),
+    FOREIGN KEY (eval_id, sample_id) REFERENCES sample_eval(eval_id, sample_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS sample_metric_lookup_idx ON sample_metric(eval_id, metric, value);

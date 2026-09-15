@@ -6,7 +6,7 @@ import sqlite3
 from typing import Any
 
 from .db import dumps, loads, utc_now
-from .run_store import STATUS_RUNNING
+from .run_store import STATUS_RUNNING, get_run
 
 
 def create_attribution_run(
@@ -32,10 +32,7 @@ def create_attribution_run(
 def get_attribution_run(
     connection: sqlite3.Connection, attribution_id: int
 ) -> dict[str, Any] | None:
-    row = connection.execute(
-        "SELECT * FROM attribution_run WHERE id = ?", (attribution_id,)
-    ).fetchone()
-    return dict(row) if row else None
+    return get_run(connection, "attribution", attribution_id)
 
 
 def attribution_run_by_name(connection: sqlite3.Connection, name: str) -> dict[str, Any] | None:

@@ -46,7 +46,9 @@ def list_datasets(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 def delete_dataset(connection: sqlite3.Connection, name: str) -> int:
     """删归一化产物。已被编译层引用时拒绝，否则会连带删掉编译与其下游。"""
     used = connection.execute(
-        "SELECT COUNT(*) AS n FROM compile_sample WHERE dataset = ?", (name,)
+        "SELECT COUNT(*) AS n FROM compile_sample cs "
+        "JOIN sample s ON s.sample_id = cs.sample_id WHERE s.dataset = ?",
+        (name,)
     ).fetchone()["n"]
     if used:
         raise ValueError(
@@ -96,7 +98,7 @@ def replace_corpus(
     return count
 
 
-def _sample(row: sqlite3.Row) -> dict[str, Any]:
+def sample_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "sample_id": row["sample_id"],
         "dataset": row["dataset"],
@@ -110,7 +112,7 @@ def _sample(row: sqlite3.Row) -> dict[str, Any]:
 
 def samples_of(connection: sqlite3.Connection, dataset: str) -> list[dict[str, Any]]:
     return [
-        _sample(row)
+        sample_from_row(row)
         for row in connection.execute(
             "SELECT * FROM sample WHERE dataset = ? ORDER BY sample_id", (dataset,)
         )
@@ -121,7 +123,7 @@ def get_sample(connection: sqlite3.Connection, sample_id: str) -> dict[str, Any]
     row = connection.execute(
         "SELECT * FROM sample WHERE sample_id = ?", (sample_id,)
     ).fetchone()
-    return _sample(row) if row else None
+    return sample_from_row(row) if row else None
 
 
 def corpus_of(connection: sqlite3.Connection, dataset: str) -> list[dict[str, Any]]:
