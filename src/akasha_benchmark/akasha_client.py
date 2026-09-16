@@ -15,10 +15,17 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
+import os
 import random
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -36,6 +43,72 @@ RETRYABLE_EXCEPTIONS = (httpx.TransportError,)
 MAX_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
 RETRY_MAX_DELAY = 30.0
+AUTH_TOKEN_COOKIE = "authToken"
+AUTH_EXPIRY_SKEW_SECONDS = 30.0
+_AUTH_CACHE_PATH = Path(tempfile.gettempdir()) / "akasha-benchmark" / "auth-tokens.json"
+_AUTH_LOCK = threading.Lock()
+_AUTH_TOKENS: dict[str, str] = {}
+
+
+def _auth_cache_key(config: AkashaConfig) -> str:
+    """凭据只参与摘要，不把账号或密码写入 JWT 缓存。"""
+    identity = "\0".join(
+        (config.base_url.rstrip("/").lower(), config.email.lower(), config.password)
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _jwt_expiry(token: str) -> float | None:
+    """不校验签名，只读取 JWT 的 exp；签名仍由 Akasha 服务端校验。"""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        expiry = decoded.get("exp")
+        return float(expiry) if isinstance(expiry, (int, float)) else None
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _usable_auth_token(token: str | None) -> bool:
+    if not token:
+        return False
+    expiry = _jwt_expiry(token)
+    return expiry is not None and expiry > time.time() + AUTH_EXPIRY_SKEW_SECONDS
+
+
+def _read_auth_cache() -> dict[str, str]:
+    try:
+        body = json.loads(_AUTH_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    return {
+        key: value
+        for key, value in body.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+
+
+def _write_auth_cache(tokens: dict[str, str]) -> None:
+    """原子替换本地缓存；缓存失败不能让一次成功登录变成任务失败。"""
+    temporary: Path | None = None
+    try:
+        _AUTH_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _AUTH_CACHE_PATH.with_name(
+            f".{_AUTH_CACHE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        temporary.write_text(json.dumps(tokens), encoding="utf-8")
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        temporary.replace(_AUTH_CACHE_PATH)
+    except OSError:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _rewind_files(files: Any) -> None:
@@ -133,6 +206,15 @@ class AkashaClient:
         response, latency_ms = self._request_with_retry(
             method, url, json_body, files, data, retry
         )
+        if response.status_code == 401 and path.strip("/") != "auth/login":
+            rejected = self._client.cookies.get(AUTH_TOKEN_COOKIE)
+            if rejected:
+                self._refresh_auth(rejected)
+                if files:
+                    _rewind_files(files)
+                response, latency_ms = self._request_with_retry(
+                    method, url, json_body, files, data, retry
+                )
 
         try:
             body: Any = response.json() if response.content else None
@@ -214,19 +296,48 @@ class AkashaClient:
     # --- 认证 ---
 
     def login(self) -> None:
-        """登录并拿到 authToken cookie。"""
+        """复用进程内或本地 JWT；同一进程的客户端只会有一个实际登录。"""
         self.config.require_credentials()
+        key = _auth_cache_key(self.config)
+        with _AUTH_LOCK:
+            token = _AUTH_TOKENS.get(key)
+            if not _usable_auth_token(token):
+                token = _read_auth_cache().get(key)
+            if _usable_auth_token(token):
+                _AUTH_TOKENS[key] = token
+                self._client.cookies.set(AUTH_TOKEN_COOKIE, token)
+                return
+            self._perform_login(key)
+
+    def _perform_login(self, key: str) -> None:
+        self._client.cookies.delete(AUTH_TOKEN_COOKIE)
         self.request(
             "POST",
             "auth/login",
             json_body={"email": self.config.email, "password": self.config.password},
         )
-        if "authToken" not in self._client.cookies:
+        token = self._client.cookies.get(AUTH_TOKEN_COOKIE)
+        if not token:
             raise AkashaError(
                 "POST", self.config.api("auth/login"), 200,
                 "login returned success but set no authToken cookie; "
                 "MFA may be enabled for this account",
             )
+        _AUTH_TOKENS[key] = token
+        cached = _read_auth_cache()
+        cached[key] = token
+        _write_auth_cache(cached)
+
+    def _refresh_auth(self, rejected: str) -> None:
+        """401 后刷新一次；若别的客户端已刷新，则直接接管它的新 JWT。"""
+        key = _auth_cache_key(self.config)
+        with _AUTH_LOCK:
+            current = _AUTH_TOKENS.get(key)
+            if current != rejected and _usable_auth_token(current):
+                self._client.cookies.set(AUTH_TOKEN_COOKIE, current)
+                return
+            _AUTH_TOKENS.pop(key, None)
+            self._perform_login(key)
 
     def current_user(self) -> dict[str, Any]:
         """``/api/users/me`` 同时带回解析出的 workspace，以及 user.role。"""

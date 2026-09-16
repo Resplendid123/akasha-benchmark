@@ -21,8 +21,9 @@ from akasha_benchmark.task import Paused, TaskContext, execute
 from .settings import Settings
 
 # 这些阶段与任何在跑的任务互斥：它们改的是下游所有层的输入。
-# 同名阶段一律不并行，见 _require_free。
 EXCLUSIVE = frozenset({"download", "normalize"})
+# 编译产物与远端 Space 按任务隔离，允许有限并行；其他同名阶段仍串行。
+STAGE_CONCURRENCY = {"compile": 3}
 
 
 class TaskRejected(RuntimeError):
@@ -231,11 +232,24 @@ class TaskRunner:
             raise TaskRejected(f"远端编译 Run 取消失败，本地状态未变：{exc}") from exc
 
     def _require_free(self, connection, stage: str) -> None:
-        for task in task_store.active_tasks(connection):
-            if task["stage"] == stage or (stage in EXCLUSIVE or task["stage"] in EXCLUSIVE):
+        active = task_store.active_tasks(connection)
+        for task in active:
+            if stage in EXCLUSIVE or task["stage"] in EXCLUSIVE:
                 raise TaskRejected(
                     f"{task['stage']} 任务 #{task['id']} 正在运行，请先等它结束或暂停"
                 )
+
+        same_stage = [task for task in active if task["stage"] == stage]
+        limit = STAGE_CONCURRENCY.get(stage, 1)
+        if len(same_stage) >= limit:
+            if limit == 1:
+                task = same_stage[0]
+                raise TaskRejected(
+                    f"{task['stage']} 任务 #{task['id']} 正在运行，请先等它结束或暂停"
+                )
+            raise TaskRejected(
+                f"{stage} 任务已达到并发上限 {limit}，请先等其中一个结束或暂停"
+            )
 
     def _verify(self, connection, task_id: int, stage: str) -> None:
         """校验链上任务的产物契约，抛出的异常按失败处理。

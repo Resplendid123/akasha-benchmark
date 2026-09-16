@@ -237,6 +237,31 @@ def test_same_stage_does_not_run_twice(settings, monkeypatch):
     release.set()
 
 
+def test_compile_allows_three_active_tasks(settings, monkeypatch):
+    runner = TaskRunner(settings)
+    monkeypatch.setattr(runner, "_spawn", lambda *args: None)
+
+    tasks = [runner.start("compile", {}) for _ in range(3)]
+    assert len({task["id"] for task in tasks}) == 3
+    with pytest.raises(TaskRejected, match="并发上限 3"):
+        runner.start("compile", {})
+
+
+def test_compile_resume_obeys_three_task_limit(settings, db, monkeypatch):
+    paused_id = task_store.create_task(db, stage="compile", params={})
+    task_store.transition(db, paused_id, task_store.PAUSED)
+    for _ in range(3):
+        task_id = task_store.create_task(db, stage="compile", params={})
+        task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+
+    runner = TaskRunner(settings)
+    monkeypatch.setattr(runner, "_spawn", lambda *args: None)
+    with pytest.raises(TaskRejected, match="并发上限 3"):
+        runner.resume(paused_id)
+    assert task_store.get_task(db, paused_id)["status"] == task_store.PAUSED
+
+
 def test_unknown_stage_and_bad_params_are_rejected(settings):
     runner = TaskRunner(settings)
     with pytest.raises(TaskRejected, match="未知阶段"):

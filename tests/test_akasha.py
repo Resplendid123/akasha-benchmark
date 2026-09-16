@@ -6,13 +6,18 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import threading
+import time
 from typing import Any
 
 import pytest
 
 from akasha_benchmark import model_configs
-from akasha_benchmark.akasha_client import unwrap_envelope
+from akasha_benchmark import akasha_client
+from akasha_benchmark.akasha_client import AkashaClient, unwrap_envelope
+from akasha_benchmark.config import AkashaConfig
 from akasha_benchmark.stages import compile, query
 from akasha_benchmark.store import (
     compile_store,
@@ -176,6 +181,119 @@ def test_envelope_is_unwrapped_only_when_it_is_an_envelope():
     payload = {"data": 1, "success": True, "status": 200, "extra": "x"}
     assert unwrap_envelope(payload) == payload
     assert unwrap_envelope([1, 2]) == [1, 2]
+
+
+def _jwt(expiry: float) -> str:
+    def encode(value: dict[str, Any]) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode({'exp': expiry})}.signature"
+
+
+def test_clients_share_jwt_in_memory_and_from_local_cache(tmp_path, monkeypatch):
+    token = _jwt(time.time() + 3600)
+    login_calls = 0
+    call_lock = threading.Lock()
+
+    class HTTPClient:
+        def __init__(self):
+            self.cookies = akasha_client.httpx.Cookies()
+
+        def request(self, method, url, **kwargs):
+            nonlocal login_calls
+            assert url.endswith("/auth/login")
+            with call_lock:
+                login_calls += 1
+            self.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, token)
+            return akasha_client.httpx.Response(
+                201, json={"success": True, "status": 201}
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(akasha_client, "_AUTH_CACHE_PATH", tmp_path / "auth.json")
+    akasha_client._AUTH_TOKENS.clear()
+    config = AkashaConfig(
+        base_url="http://akasha", email="owner@example.com", password="pw"
+    )
+    clients = [AkashaClient(config) for _ in range(4)]
+    for client in clients:
+        client._client.close()
+        client._client = HTTPClient()
+
+    threads = [threading.Thread(target=client.login) for client in clients]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert login_calls == 1
+    assert all(
+        client._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == token
+        for client in clients
+    )
+
+    # 模拟进程重启：清空内存后仍从本地暂存读取，不再请求 login。
+    akasha_client._AUTH_TOKENS.clear()
+    restarted = AkashaClient(config)
+    restarted._client.close()
+    restarted._client = HTTPClient()
+    restarted.login()
+    assert login_calls == 1
+    assert restarted._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == token
+    akasha_client._AUTH_TOKENS.clear()
+
+
+def test_unauthorized_client_reuses_jwt_refreshed_by_another_client(
+    tmp_path, monkeypatch
+):
+    stale = _jwt(time.time() + 3600)
+    fresh = _jwt(time.time() + 7200)
+    login_calls = 0
+
+    class HTTPClient:
+        def __init__(self):
+            self.cookies = akasha_client.httpx.Cookies()
+            self.request_calls = 0
+
+        def request(self, method, url, **kwargs):
+            nonlocal login_calls
+            if url.endswith("/auth/login"):
+                login_calls += 1
+                self.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, fresh)
+                return akasha_client.httpx.Response(
+                    201, json={"success": True, "status": 201}
+                )
+            self.request_calls += 1
+            status = 401 if self.request_calls == 1 else 200
+            return akasha_client.httpx.Response(
+                status, json={"data": {}, "success": status == 200, "status": status}
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(akasha_client, "_AUTH_CACHE_PATH", tmp_path / "auth.json")
+    config = AkashaConfig(base_url="http://akasha", email="e@x", password="pw")
+    key = akasha_client._auth_cache_key(config)
+    akasha_client._AUTH_TOKENS.clear()
+    akasha_client._AUTH_TOKENS[key] = stale
+    clients = [AkashaClient(config), AkashaClient(config)]
+    for client in clients:
+        client._client.close()
+        client._client = HTTPClient()
+        client._client.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, stale)
+
+    assert clients[0].get("users/me") == {}
+    assert clients[1].get("users/me") == {}
+    assert login_calls == 1
+    assert all(
+        client._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == fresh
+        for client in clients
+    )
+    akasha_client._AUTH_TOKENS.clear()
 
 
 def test_embedding_drift_is_detected():
@@ -441,7 +559,7 @@ def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
     assert run["space_id"] == "space-1"
     docs = compile_store.compile_docs(ready_connection, int(run["id"]))
     assert docs and all(doc["page_id"] for doc in docs)
-    assert len(clients[0].imported) == len(docs)
+    assert sum(len(client.imported) for client in clients) == len(docs)
     assert task_store.get_task(ready_connection, ctx.task_id)["params"][
         "remote_compile_run_ids"
     ] == ["remote-run-1"]
@@ -450,16 +568,19 @@ def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
 
 def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
     clients: list[FakeClient] = []
+    remote_runs = 0
 
     def factory(config):
-        remote_run_id = f"remote-run-{len(clients) + 1}"
-
         class Resumable(FakeClient):
             def compile_spaces(self, space_ids):
+                nonlocal remote_runs
+                remote_runs += 1
                 return {
                     "acceptedRunCount": 1,
                     "coalescedRunCount": 0,
-                    "runs": [{"runId": remote_run_id, "disposition": "created"}],
+                    "runs": [
+                        {"runId": f"remote-run-{remote_runs}", "disposition": "created"}
+                    ],
                 }
 
         client = Resumable(config)
@@ -470,15 +591,119 @@ def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
     params = {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r1"}
     ctx = context(ready_connection, params)
     execute(compile.run, ctx)
-    first = len(clients[0].imported)
+    first_run_clients = len(clients)
+    first = sum(len(client.imported) for client in clients)
 
     # 同一任务续跑，子集与已导入文档保持不变。
     execute(compile.run, ctx)
-    assert clients[1].imported == []
+    assert all(client.imported == [] for client in clients[first_run_clients:])
     assert first > 0
     assert task_store.get_task(ready_connection, ctx.task_id)["params"][
         "remote_compile_run_ids"
     ] == ["remote-run-2"]
+
+
+def test_compile_imports_concurrently(ready_connection, monkeypatch):
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    imported = 0
+
+    class Concurrent(FakeClient):
+        def import_page_text(self, filename, markdown, space_id):
+            nonlocal active, peak, imported
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+                imported += 1
+                page_id = f"page-{imported}"
+            return {"id": page_id}
+
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: Concurrent(config))
+    ctx = context(
+        ready_connection,
+        {
+            "datasets": ["hotpotqa"],
+            "qa_limit": 2,
+            "run_id": "concurrent",
+            "import_concurrency": 3,
+        },
+    )
+    execute(compile.run, ctx)
+
+    run = compile_store.compile_run_by_run_id(ready_connection, "concurrent")
+    docs = compile_store.compile_docs(ready_connection, int(run["id"]))
+    assert peak > 1
+    assert imported == len(docs)
+    assert task_store.get_task(ready_connection, ctx.task_id)["params"][
+        "import_concurrency"
+    ] == 3
+
+
+def test_compile_retries_then_pauses_and_resume_only_imports_pending(
+    ready_connection, monkeypatch
+):
+    attempts: dict[str, int] = {}
+    imported_ids = 0
+    compile_calls = 0
+    keep_failing = True
+    failed_filename: str | None = None
+    lock = threading.Lock()
+
+    class Retryable(FakeClient):
+        def import_page_text(self, filename, markdown, space_id):
+            nonlocal failed_filename, imported_ids
+            with lock:
+                failed_filename = failed_filename or filename
+                attempts[filename] = attempts.get(filename, 0) + 1
+                if keep_failing and filename == failed_filename:
+                    return {}
+                imported_ids += 1
+                return {"id": f"page-{imported_ids}"}
+
+        def compile_spaces(self, space_ids):
+            nonlocal compile_calls
+            compile_calls += 1
+            return super().compile_spaces(space_ids)
+
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: Retryable(config))
+    ctx = context(
+        ready_connection,
+        {
+            "datasets": ["hotpotqa"],
+            "qa_limit": 2,
+            "run_id": "retry",
+            "import_concurrency": 3,
+        },
+    )
+
+    from akasha_benchmark.task import Paused
+
+    with pytest.raises(Paused, match="重试后仍未导入"):
+        execute(compile.run, ctx)
+
+    run = compile_store.compile_run_by_run_id(ready_connection, "retry")
+    compile_id = int(run["id"])
+    docs = compile_store.compile_docs(ready_connection, compile_id)
+    succeeded_filenames = {f"{doc['doc_id']}.md" for doc in docs if doc["page_id"]}
+    assert attempts[failed_filename] == 2
+    assert all(attempts[name] == 1 for name in succeeded_filenames)
+    assert len(succeeded_filenames) == len(docs) - 1
+    assert task_store.get_task(ready_connection, ctx.task_id)["status"] == task_store.PAUSED
+    assert run["status"] == run_store.STATUS_PAUSED
+    assert compile_calls == 0
+
+    keep_failing = False
+    execute(compile.run, context(ready_connection, {}, task_id=ctx.task_id))
+
+    resumed_docs = compile_store.compile_docs(ready_connection, compile_id)
+    assert all(doc["page_id"] for doc in resumed_docs)
+    assert attempts[failed_filename] == 3
+    assert all(attempts[name] == 1 for name in succeeded_filenames)
+    assert compile_calls == 1
 
 
 # ------------------------------------------------------------ 查询闸门

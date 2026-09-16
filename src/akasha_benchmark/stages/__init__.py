@@ -52,6 +52,7 @@ STAGES: dict[str, StageSpec] = {
             "qa_limit": int,
             "negatives_ratio": float,
             "full_corpus": bool,
+            "import_concurrency": int,
         },
         cost="约 40 秒/篇，取决于 Akasha 的编译 worker 吞吐",
         needs_akasha=True,

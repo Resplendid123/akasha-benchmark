@@ -15,14 +15,18 @@ narrativeqa 整篇取文档再取属于这些文档的问题；itfaq 没有指�
 
 from __future__ import annotations
 
+import queue
 import random
 import re
 import sqlite3
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
+
+import httpx
 
 from ..akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
 from ..config import AkashaConfig, load_config
@@ -34,11 +38,13 @@ from ..datasets import (
     get_adapter,
 )
 from ..store import compile_store, config_store, data_store, dumps, transaction
-from ..task import TaskContext
+from ..task import Paused, TaskContext
 
 DEFAULT_QA_LIMIT = 20
 DEFAULT_NEGATIVES_RATIO = 1.0
 DEFAULT_NARRATIVEQA_DOCS = 2
+DEFAULT_IMPORT_CONCURRENCY = 4
+MAX_IMPORT_CONCURRENCY = 16
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MARKDOWN_HEADING = re.compile(r"^\s*#+\s*.*$", re.MULTILINE)
 
@@ -411,10 +417,13 @@ def run(ctx: TaskContext) -> None:
     qa_limit = int(params.get("qa_limit") or DEFAULT_QA_LIMIT)
     negatives_ratio = float(params.get("negatives_ratio", DEFAULT_NEGATIVES_RATIO))
     full_corpus = bool(params.get("full_corpus", False))
+    import_concurrency = int(params.get("import_concurrency") or DEFAULT_IMPORT_CONCURRENCY)
     if qa_limit < 1:
         raise ValueError("每个数据集的 QA 数必须大于 0")
     if negatives_ratio < 0:
         raise ValueError("负样本比例不能为负")
+    if not 1 <= import_concurrency <= MAX_IMPORT_CONCURRENCY:
+        raise ValueError(f"导入并发必须在 1 到 {MAX_IMPORT_CONCURRENCY} 之间")
 
     config = load_config(ctx.db)
     config.require_credentials()
@@ -428,6 +437,7 @@ def run(ctx: TaskContext) -> None:
         qa_limit=qa_limit,
         negatives_ratio=negatives_ratio,
         full_corpus=full_corpus,
+        import_concurrency=import_concurrency,
     )
     if compile_id is None:
         if compile_store.compile_run_by_run_id(ctx.db, run_id):
@@ -443,7 +453,18 @@ def run(ctx: TaskContext) -> None:
         ctx.bind("compile", compile_id)
     ctx.log(f"编译 {run_id}（#{compile_id}），数据集 {', '.join(datasets)}")
 
-    _execute(ctx, compile_id, run_id, datasets, seed, qa_limit, negatives_ratio, full_corpus, config)
+    _execute(
+        ctx,
+        compile_id,
+        run_id,
+        datasets,
+        seed,
+        qa_limit,
+        negatives_ratio,
+        full_corpus,
+        import_concurrency,
+        config,
+    )
 
 
 def _execute(
@@ -455,6 +476,7 @@ def _execute(
     qa_limit: int,
     negatives_ratio: float,
     full_corpus: bool,
+    import_concurrency: int,
     config: AkashaConfig,
 ) -> None:
     # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档，
@@ -526,7 +548,7 @@ def _execute(
                 raise RuntimeError(mismatch)
             ctx.log(f"复用本次编译的空间 {space_id}")
 
-        _import_docs(ctx, client, compile_id, space_id)
+        _import_docs(ctx, client, compile_id, space_id, import_concurrency)
 
         # 等编译的总量拿不到，用「导入完 = 2/3」这一档，收尾时推到 3/3。
         ctx.progress(2, 3, "等待编译")
@@ -605,8 +627,31 @@ def _execute(
     ctx.log("编译完成，可以进入查询层")
 
 
-def _import_docs(ctx: TaskContext, client: AkashaClient, compile_id: int, space_id: str) -> None:
-    """串行导入未导入的文档，逐条提交。失败的记下来并继续下一篇。"""
+def _import_one(
+    client: AkashaClient, doc: dict[str, Any], markdown: str, space_id: str
+) -> dict[str, Any]:
+    """导入一篇文档；预期的传输失败转成可由主线程落库的结果。"""
+    try:
+        page = client.import_page_text(f"{doc['doc_id']}.md", markdown, space_id)
+        page_id = page.get("id") if isinstance(page, dict) else None
+        error = None if page_id else f"响应里没有 page id: {page!r}"[:300]
+    except (AkashaError, httpx.RequestError, OSError) as exc:
+        page_id, error = None, f"{type(exc).__name__}: {exc}"[:300]
+    return {"doc": doc, "page_id": page_id, "error": error}
+
+
+def _import_docs(
+    ctx: TaskContext,
+    client: AkashaClient,
+    compile_id: int,
+    space_id: str,
+    concurrency: int,
+) -> None:
+    """并发导入未导入文档；失败项在末尾重试一次，仍失败则暂停。
+
+    worker 不接触 SQLite。正文在主线程读取，结果也由主线程逐条提交，因此暂停或
+    进程退出后，继续任务只会选中 ``page_id`` 仍为空的文档。
+    """
     pending = compile_store.compile_docs(ctx.db, compile_id, pending_only=True)
     total = len(compile_store.compile_docs(ctx.db, compile_id))
     done = total - len(pending)
@@ -614,28 +659,73 @@ def _import_docs(ctx: TaskContext, client: AkashaClient, compile_id: int, space_
         ctx.log(f"{total} 篇语料均已导入，跳过")
         return
 
-    ctx.log(f"导入语料：待导入 {len(pending)} / 共 {total}")
-    failures = 0
-    for doc in pending:
-        ctx.checkpoint()
-        markdown = markdown_of(ctx.db, doc["dataset"], doc["doc_id"])
-        try:
-            page = client.import_page_text(f"{doc['doc_id']}.md", markdown, space_id)
-            page_id = (page or {}).get("id")
-            error = None if page_id else f"响应里没有 page id: {page!r}"[:300]
-        except AkashaError as exc:
-            page_id, error = None, f"HTTP {exc.status}: {exc.body[:200]}"
+    worker_count = min(concurrency, len(pending))
+    ctx.log(f"导入语料：待导入 {len(pending)} / 共 {total}，并发 {worker_count}")
 
-        compile_store.record_page(
-            ctx.db, compile_id, doc["dataset"], doc["doc_id"], page_id=page_id, error=error
-        )
-        ctx.db.commit()
-        done += 1
-        if error:
-            failures += 1
-            ctx.log(f"{doc['dataset']}/{doc['doc_id']}: {error}", "warn")
-        if done % 10 == 0 or done == total:
-            ctx.progress(1, 3, f"导入语料 {done}/{total}")
+    # httpx client 与实例级限流状态不跨 worker 共享；登录会复用共享 JWT。
+    extras = [AkashaClient(client.config) for _ in range(worker_count - 1)]
+    try:
+        for spare in extras:
+            spare.login()
+        clients: queue.Queue[AkashaClient] = queue.Queue()
+        for worker in (client, *extras):
+            clients.put(worker)
+
+        def task(item: tuple[dict[str, Any], str]) -> dict[str, Any]:
+            doc, markdown = item
+            borrowed = clients.get()
+            try:
+                return _import_one(borrowed, doc, markdown, space_id)
+            finally:
+                clients.put(borrowed)
+
+        def run_pass(
+            executor: ThreadPoolExecutor, docs: list[dict[str, Any]], *, retry: bool
+        ) -> list[dict[str, Any]]:
+            nonlocal done
+            failures: list[dict[str, Any]] = []
+            for start in range(0, len(docs), worker_count):
+                ctx.checkpoint()
+                batch = docs[start : start + worker_count]
+                work = [
+                    (doc, markdown_of(ctx.db, doc["dataset"], doc["doc_id"]))
+                    for doc in batch
+                ]
+                for row in executor.map(task, work):
+                    doc = row["doc"]
+                    compile_store.record_page(
+                        ctx.db,
+                        compile_id,
+                        doc["dataset"],
+                        doc["doc_id"],
+                        page_id=row["page_id"],
+                        error=row["error"],
+                    )
+                    ctx.db.commit()
+                    if row["error"]:
+                        failures.append(doc)
+                        prefix = "重试仍失败" if retry else "导入失败"
+                        ctx.log(
+                            f"{prefix} {doc['dataset']}/{doc['doc_id']}: {row['error']}",
+                            "warn",
+                        )
+                    else:
+                        done += 1
+                ctx.progress(1, 3, f"导入语料 {done}/{total}")
+            return failures
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            failures = run_pass(executor, pending, retry=False)
+            if failures:
+                ctx.checkpoint()
+                ctx.log(f"首轮有 {len(failures)} 篇失败，移到末尾重试一次", "warn")
+                failures = run_pass(executor, failures, retry=True)
+    finally:
+        for spare in extras:
+            spare.close()
 
     if failures:
-        raise RuntimeError(f"{failures} 篇语料导入失败，page_map 不完整")
+        raise Paused(
+            f"{len(failures)} 篇语料重试后仍未导入，任务已暂停；"
+            "继续任务将从未导入文档接着执行"
+        )

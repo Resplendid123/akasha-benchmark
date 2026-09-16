@@ -168,6 +168,7 @@ function NewCompile({
   const [seed, setSeed] = useState(todaySeed)
   const [fullCorpus, setFullCorpus] = useState(true)
   const [ratio, setRatio] = useState(1)
+  const [importConcurrency, setImportConcurrency] = useState(10)
   const start = useAction<unknown>()
   const selectedQaMax = Math.max(
     0,
@@ -235,12 +236,27 @@ function NewCompile({
             />
           </Field>
         )}
+        <Field label="导入并发" hint="同时上传的文档数">
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={importConcurrency}
+            onChange={(e) => setImportConcurrency(Number(e.target.value))}
+          />
+        </Field>
       </div>
 
       <div className="panel-actions">
         <button
           className="action primary"
-          disabled={start.busy || selected.length === 0 || effectiveQaLimit < 1}
+          disabled={
+            start.busy ||
+            selected.length === 0 ||
+            effectiveQaLimit < 1 ||
+            importConcurrency < 1 ||
+            importConcurrency > 16
+          }
           onClick={() =>
             start.run(async () => {
               const task = await api.startTask('compile', {
@@ -248,6 +264,7 @@ function NewCompile({
                 qa_limit: effectiveQaLimit,
                 seed,
                 full_corpus: fullCorpus,
+                import_concurrency: importConcurrency,
                 ...(fullCorpus ? {} : { negatives_ratio: ratio }),
                 ...(runId.trim() ? { run_id: runId.trim() } : {}),
               })
