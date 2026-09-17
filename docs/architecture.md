@@ -7,6 +7,7 @@
 | 前端页面 | 九个视图，各层的表单、任务操作与结果展示 | `web/src/views/` |
 | 前端公共代码 | HTTP 请求、响应类型、异步状态与基础控件 | `web/src/api.ts`、`web/src/types.ts`、`web/src/ui.tsx` |
 | 后端路由 | 请求处理、配置读写、结果查询 | `src/akasha_platform/api/` |
+| 运行树读取模型 | 批量聚合编译、查询、评测、归因记录，避免层级 N+1 查询 | `src/akasha_platform/run_tree.py` |
 | 任务运行器 | 线程调度、启动互斥、暂停/继续、重启恢复 | `src/akasha_platform/tasks.py` |
 | 任务执行接口 | 实际参数保存、产物绑定、阶段执行与最终状态 | `src/akasha_benchmark/task.py` |
 | 阶段 | 六层流水线加链路测试 | `src/akasha_benchmark/stages/` |
@@ -44,6 +45,7 @@
 
 存储按 `compile_store`、`query_store`、`eval_store`、`attribution_store` 分文件，直接执行 SQL。
 `run_store` 只维护共享状态与上下游依赖；模型端点解析集中在 `judge/providers.py`。
+跨阶段运行记录的列表投影由 `run_tree.py` 一次批量读取，路由不逐层拼装统计。
 
 数据库以 `store/schema.sql` 定义最终结构，不提供迁移或旧结构兼容分支。
 `compile_sample`、`query_sample` 只存运行与样本的关联，数据集名从 `sample` 读取；
@@ -66,5 +68,5 @@
 
 Akasha 连接与模型端点都在 `akasha_connection` / `model_provider` 两张表，由配置页读写。配置页在线读写 Akasha 部署的 compiler、embedding、answer、image 模型配置；编译时把它们的快照固化在 `compile_run` 上，供查询前比对。
 
-`database_url`（只读 PostgreSQL）用于链路查询与归因证据读取。未配置或连接不可用时，自动归因跳过 `compiled_away` 判据，继续执行其他规则。
-编译记录中的“编译成功”也通过该库统计：源页面关联到未失效的 `knowledge_pages`，且至少存在一个 `knowledge_chunks` 时计为一篇；PG 不可用时显示未知，不拿 Run 进度代替。
+`database_url`（只读 PostgreSQL）用于按需读取编译链路与归因证据。未配置或连接不可用时，自动归因跳过 `compiled_away` 判据，继续执行其他规则。
+编译记录中的“编译成功”读取编译结束时保存的远端逐页进度；升级前没有进度的成功记录回退为已导入篇数。列表页不访问 PostgreSQL。

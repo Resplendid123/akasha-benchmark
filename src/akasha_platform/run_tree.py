@@ -14,6 +14,8 @@ from akasha_benchmark.store import (
     query_store,
 )
 
+_MISSING = object()
+
 
 def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     """批量读取完整运行树，查询数量不随运行记录数增长。"""
@@ -81,12 +83,17 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         for row in connection.execute(
             """
             SELECT ar.id AS attribution_id,
-                   MIN(ar.sample_limit, COUNT(DISTINCT sm.sample_id)) AS samples,
-                   COUNT(DISTINCT result.sample_id) AS succeeded
+                   MIN(ar.sample_limit, COALESCE(metrics.samples, 0)) AS samples,
+                   COALESCE(results.succeeded, 0) AS succeeded
             FROM attribution_run ar
-            LEFT JOIN sample_metric sm ON sm.eval_id = ar.eval_id AND sm.metric = ar.metric
-            LEFT JOIN attribution_result result ON result.attribution_id = ar.id
-            GROUP BY ar.id
+            LEFT JOIN (
+                SELECT eval_id, metric, COUNT(DISTINCT sample_id) AS samples
+                FROM sample_metric GROUP BY eval_id, metric
+            ) metrics ON metrics.eval_id = ar.eval_id AND metrics.metric = ar.metric
+            LEFT JOIN (
+                SELECT attribution_id, COUNT(*) AS succeeded
+                FROM attribution_result GROUP BY attribution_id
+            ) results ON results.attribution_id = ar.id
             """
         )
     }
@@ -222,7 +229,7 @@ def _eval_view(
         for sample in samples
         if 200 <= int(sample["http_status"] or 0) < 300
         and all(
-            verdicts.get((eval_id, sample["sample_id"], metric), object()) is None
+            verdicts.get((eval_id, sample["sample_id"], metric), _MISSING) is None
             for metric in judge_metrics
         )
     )

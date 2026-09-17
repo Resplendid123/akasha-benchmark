@@ -119,6 +119,35 @@ def samples_of(connection: sqlite3.Connection, dataset: str) -> list[dict[str, A
     ]
 
 
+def sample_page(
+    connection: sqlite3.Connection,
+    dataset: str,
+    *,
+    search: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[int, list[dict[str, Any]]]:
+    """在 SQLite 内过滤并分页归一化样本，避免把整组数据载入内存。"""
+    where = ["dataset = ?"]
+    params: list[Any] = [dataset]
+    if search:
+        where.append(
+            "(INSTR(LOWER(sample_id), ?) > 0 OR INSTR(LOWER(question), ?) > 0 "
+            "OR INSTR(LOWER(answers_json), ?) > 0)"
+        )
+        needle = search.lower()
+        params.extend((needle, needle, needle))
+    scope = " AND ".join(where)
+    total = int(
+        connection.execute(f"SELECT COUNT(*) FROM sample WHERE {scope}", params).fetchone()[0]
+    )
+    rows = connection.execute(
+        f"SELECT * FROM sample WHERE {scope} ORDER BY sample_id LIMIT ? OFFSET ?",
+        (*params, limit, offset),
+    )
+    return total, [sample_from_row(row) for row in rows]
+
+
 def get_sample(connection: sqlite3.Connection, sample_id: str) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT * FROM sample WHERE sample_id = ?", (sample_id,)
@@ -133,6 +162,32 @@ def corpus_of(connection: sqlite3.Connection, dataset: str) -> list[dict[str, An
             "SELECT * FROM corpus_doc WHERE dataset = ? ORDER BY doc_id", (dataset,)
         )
     ]
+
+
+def corpus_page(
+    connection: sqlite3.Connection,
+    dataset: str,
+    *,
+    search: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> tuple[int, list[dict[str, Any]]]:
+    """在 SQLite 内过滤并分页语料，只读取当前页的正文。"""
+    where = ["dataset = ?"]
+    params: list[Any] = [dataset]
+    if search:
+        where.append("(INSTR(LOWER(doc_id), ?) > 0 OR INSTR(LOWER(title), ?) > 0)")
+        needle = search.lower()
+        params.extend((needle, needle))
+    scope = " AND ".join(where)
+    total = int(
+        connection.execute(f"SELECT COUNT(*) FROM corpus_doc WHERE {scope}", params).fetchone()[0]
+    )
+    rows = connection.execute(
+        f"SELECT * FROM corpus_doc WHERE {scope} ORDER BY doc_id LIMIT ? OFFSET ?",
+        (*params, limit, offset),
+    )
+    return total, [dict(row) for row in rows]
 
 
 def corpus_doc(

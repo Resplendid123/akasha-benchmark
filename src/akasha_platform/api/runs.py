@@ -22,8 +22,8 @@ from akasha_benchmark.store import (
     query_store,
 )
 
-from ._common import db, public_run, reject_if_busy, writable
 from ..run_tree import build_compile_tree
+from ._common import db, reject_if_busy, writable
 
 router = APIRouter(prefix="/api")
 
@@ -48,8 +48,8 @@ def compile_docs(
     dataset: str | None = None,
     gold_only: bool = False,
     q: str | None = None,
-    limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
-    offset: int = 0,
+    limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """本次编译的语料，带 ``page_id``（走链路视图的钥匙）。
 
@@ -124,8 +124,8 @@ def query_responses(
     dataset: str | None = None,
     answer_mode: str | None = None,
     q: str | None = None,
-    limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
-    offset: int = 0,
+    limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """查询结果列表，按 answerMode 另给一份计数。
 

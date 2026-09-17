@@ -676,6 +676,52 @@ def test_normalized_corpus_returns_full_text(client, normalized):
     assert "truncated" not in body["docs"][0]
 
 
+def test_normalized_dataset_browsing_filters_and_pages_in_sqlite(
+    client, normalized, monkeypatch
+):
+    """列表路由不能再调用会把整组样本或正文载入内存的旧接口。"""
+    from akasha_platform.api import datasets as datasets_api
+
+    def reject_full_load(*args, **kwargs):
+        raise AssertionError("full dataset load is forbidden for paged routes")
+
+    monkeypatch.setattr(datasets_api.data_store, "samples_of", reject_full_load)
+    monkeypatch.setattr(datasets_api.data_store, "corpus_of", reject_full_load)
+
+    samples = client.get(
+        "/api/datasets/hotpotqa/samples",
+        params={"q": "venice", "limit": 1},
+    ).json()
+    assert samples["total"] == 1
+    assert samples["samples"][0]["dataset_sample_id"] == "q2"
+
+    corpus = client.get(
+        "/api/datasets/hotpotqa/corpus",
+        params={"limit": 1, "offset": 1},
+    ).json()
+    assert corpus["total"] == 4
+    assert len(corpus["docs"]) == 1
+    assert corpus["docs"][0]["doc_id"] == "1"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/datasets/hotpotqa/raw?limit=0",
+        "/api/datasets/hotpotqa/samples?offset=-1",
+        "/api/datasets/hotpotqa/corpus?limit=-1",
+        "/api/compiles/1/docs?offset=-1",
+        "/api/queries/1/responses?limit=0",
+        "/api/evals/1/samples?offset=-1",
+        "/api/tasks?limit=0",
+        "/api/tasks/1?after_id=-1",
+        "/api/audit?limit=-1",
+    ],
+)
+def test_paged_routes_reject_invalid_bounds(client, path):
+    assert client.get(path).status_code == 422
+
+
 def test_provider_rename_updates_the_same_row(client):
     """带 id 的改名改的是那一条 —— 不带 id 会按 label 认行，于是变成新增。"""
     created = client.put(
@@ -1054,6 +1100,21 @@ def test_auth_token_is_required_when_set(db_path):
     assert client.get("/api/health").status_code == 401
     assert client.get("/api/health", headers={"X-Auth-Token": "wrong"}).status_code == 401
     assert client.get("/api/health", headers={"X-Auth-Token": "secret"}).status_code == 200
+
+
+def test_auth_token_allows_cors_preflight_without_credentials(db_path):
+    app = create_app(Settings(db_path=db_path, auth_token="secret"))
+    client = TestClient(app)
+    response = client.options(
+        "/api/health",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-auth-token",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
 
 
 def test_non_loopback_without_token_refuses_to_start(db_path):

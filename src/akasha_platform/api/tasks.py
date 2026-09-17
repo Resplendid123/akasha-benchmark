@@ -28,14 +28,16 @@ def stages() -> list[dict[str, Any]]:
 
 @router.get("/tasks")
 def list_tasks(
-    request: Request, status: str | None = None, limit: int = Query(50, le=500)
+    request: Request, status: str | None = None, limit: int = Query(50, ge=1, le=500)
 ) -> list[dict[str, Any]]:
     with db(request) as connection:
         return task_store.list_tasks(connection, status=status, limit=limit)
 
 
 @router.get("/tasks/{task_id}")
-def task_detail(request: Request, task_id: int, after_id: int = 0) -> dict[str, Any]:
+def task_detail(
+    request: Request, task_id: int, after_id: int = Query(0, ge=0)
+) -> dict[str, Any]:
     """任务详情与增量日志。``after_id`` 让前端只拉新增的行。"""
     with db(request) as connection:
         task = task_store.get_task(connection, task_id)
@@ -100,7 +102,7 @@ def cleanup_inactive(request: Request) -> dict[str, Any]:
 
 @router.get("/audit")
 def audit(
-    request: Request, stage: str | None = None, limit: int = Query(200, le=2000)
+    request: Request, stage: str | None = None, limit: int = Query(200, ge=1, le=2000)
 ) -> list[dict[str, Any]]:
     """审计日志。只追加，清理任务不删它。"""
     with db(request) as connection:

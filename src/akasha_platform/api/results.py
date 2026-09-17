@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from akasha_benchmark import attribution, textdiff
 from akasha_benchmark.config import load_config
@@ -29,12 +29,10 @@ def eval_samples(
     dataset: str | None = None,
     answer_mode: str | None = None,
     q: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """评测样本列表；逐条原始 LLM 响应在样本详情里按需读取。"""
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
     with db(request) as connection:
         if eval_store.get_eval_run(connection, eval_id) is None:
             raise HTTPException(404, f"评测 #{eval_id} 不存在")

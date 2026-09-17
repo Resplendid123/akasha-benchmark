@@ -88,8 +88,8 @@ def raw_samples(
     name: str,
     kind: str = "qa",
     q: str | None = None,
-    limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
-    offset: int = 0,
+    limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """原始样例，直接读数据文件，``kind`` 取 ``qa`` 或 ``corpus``。
 
@@ -130,30 +130,26 @@ def normalized_samples(
     request: Request,
     name: str,
     q: str | None = None,
-    limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
-    offset: int = 0,
+    limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """归一化后的样本。``q`` 按问题文本、sample_id 或参考答案过滤。"""
     with db(request) as connection:
         if data_store.get_dataset(connection, name) is None:
             raise HTTPException(404, f"{name} 还没归一化")
-        rows = data_store.samples_of(connection, name)
-
-    if q:
-        needle = q.strip().lower()
-        rows = [
-            r
-            for r in rows
-            if needle in r["question"].lower()
-            or needle in r["sample_id"].lower()
-            or any(needle in str(answer).lower() for answer in r["answers"])
-        ]
+        total, rows = data_store.sample_page(
+            connection,
+            name,
+            search=(q or "").strip() or None,
+            limit=limit,
+            offset=offset,
+        )
     return {
         "dataset": name,
-        "total": len(rows),
+        "total": total,
         "offset": offset,
         "limit": limit,
-        "samples": rows[offset : offset + limit],
+        "samples": rows,
     }
 
 
@@ -184,26 +180,26 @@ def normalized_corpus(
     request: Request,
     name: str,
     q: str | None = None,
-    limit: int = Query(10, le=50),
-    offset: int = 0,
+    limit: int = Query(10, ge=1, le=50),
+    offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """归一化后的语料。正文按数据库内容原样返回。"""
     with db(request) as connection:
         if data_store.get_dataset(connection, name) is None:
             raise HTTPException(404, f"{name} 还没归一化")
-        rows = data_store.corpus_of(connection, name)
-
-    if q:
-        needle = q.strip().lower()
-        rows = [
-            r for r in rows if needle in r["title"].lower() or needle in r["doc_id"].lower()
-        ]
+        total, rows = data_store.corpus_page(
+            connection,
+            name,
+            search=(q or "").strip() or None,
+            limit=limit,
+            offset=offset,
+        )
     return {
         "dataset": name,
-        "total": len(rows),
+        "total": total,
         "offset": offset,
         "limit": limit,
-        "docs": rows[offset : offset + limit],
+        "docs": rows,
     }
 
 
