@@ -3,13 +3,13 @@
 -- ------------------------------------------------------------ 配置层
 CREATE TABLE IF NOT EXISTS akasha_connection (
     id                       INTEGER PRIMARY KEY CHECK (id = 1),
-    base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3000',
+    base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3001',
     email                    TEXT NOT NULL DEFAULT 'test@example.com',
     password                 TEXT NOT NULL DEFAULT '12345678',
-    database_url             TEXT NOT NULL DEFAULT 'postgresql://akasha:STRONG_DB_PASSWORD@127.0.0.1:5432/akasha',  -- 只读 PG，归因链路用
-    timeout_seconds          REAL NOT NULL DEFAULT 180.0,
+    database_url             TEXT NOT NULL DEFAULT 'postgresql://akasha:STRONG_DB_PASSWORD@127.0.0.1:5433/akasha',  -- 只读 PG，归因链路用
+    timeout_seconds          REAL NOT NULL DEFAULT 120.0,
     request_interval_seconds REAL NOT NULL DEFAULT 0.5,
-    poll_interval_seconds    REAL NOT NULL DEFAULT 10.0, -- 编译轮询间隔
+    poll_interval_seconds    REAL NOT NULL DEFAULT 30.0,
     poll_timeout_seconds     REAL NOT NULL DEFAULT 7200.0,
     updated_at               TEXT NOT NULL
 );

@@ -33,6 +33,6 @@ wheels/
 CLAUDE.md
 .DS_Store
 *.tsbuildinfo
-
+.claude/
 /tmp/*
 !/tmp/process.py
