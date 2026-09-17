@@ -296,7 +296,7 @@ def test_evaluate_rejects_rebuilt_subset(normalized):
 
 def test_attribution_can_use_judge_metric(normalized):
     """归因依据必须使用本次评测实际产出的指标，而不是固定 recall@5。"""
-    compile_id, query_id, eval_id = _fixture_chain(
+    compile_id, _, eval_id = _fixture_chain(
         normalized, {"answerMode": "knowledge", "answer": "Rita Moreno"}
     )
     sample_id = compile_store.compile_samples(normalized, compile_id)[0]["sample_id"]
@@ -422,3 +422,112 @@ def test_evaluate_resume_restores_judge_scores_and_summary(normalized, monkeypat
     assert len(summaries) == 1
     assert summaries[0]["value"] == 0.5
     assert summaries[0]["sample_count"] == 2
+
+
+def test_judge_runs_all_metrics_for_each_sample_before_next(normalized, monkeypatch):
+    from akasha_benchmark.judge.client import JudgeProvider, JudgeReply
+    from akasha_benchmark.store import task_store
+
+    compile_id, query_id, eval_id = _fixture_chain(
+        normalized, {"answerMode": "knowledge", "answer": "a"}
+    )
+    evaluate.evaluate_dataset(
+        normalized,
+        eval_id,
+        query_id,
+        compile_id,
+        "hotpotqa",
+        (2,),
+        frozenset({"em"}),
+    )
+    task_id = task_store.create_task(normalized, stage="evaluate", params={})
+    normalized.commit()
+    ctx = TaskContext(
+        task_id=task_id,
+        stage="evaluate",
+        params={},
+        connection=normalized,
+        pause_event=threading.Event(),
+    )
+    calls: list[list[tuple[str, str]]] = []
+
+    def fake_task(metric, question, answer, reference, body):
+        return ((metric, question), lambda payload: (1.0, {}))
+
+    def fake_complete_many(provider, prompts, concurrency):
+        calls.append(list(prompts))
+        return [
+            JudgeReply(content="{}", failure_kind=None, raw="SECRET_RAW", status=200)
+            for _ in prompts
+        ]
+
+    monkeypatch.setattr(evaluate, "_judge_task", fake_task)
+    monkeypatch.setattr(evaluate, "complete_many", fake_complete_many)
+    provider = JudgeProvider("https://x", "m", "k", concurrency=4)
+
+    evaluate._judge(
+        ctx,
+        eval_id,
+        query_id,
+        provider,
+        ["faithfulness", "answer_relevancy"],
+    )
+
+    rows = eval_store.sample_evals(normalized, eval_id)
+    assert calls == [
+        [("faithfulness", rows[0]["detail"]["question"]), ("answer_relevancy", rows[0]["detail"]["question"])],
+        [("faithfulness", rows[1]["detail"]["question"]), ("answer_relevancy", rows[1]["detail"]["question"])],
+    ]
+    task = task_store.get_task(normalized, task_id)
+    assert (task["progress_done"], task["progress_total"]) == (2, 2)
+    assert all("SECRET_RAW" not in entry["message"] for entry in task_store.task_logs(normalized, task_id))
+
+
+def test_judge_resume_retries_failed_verdicts(normalized, monkeypatch):
+    from akasha_benchmark.judge.client import JudgeProvider, JudgeReply
+    from akasha_benchmark.store import task_store
+
+    compile_id, query_id, eval_id = _fixture_chain(
+        normalized, {"answerMode": "knowledge", "answer": "a"}
+    )
+    evaluate.evaluate_dataset(
+        normalized, eval_id, query_id, compile_id, "hotpotqa", (2,), frozenset({"em"})
+    )
+    rows = eval_store.sample_evals(normalized, eval_id)
+    for row in rows:
+        eval_store.record_judge_verdict(
+            normalized,
+            eval_id,
+            sample_id=row["sample_id"],
+            metric="answer_relevancy",
+            score=None,
+            failure_kind="parse_error",
+            detail={"error": "invalid json"},
+        )
+    task_id = task_store.create_task(normalized, stage="evaluate", params={})
+    normalized.commit()
+    ctx = TaskContext(
+        task_id=task_id, stage="evaluate", params={}, connection=normalized, pause_event=threading.Event()
+    )
+    calls = 0
+
+    def fake_task(metric, question, answer, reference, body):
+        return (("system", "user"), lambda payload: (1.0, {}))
+
+    def fake_complete_many(provider, prompts, concurrency):
+        nonlocal calls
+        calls += len(prompts)
+        return [JudgeReply("{}", None, "{}", 200) for _ in prompts]
+
+    monkeypatch.setattr(evaluate, "_judge_task", fake_task)
+    monkeypatch.setattr(evaluate, "complete_many", fake_complete_many)
+    evaluate._judge(
+        ctx, eval_id, query_id, JudgeProvider("https://x", "m", "k"), ["answer_relevancy"]
+    )
+
+    assert calls == len(rows)
+    assert all(
+        verdict["failure_kind"] is None
+        for verdict in eval_store.judge_verdicts(normalized, eval_id)
+        if verdict["metric"] == "answer_relevancy"
+    )

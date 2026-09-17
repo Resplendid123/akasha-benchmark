@@ -42,14 +42,16 @@ def test_answer_correctness_needs_reference_answers():
 
 
 def test_answer_relevancy_is_the_relevant_share():
+    sentences = ["a", "b", "c"]
     score, detail = answer_relevancy.parse_verdict(
         {
-            "sentences": [
-                {"sentence": "a", "verdict": "relevant"},
-                {"sentence": "b", "verdict": "relevant"},
-                {"sentence": "c", "verdict": "irrelevant"},
+            "verdicts": [
+                {"index": 1, "verdict": "relevant"},
+                {"index": 2, "verdict": "relevant"},
+                {"index": 3, "verdict": "irrelevant"},
             ]
-        }
+        },
+        sentences,
     )
     assert score == pytest.approx(2 / 3)
     assert detail["relevant"] == 2
@@ -58,13 +60,62 @@ def test_answer_relevancy_is_the_relevant_share():
 
 def test_answer_relevancy_undefined_on_refusal():
     """没有实质句子时无定义。记 0 会把拒答算成「答偏了」。"""
-    score, _ = answer_relevancy.parse_verdict({"sentences": []})
+    score, detail = answer_relevancy.parse_verdict(
+        {"verdicts": [{"index": 1, "verdict": "ignore"}]},
+        ["我无法回答。"],
+    )
     assert score is None
+    assert detail["ignored"] == 1
 
 
 def test_answer_relevancy_rejects_unknown_verdict():
     with pytest.raises(ValueError, match="unknown verdict"):
-        answer_relevancy.parse_verdict({"sentences": [{"sentence": "a", "verdict": "maybe"}]})
+        answer_relevancy.parse_verdict(
+            {"verdicts": [{"index": 1, "verdict": "maybe"}]}, ["a"]
+        )
+
+
+def test_answer_relevancy_rejects_missing_or_duplicate_indexes():
+    with pytest.raises(ValueError, match="expected 2 verdicts"):
+        answer_relevancy.parse_verdict(
+            {"verdicts": [{"index": 1, "verdict": "relevant"}]},
+            ["a", "b"],
+        )
+    with pytest.raises(ValueError, match="duplicate sentence index"):
+        answer_relevancy.parse_verdict(
+            {
+                "verdicts": [
+                    {"index": 1, "verdict": "relevant"},
+                    {"index": 1, "verdict": "irrelevant"},
+                ]
+            },
+            ["a", "b"],
+        )
+
+
+def test_answer_relevancy_does_not_echo_quoted_sentences_in_json():
+    built = answer_relevancy.build_prompt(
+        "怎么申请？",
+        '登录门户搜索"设备申请"。然后联系 IT。',
+        {},
+    )
+    assert built is not None
+    system, user, sentences = built
+    assert sentences == ['登录门户搜索"设备申请"。', "然后联系 IT。"]
+    assert "Never copy sentence text" in system
+    assert '[1] 登录门户搜索"设备申请"。' in user
+
+    score, detail = answer_relevancy.parse_verdict(
+        {
+            "verdicts": [
+                {"index": 1, "verdict": "relevant"},
+                {"index": 2, "verdict": "irrelevant"},
+            ]
+        },
+        sentences,
+    )
+    assert score == pytest.approx(0.5)
+    assert detail["sentences"][0]["sentence"] == '登录门户搜索"设备申请"。'
 
 
 def test_answer_relevancy_skips_empty_answer():

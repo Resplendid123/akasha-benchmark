@@ -379,6 +379,55 @@ class AkashaClient:
         """立即建 Run，绕过 1 小时静默期。"""
         return self.post("llm-wiki/admin/compile-spaces", {"spaceIds": space_ids})
 
+    def run_pages(
+        self, run_id: str, *, page: int = 1, limit: int = 100
+    ) -> dict[str, Any]:
+        """一条编译 Run 的逐页结果。Akasha 单页最多返回 100 条。"""
+        return self.get(
+            f"llm-wiki/admin/diagnostics/runs/{run_id}/pages?page={page}&limit={limit}"
+        )
+
+    def retryable_run_page_ids(self, run_ids: list[str]) -> list[str]:
+        """收集失败或因主动取消而跳过的源页面，跨页并保序去重。"""
+        failed: dict[str, None] = {}
+        for run_id in dict.fromkeys(run_ids):
+            page = 1
+            while True:
+                result = self.run_pages(run_id, page=page, limit=100)
+                items = result.get("items") or []
+                for item in items:
+                    page_id = item.get("sourcePageId")
+                    if page_id and (
+                        item.get("status") == "failed"
+                        or item.get("mergeStatus") == "failed"
+                        or (
+                            item.get("status") == "skipped"
+                            and item.get("errorCode") == "manual_cancelled"
+                        )
+                    ):
+                        failed.setdefault(str(page_id), None)
+                total = int(result.get("total") or 0)
+                limit = int(result.get("limit") or 100)
+                if page * limit >= total or not items:
+                    break
+                page += 1
+        return list(failed)
+
+    def retry_pages(self, page_ids: list[str]) -> dict[str, Any]:
+        """批量重试指定页面，并合并各批返回的新 Run ID。"""
+        unique = list(dict.fromkeys(page_ids))
+        job_ids: dict[str, None] = {}
+        queued = 0
+        for start in range(0, len(unique), 100):
+            result = self.post(
+                "llm-wiki/admin/retry-pages",
+                {"pageIds": unique[start : start + 100]},
+            )
+            queued += int(result.get("queuedPageCount") or 0)
+            for job_id in result.get("jobIds") or []:
+                job_ids.setdefault(str(job_id), None)
+        return {"queuedPageCount": queued, "jobIds": list(job_ids)}
+
     def cancel_compile_run(self, run_id: str, reason: str) -> dict[str, Any]:
         """取消一个精确的编译 Run；服务端同时清理对应 BullMQ job。"""
         return self.post(

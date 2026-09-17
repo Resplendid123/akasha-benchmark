@@ -125,7 +125,7 @@ export const api = {
     del<{ deleted: number }>(`/api/datasets/${encodeURIComponent(name)}`),
   rawSamples: (
     name: string,
-    params: { kind?: 'qa' | 'corpus'; limit?: number; offset?: number } = {},
+    params: { kind?: 'qa' | 'corpus'; q?: string; limit?: number; offset?: number } = {},
   ) => request<RawSamples>(`/api/datasets/${name}/raw${query(params)}`),
   samples: (name: string, params: { q?: string; limit?: number; offset?: number } = {}) =>
     request<SampleList>(`/api/datasets/${name}/samples${query(params)}`),
@@ -140,7 +140,7 @@ export const api = {
   compiles: () => request<{ compiles: CompileRun[] }>('/api/compiles'),
   compileDocs: (
     id: number,
-    params: { dataset?: string; gold_only?: boolean; limit?: number; offset?: number } = {},
+    params: { dataset?: string; gold_only?: boolean; q?: string; limit?: number; offset?: number } = {},
   ) =>
     request<Paged & { docs: CompileDoc[]; imported: number }>(
       `/api/compiles/${id}/docs${query(params)}`,
@@ -157,7 +157,7 @@ export const api = {
   // --- 查询层 ---
   responses: (
     id: number,
-    params: { dataset?: string; answer_mode?: string; limit?: number; offset?: number } = {},
+    params: { dataset?: string; answer_mode?: string; q?: string; limit?: number; offset?: number } = {},
   ) => request<ResponseList>(`/api/queries/${id}/responses${query(params)}`),
   response: (id: number, sampleId: string) =>
     request<Record<string, unknown>>(
@@ -167,7 +167,10 @@ export const api = {
 
   // --- 评测层 ---
   evalRun: (id: number) => request<EvalDetail>(`/api/evals/${id}`),
-  evalSamples: (id: number, params: { dataset?: string; limit?: number; offset?: number } = {}) =>
+  evalSamples: (
+    id: number,
+    params: { dataset?: string; answer_mode?: string; q?: string; limit?: number; offset?: number } = {},
+  ) =>
     request<EvalSampleList>(`/api/evals/${id}/samples${query(params)}`),
   evalSample: (id: number, sampleId: string) =>
     request<EvalSampleDetail>(`/api/evals/${id}/samples/${encodeURIComponent(sampleId)}`),

@@ -175,7 +175,7 @@ export interface SampleList extends Paged {
 
 export interface CorpusList extends Paged {
   dataset: string
-  docs: { doc_id: string; title: string; text: string; truncated: boolean }[]
+  docs: { doc_id: string; title: string; text: string }[]
 }
 
 export interface RawSamples extends Paged {
@@ -214,6 +214,9 @@ export interface AttributionRun {
   sample_limit: number
   provider_id: number | null
   status: RunStatus
+  config_group: string | null
+  sample_count: number
+  success_count: number
   created_at: string
   finished_at: string | null
 }
@@ -226,6 +229,9 @@ export interface EvalRun {
   metrics: string[]
   judge_provider_id: number | null
   status: RunStatus
+  config_group: string | null
+  sample_count: number
+  success_count: number
   created_at: string
   finished_at: string | null
   attributions: AttributionRun[]
@@ -246,6 +252,9 @@ export interface QueryRun {
   score_threshold: number | null
   concurrency: number
   status: RunStatus
+  config_group: string | null
+  sample_count: number
+  success_count: number
   created_at: string
   finished_at: string | null
   stats: Record<string, QueryStats>
@@ -263,6 +272,7 @@ export interface CompileStats {
 export interface Readiness {
   ready: boolean
   reasons: string[]
+  warnings: string[]
 }
 
 export interface CompileRun {
@@ -280,7 +290,13 @@ export interface CompileRun {
   created_at: string
   finished_at: string | null
   stats: Record<string, CompileStats>
-  quality: { passed: boolean; gates: Record<string, number | null> } | null
+  compiled_pages: number | null
+  compiled_pages_error: string | null
+  quality: {
+    passed: boolean
+    gates: Record<string, number | null>
+    progress?: { expected?: number; succeeded?: number; failed?: number; skipped?: number }
+  } | null
   /** 每篇编译耗时的估算，不是实测。 */
   pace: { runs: number; pages: number; total_ms: number; per_page_ms: number } | null
   readiness: Readiness
@@ -381,6 +397,7 @@ export interface EvalSampleRow {
 
 export interface EvalSampleList extends Paged {
   eval_id: number
+  count_by_answer_mode: Record<string, number>
   samples: EvalSampleRow[]
 }
 

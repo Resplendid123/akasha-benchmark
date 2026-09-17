@@ -53,7 +53,8 @@ def test_init_db_is_idempotent(db_path):
     assert {"compile_run", "query_run", "eval_run", "attribution_run", "audit_log"} <= tables
 
 
-def test_foreign_keys_cascade(db, sample_dataset, compile_id, query_id, eval_id):
+@pytest.mark.usefixtures("sample_dataset")
+def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
     """删除编译时级联删除下游记录与产物。"""
     compile_store.replace_compile_subset(
         db, compile_id, "d", ["d:1"], [{"doc_id": "0", "is_gold": True}]
@@ -70,7 +71,8 @@ def test_foreign_keys_cascade(db, sample_dataset, compile_id, query_id, eval_id)
     assert compile_store.compile_docs(db, compile_id) == []
 
 
-def test_dataset_delete_refuses_when_compiled(db, sample_dataset, compile_id):
+@pytest.mark.usefixtures("sample_dataset")
+def test_dataset_delete_refuses_when_compiled(db, compile_id):
     """禁止删除已被编译引用的数据集。"""
     compile_store.replace_compile_subset(db, compile_id, "d", ["d:1"], [])
 
@@ -78,7 +80,8 @@ def test_dataset_delete_refuses_when_compiled(db, sample_dataset, compile_id):
         data_store.delete_dataset(db, "d")
 
 
-def test_pending_query_samples_drives_resume(db, sample_dataset, query_id):
+@pytest.mark.usefixtures("sample_dataset")
+def test_pending_query_samples_drives_resume(db, query_id):
     """续跑仅处理固化选择中尚无响应的样本。"""
     query_store.freeze_query_samples(
         db, query_id, [{"sample_id": "d:1"}, {"sample_id": "d:2"}]
@@ -111,9 +114,8 @@ def test_pending_query_samples_drives_resume(db, sample_dataset, query_id):
         query_store.freeze_query_samples(db, query_id, [{"sample_id": "missing"}])
 
 
-def test_compile_subset_replacement_is_scoped_to_dataset(
-    db, sample_dataset, compile_id
-):
+@pytest.mark.usefixtures("sample_dataset")
+def test_compile_subset_replacement_is_scoped_to_dataset(db, compile_id):
     data_store.upsert_dataset(
         db, name="other", qa_sha256="a", qa_rows=1, corpus_sha256="b", corpus_rows=0
     )
@@ -239,6 +241,51 @@ def test_compile_ready_requires_quality_gate(db, compile_id):
     assert compile_store.compile_ready(db, compile_id)["ready"] is True
 
 
+def test_compile_ready_rejects_failed_compile_without_partial_success(db, compile_id):
+    compile_store.replace_compile_subset(
+        db, compile_id, "d", [], [{"doc_id": "0", "is_gold": True}]
+    )
+    compile_store.record_page(db, compile_id, "d", "0", page_id="p0", error=None)
+    compile_store.update_compile_run(
+        db,
+        compile_id,
+        space_id="s",
+        status=run_store.STATUS_FAILED,
+        quality_json=(
+            '{"passed": false, "progress": '
+            '{"expected": 1, "succeeded": 0, "failed": 1, "skipped": 0}}'
+        ),
+    )
+
+    readiness = compile_store.compile_ready(db, compile_id)
+    assert readiness["ready"] is False
+    assert readiness["warnings"] == []
+
+
+def test_compile_ready_recognizes_existing_partial_quality_report(db, compile_id):
+    docs = [{"doc_id": str(index), "is_gold": index == 0} for index in range(4)]
+    compile_store.replace_compile_subset(db, compile_id, "d", [], docs)
+    for index in range(4):
+        compile_store.record_page(
+            db, compile_id, "d", str(index), page_id=f"p{index}", error=None
+        )
+    compile_store.update_compile_run(
+        db,
+        compile_id,
+        space_id="s",
+        status=run_store.STATUS_FAILED,
+        quality_json=(
+            '{"passed": false, "gates": {'
+            '"missingChunkPageCount": 1, "missingEmbeddingPageCount": 1, '
+            '"missingSourcePageCount": 1, "stalePageCount": 0}}'
+        ),
+    )
+
+    readiness = compile_store.compile_ready(db, compile_id)
+    assert readiness["ready"] is True
+    assert "至少 1 篇" in readiness["warnings"][0]
+
+
 def test_provider_api_key_roundtrip(db):
     provider_id = config_store.upsert_provider(
         db,
@@ -259,6 +306,19 @@ def test_provider_api_key_roundtrip(db):
             model="m",
             api_key="",
         )
+
+
+def test_providers_are_listed_by_most_recent_update(db):
+    older = config_store.upsert_provider(
+        db, role="judge", label="z-old", base_url="u", model="m1", api_key="k"
+    )
+    newer = config_store.upsert_provider(
+        db, role="judge", label="a-new", base_url="u", model="m2", api_key="k"
+    )
+    db.execute("UPDATE model_provider SET updated_at = '2026-01-01T00:00:00Z' WHERE id = ?", (older,))
+    db.execute("UPDATE model_provider SET updated_at = '2026-01-02T00:00:00Z' WHERE id = ?", (newer,))
+
+    assert [row["id"] for row in config_store.list_providers(db, "judge")] == [newer, older]
 
 
 def test_connection_rejects_unknown_fields(db):

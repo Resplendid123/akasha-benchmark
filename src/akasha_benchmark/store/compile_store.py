@@ -7,7 +7,7 @@ from typing import Any
 
 from .data_store import sample_from_row
 from .db import dumps, loads, utc_now
-from .run_store import STATUS_RUNNING, STATUS_SUCCEEDED, get_run
+from .run_store import STATUS_FAILED, STATUS_RUNNING, STATUS_SUCCEEDED, get_run
 
 
 def create_compile_run(
@@ -211,22 +211,86 @@ def workspace_mismatch(
 
 
 def compile_ready(connection: sqlite3.Connection, compile_id: int) -> dict[str, Any]:
-    """能不能拿这次编译去查询，返回 ``{ready, reasons}``。"""
+    """能不能拿这次编译去查询，返回阻断原因与降级警告。
+
+    编译任务失败不等于空间完全不可查。远端逐页进度明确证明至少一篇成功时，
+    保留失败状态用于告警，但允许查询层使用其余已经编译好的页面。
+    """
     run = get_compile_run(connection, compile_id)
     if run is None:
-        return {"ready": False, "reasons": ["编译记录不存在"]}
+        return {"ready": False, "reasons": ["编译记录不存在"], "warnings": []}
+    doc_counts = connection.execute(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN page_id IS NULL THEN 1 ELSE 0 END) AS missing "
+        "FROM compile_doc WHERE compile_id = ?",
+        (compile_id,),
+    ).fetchone()
+    return compile_readiness(
+        run,
+        total=int(doc_counts["total"] or 0),
+        missing=int(doc_counts["missing"] or 0),
+    )
+
+
+def compile_readiness(run: dict[str, Any], *, total: int, missing: int) -> dict[str, Any]:
+    """用已聚合的文档数判断编译能否查询。"""
     reasons: list[str] = []
-    if run["status"] != STATUS_SUCCEEDED:
+    warnings: list[str] = []
+    quality = loads(run["quality_json"]) or {}
+    progress = quality.get("progress") or {}
+    succeeded = progress.get("succeeded")
+    failed = progress.get("failed")
+    skipped = progress.get("skipped")
+    unsuccessful = sum(
+        value
+        for value in (failed, skipped)
+        if isinstance(value, int) and not isinstance(value, bool)
+    )
+    progress_proves_partial = (
+        run["status"] == STATUS_FAILED
+        and isinstance(succeeded, int)
+        and not isinstance(succeeded, bool)
+        and succeeded > 0
+        and unsuccessful > 0
+    )
+    gates = quality.get("gates") or {}
+    gate_names = (
+        "missingChunkPageCount",
+        "missingEmbeddingPageCount",
+        "missingSourcePageCount",
+        "stalePageCount",
+    )
+    gate_counts = [gates.get(name) for name in gate_names]
+    gates_are_counts = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in gate_counts
+    )
+    # 兼容升级前没有保存 progress 的失败记录。用并集上界做保守估计：即使
+    # 四类问题全落在不同页面，仍有剩余页面时，才能证明至少一篇产物完整。
+    complete_lower_bound = total - sum(gate_counts) if gates_are_counts else 0
+    quality_proves_partial = (
+        run["status"] == STATUS_FAILED
+        and quality.get("passed") is False
+        and any(gate_counts)
+        and complete_lower_bound > 0
+    )
+    partial = progress_proves_partial or quality_proves_partial
+    if run["status"] != STATUS_SUCCEEDED and not partial:
         reasons.append(f"编译状态为 {run['status']}，未成功结束")
+    elif progress_proves_partial:
+        warnings.append(
+            f"编译仅部分成功：{succeeded} 篇可用，{unsuccessful} 篇失败或跳过；"
+            "查询结果可能不完整"
+        )
+    elif quality_proves_partial:
+        warnings.append(
+            f"编译仅部分成功：可确认至少 {complete_lower_bound} 篇产物完整；"
+            "查询结果可能不完整"
+        )
     if not run["space_id"]:
         reasons.append("没有 Akasha 空间")
-    missing = connection.execute(
-        "SELECT COUNT(*) AS n FROM compile_doc WHERE compile_id = ? AND page_id IS NULL",
-        (compile_id,),
-    ).fetchone()["n"]
     if missing:
         reasons.append(f"{missing} 篇语料没有导入成功")
-    quality = loads(run["quality_json"]) or {}
-    if quality.get("passed") is not True:
+    if quality.get("passed") is not True and not partial:
         reasons.append("编译质量闸门未通过")
-    return {"ready": not reasons, "reasons": reasons}
+    return {"ready": not reasons, "reasons": reasons, "warnings": warnings}

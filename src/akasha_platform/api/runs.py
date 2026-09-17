@@ -11,17 +11,19 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from akasha_benchmark.akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
+from akasha_benchmark.akasha_client import (
+    ACTIVE_RUN_STATUSES,
+    AkashaClient,
+    AkashaError,
+)
 from akasha_benchmark.config import load_config
 from akasha_benchmark.store import (
-    attribution_store,
     compile_store,
-    eval_store,
-    loads,
     query_store,
 )
 
 from ._common import db, public_run, reject_if_busy, writable
+from ..run_tree import build_compile_tree
 
 router = APIRouter(prefix="/api")
 
@@ -36,44 +38,7 @@ MAX_PAGE = 200
 def list_compiles(request: Request) -> dict[str, Any]:
     """编译记录树：每次编译连同它的查询、评测、归因。各层的选择器都读它。"""
     with db(request) as connection:
-        runs = []
-        for row in compile_store.list_compile_runs(connection):
-            compile_id = int(row["id"])
-            queries = []
-            for q in query_store.list_query_runs(connection, compile_id):
-                query_id = int(q["id"])
-                queries.append(
-                    {
-                        **public_run(q),
-                        "stats": query_store.query_stats(connection, query_id),
-                        "evals": [
-                            {
-                                **public_run(e),
-                                "ks": loads(e["ks_json"], []),
-                                "metrics": loads(e["metrics_json"], []),
-                                "attributions": [
-                                    public_run(a)
-                                    for a in attribution_store.list_attribution_runs(
-                                        connection, int(e["id"])
-                                    )
-                                ],
-                            }
-                            for e in eval_store.list_eval_runs(connection, query_id)
-                        ],
-                    }
-                )
-            runs.append(
-                {
-                    **public_run(row),
-                    "datasets": loads(row["datasets_json"], []),
-                    "stats": compile_store.compile_stats(connection, compile_id),
-                    "quality": loads(row["quality_json"]),
-                    "pace": loads(row["pace_json"]),
-                    "readiness": compile_store.compile_ready(connection, compile_id),
-                    "queries": queries,
-                }
-            )
-    return {"compiles": runs}
+        return {"compiles": build_compile_tree(connection)}
 
 
 @router.get("/compiles/{compile_id}/docs")
@@ -82,6 +47,7 @@ def compile_docs(
     compile_id: int,
     dataset: str | None = None,
     gold_only: bool = False,
+    q: str | None = None,
     limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -95,6 +61,15 @@ def compile_docs(
         docs = compile_store.compile_docs(connection, compile_id, dataset)
     if gold_only:
         docs = [d for d in docs if d["is_gold"]]
+    needle = (q or "").strip().lower()
+    if needle:
+        docs = [
+            doc
+            for doc in docs
+            if needle in str(doc["doc_id"]).lower()
+            or needle in str(doc.get("title") or "").lower()
+            or needle in str(doc.get("page_id") or "").lower()
+        ]
     return {
         "compile_id": compile_id,
         "total": len(docs),
@@ -148,6 +123,7 @@ def query_responses(
     query_id: int,
     dataset: str | None = None,
     answer_mode: str | None = None,
+    q: str | None = None,
     limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -159,36 +135,23 @@ def query_responses(
     with db(request) as connection:
         if query_store.get_query_run(connection, query_id) is None:
             raise HTTPException(404, f"查询 #{query_id} 不存在")
-        rows = query_store.responses_of(connection, query_id, dataset)
-
-    counts: dict[str, int] = {}
-    for row in rows:
-        key = row["answer_mode"] or "missing"
-        counts[key] = counts.get(key, 0) + 1
-    if answer_mode:
-        rows = [r for r in rows if (r["answer_mode"] or "missing") == answer_mode]
+        total, counts, rows = query_store.response_page(
+            connection,
+            query_id,
+            dataset=dataset,
+            answer_mode=answer_mode,
+            search=(q or "").strip() or None,
+            limit=limit,
+            offset=offset,
+        )
 
     return {
         "query_id": query_id,
-        "total": len(rows),
+        "total": total,
         "count_by_answer_mode": counts,
         "offset": offset,
         "limit": limit,
-        "responses": [
-            {
-                **{k: v for k, v in row.items() if k != "response"},
-                "answer": ((row["response"] or {}).get("answer") or "")[:600]
-                if isinstance(row["response"], dict)
-                else None,
-                "retrieved_count": len((row["response"] or {}).get("retrievedSources") or [])
-                if isinstance(row["response"], dict)
-                else 0,
-                "citation_count": len((row["response"] or {}).get("citations") or [])
-                if isinstance(row["response"], dict)
-                else 0,
-            }
-            for row in rows[offset : offset + limit]
-        ],
+        "responses": rows,
     }
 
 

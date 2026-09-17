@@ -47,6 +47,21 @@ WHERE e.from_knowledge_page_id = ANY(%(ids)s)
 ORDER BY e.relation
 """
 
+# 一篇源页面只有在仍有效的编译产物至少生成一个可检索 chunk 时才算编译成功。
+# DISTINCT 避免同一源页面生成多个 artifact / chunk 后被重复计数。
+COMPILED_SOURCE_PAGES = """
+SELECT DISTINCT kps.source_page_id
+FROM knowledge_page_sources kps
+JOIN knowledge_pages kp ON kp.id = kps.knowledge_page_id
+WHERE kps.source_page_id = ANY(%(pages)s)
+  AND kp.stale_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM knowledge_chunks kc
+      WHERE kc.knowledge_page_id = kp.id
+  )
+"""
+
 
 class LineageUnavailable(RuntimeError):
     """没配只读数据库，或 psycopg 没装。"""
@@ -81,6 +96,31 @@ class LineageReader:
             ) from exc
         # read_only 由连接层保证，不靠「只写了 SELECT」这种约定。
         return psycopg.connect(self.database_url, autocommit=False)
+
+    def compiled_source_page_ids(self, page_ids: list[str]) -> set[str]:
+        """批量返回真正生成了可检索产物的源页面 ID。"""
+        valid: list[UUID] = []
+        for page_id in dict.fromkeys(page_ids):
+            try:
+                valid.append(UUID(page_id))
+            except (ValueError, AttributeError, TypeError):
+                continue
+        if not valid:
+            return set()
+
+        try:
+            with self._connect() as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    cursor.execute(COMPILED_SOURCE_PAGES, {"pages": valid})
+                    return {str(row[0]) for row in cursor.fetchall()}
+        except LineageUnavailable:
+            raise
+        except Exception as exc:
+            # 不把 DSN 或 PG 原始错误透给接口；列表页把它显示为「未知」。
+            raise LineageUnavailable(
+                f"PostgreSQL compilation count unavailable: {type(exc).__name__}"
+            ) from exc
 
     @staticmethod
     def _check_page_id(page_id: str) -> str:

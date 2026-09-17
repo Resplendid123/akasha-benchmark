@@ -2,13 +2,16 @@ import { useState } from 'react'
 import { api } from '../api'
 import type { CompileRun, QueryRun } from '../types'
 import {
+  AnswerModeFilter,
   CleanupButton,
+  ConfigPanel,
   DatasetPicker,
   Failed,
   Field,
   Loading,
   ModeTag,
   Pager,
+  RecordSearch,
   StatusTag,
   Timing,
   num,
@@ -57,7 +60,7 @@ export function Query({
           还没有可用于查询的编译。编译需要成功结束、语料全部导入、且质量闸门通过。
         </div>
       ) : (
-        <div className="panel">
+        <ConfigPanel storageKey="query" title="查询配置">
           <Field label="选择编译">
             <select
               value={compile?.id ?? ''}
@@ -65,7 +68,8 @@ export function Query({
             >
               {ready.map((run) => (
                 <option key={run.id} value={run.id}>
-                  {run.run_id}（#{run.id}，{run.datasets.join('+')}）
+                  {run.run_id}（#{run.id}，{run.datasets.join('+')}
+                  {run.readiness.warnings.length ? '，部分可用' : ''}）
                 </option>
               ))}
             </select>
@@ -79,7 +83,7 @@ export function Query({
               }}
             />
           )}
-        </div>
+        </ConfigPanel>
       )}
 
       {compile && compile.queries.length > 0 && (
@@ -89,32 +93,31 @@ export function Query({
             <thead>
               <tr>
                 <th>名称</th>
+                <th>配置组</th>
                 <th>状态</th>
-                <th className="num">响应</th>
-                <th className="num">失败</th>
+                <th className="num">样本数</th>
+                <th className="num">成功</th>
                 <th>耗时</th>
-                <th>阈值</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {compile.queries.map((run) => {
                 const stats = Object.values(run.stats)
-                const responses = stats.reduce((sum, s) => sum + s.responses, 0)
-                const failures = stats.reduce((sum, s) => sum + s.failures, 0)
                 const mean = stats.length
                   ? stats.reduce((sum, s) => sum + (s.latency_mean ?? 0), 0) / stats.length
                   : null
                 return (
                   <tr key={run.id} className={openQuery === run.id ? 'selected' : ''}>
-                    <td className="mono small">
+                  <td className="mono small">
                       {run.name} <span className="muted">#{run.id}</span>
-                    </td>
+                  </td>
+                  <td className="small">{run.config_group ?? '—'}</td>
                     <td>
                       <StatusTag status={run.status} />
                     </td>
-                    <td className="num">{responses}</td>
-                    <td className="num">{failures || '—'}</td>
+                  <td className="num">{run.sample_count}</td>
+                  <td className="num">{run.success_count}</td>
                     <td>
                       <Timing
                         startedAt={run.created_at}
@@ -123,7 +126,6 @@ export function Query({
                         perLabel="条"
                       />
                     </td>
-                    <td className="small muted">{run.score_threshold ?? '服务端默认'}</td>
                     <td className="table-actions-cell">
                       <div className="table-actions">
                         <button
@@ -180,6 +182,11 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
   return (
     <div style={{ marginTop: 12 }}>
       {start.error && <Failed error={start.error} />}
+      {compile.readiness.warnings.map((warning) => (
+        <div key={warning} className="note warn">
+          {warning}
+        </div>
+      ))}
       <DatasetPicker
         all={available}
         selected={selected.filter((n) => available.includes(n))}
@@ -248,11 +255,13 @@ function Responses({ queryId }: { queryId: number }) {
   const [mode, setMode] = useState('')
   const [offset, setOffset] = useState(0)
   const [sampleId, setSampleId] = useState<string | null>(null)
+  const [term, setTerm] = useState('')
+  const [q, setQ] = useState('')
   const limit = 5
 
   const { data, error, loading } = useAsync(
-    () => api.responses(queryId, { answer_mode: mode || undefined, limit, offset }),
-    [queryId, mode, offset],
+    () => api.responses(queryId, { answer_mode: mode || undefined, q, limit, offset }),
+    [queryId, mode, q, offset],
   )
 
   // 完整响应覆盖整个列表框，带返回按钮。
@@ -278,21 +287,26 @@ function Responses({ queryId }: { queryId: number }) {
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
-      <h3 style={{ marginTop: 0 }}>查询 #{queryId} 的响应</h3>
-
-      <div className="row tight" style={{ marginBottom: 8 }}>
-        {Object.entries(data.count_by_answer_mode).map(([key, count]) => (
-          <button
-            key={key}
-            className={`action small${mode === key ? ' primary' : ''}`}
-            onClick={() => {
-              setMode(mode === key ? '' : key)
-              setOffset(0)
-            }}
-          >
-            {key} · {count}
-          </button>
-        ))}
+      <div className="record-filters">
+        <AnswerModeFilter
+          counts={data.count_by_answer_mode}
+          value={mode}
+          onChange={(value) => {
+            setMode(value)
+            setOffset(0)
+            setSampleId(null)
+          }}
+        />
+        <RecordSearch
+          placeholder="搜索 sample_id、问题或系统答案"
+          value={term}
+          onChange={setTerm}
+          onSearch={(value) => {
+            setQ(value)
+            setOffset(0)
+            setSampleId(null)
+          }}
+        />
       </div>
 
       <table>

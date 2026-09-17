@@ -8,72 +8,101 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 SYSTEM = """You judge whether an ANSWER actually addresses the QUESTION.
 
-Do this:
-1. Split the ANSWER into sentences. Ignore pure boilerplate ("Here is what I
-   found", "Let me help you with that").
-2. For each sentence decide:
+The ANSWER has already been split into numbered sentences.
+For each numbered sentence decide:
    - "relevant": it contributes to answering the question.
    - "irrelevant": it is off-topic, filler, or answers something else.
-3. Judge relevance to the QUESTION only. Factual correctness is NOT your concern
+   - "ignore": it is a refusal, heading, or pure boilerplate with no substantive claim.
+Judge relevance to the QUESTION only. Factual correctness is NOT your concern
    here — a wrong-but-on-topic sentence is still "relevant".
 
 Return JSON only, no prose, in exactly this shape:
-{"sentences": [{"sentence": "<text>", "verdict": "relevant|irrelevant"}]}
+{"verdicts": [{"index": 1, "verdict": "relevant|irrelevant|ignore"}]}
 
-If the ANSWER is a refusal or contains no substantive sentences,
-return {"sentences": []}."""
+Return exactly one verdict for every numbered sentence, in the same order.
+Never copy sentence text into the JSON."""
 
 USER_TEMPLATE = """QUESTION:
 {question}
 
-ANSWER:
-{answer}"""
+NUMBERED ANSWER SENTENCES:
+{sentences}"""
 
-VERDICTS = ("relevant", "irrelevant")
+VERDICTS = ("relevant", "irrelevant", "ignore")
+MAX_SENTENCES = 100
+MAX_SENTENCE_CHARS = 1000
+_SENTENCE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
+
+
+def split_sentences(answer: str) -> list[str]:
+    """本地稳定分句，避免让模型把带引号的原文复制进 JSON。"""
+    return [
+        match.group(0).strip()[:MAX_SENTENCE_CHARS]
+        for match in _SENTENCE.finditer(answer)
+        if match.group(0).strip()
+    ][:MAX_SENTENCES]
 
 
 def score_sentences(sentences: list[dict[str, Any]]) -> float | None:
     """相关句占比。没有实质句子时返回 ``None``（拒答上这个指标无定义）。"""
-    if not sentences:
+    judged = [sentence for sentence in sentences if sentence.get("verdict") != "ignore"]
+    if not judged:
         return None
-    relevant = sum(1 for s in sentences if s.get("verdict") == "relevant")
-    return relevant / len(sentences)
+    relevant = sum(1 for sentence in judged if sentence.get("verdict") == "relevant")
+    return relevant / len(judged)
 
 
-def parse_verdict(payload: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
-    sentences = payload.get("sentences")
-    if not isinstance(sentences, list):
-        raise ValueError(f"expected a list under 'sentences', got {type(sentences).__name__}")
+def parse_verdict(
+    payload: dict[str, Any], sentences: list[str]
+) -> tuple[float | None, dict[str, Any]]:
+    verdicts = payload.get("verdicts")
+    if not isinstance(verdicts, list):
+        raise ValueError(f"expected a list under 'verdicts', got {type(verdicts).__name__}")
+    if len(verdicts) != len(sentences):
+        raise ValueError(f"expected {len(sentences)} verdicts, got {len(verdicts)}")
 
-    cleaned: list[dict[str, Any]] = []
-    for entry in sentences:
+    by_index: dict[int, str] = {}
+    for entry in verdicts:
         if not isinstance(entry, dict):
-            raise ValueError(f"sentence entries must be objects, got {type(entry).__name__}")
+            raise ValueError(f"verdict entries must be objects, got {type(entry).__name__}")
+        index = entry.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 1 <= index <= len(sentences):
+            raise ValueError(f"invalid sentence index {index!r}; expected 1..{len(sentences)}")
+        if index in by_index:
+            raise ValueError(f"duplicate sentence index {index}")
         verdict = entry.get("verdict")
         if verdict not in VERDICTS:
             raise ValueError(f"unknown verdict {verdict!r}; expected one of {list(VERDICTS)}")
-        cleaned.append(
-            {"sentence": str(entry.get("sentence") or "")[:500], "verdict": verdict}
-        )
+        by_index[index] = verdict
+
+    cleaned = [
+        {"index": index, "sentence": sentence[:500], "verdict": by_index[index]}
+        for index, sentence in enumerate(sentences, 1)
+    ]
 
     return score_sentences(cleaned), {
         "sentences": cleaned,
         "sentence_count": len(cleaned),
         "relevant": sum(1 for s in cleaned if s["verdict"] == "relevant"),
+        "irrelevant": sum(1 for s in cleaned if s["verdict"] == "irrelevant"),
+        "ignored": sum(1 for s in cleaned if s["verdict"] == "ignore"),
     }
 
 
 def build_prompt(
     question: str, answer: str, response: dict[str, Any]
-) -> tuple[str, str] | None:
-    """拼出 ``(system, user)``。问题或答案为空时返回 ``None``，该条跳过。
+) -> tuple[str, str, list[str]] | None:
+    """拼出 prompt 与本地分句。问题或答案为空时返回 ``None``。
 
     ``response`` 用不上，保留形参是为了与另外三个判据共用调用签名。
     """
-    if not question.strip() or not answer.strip():
+    sentences = split_sentences(answer)
+    if not question.strip() or not sentences:
         return None
-    return SYSTEM, USER_TEMPLATE.format(question=question, answer=answer)
+    numbered = "\n".join(f"[{index}] {sentence}" for index, sentence in enumerate(sentences, 1))
+    return SYSTEM, USER_TEMPLATE.format(question=question, sentences=numbered), sentences

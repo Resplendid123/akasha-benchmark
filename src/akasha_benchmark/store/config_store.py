@@ -133,7 +133,12 @@ def list_providers(connection: sqlite3.Connection, role: str | None = None) -> l
     if role is not None:
         sql += " WHERE role = ?"
         params = (role,)
-    return [dict(row) for row in connection.execute(sql + " ORDER BY role, label", params)]
+    return [
+        dict(row)
+        for row in connection.execute(
+            sql + " ORDER BY role, updated_at DESC, id DESC", params
+        )
+    ]
 
 
 def get_provider(connection: sqlite3.Connection, provider_id: int) -> dict[str, Any] | None:

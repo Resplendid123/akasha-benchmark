@@ -260,7 +260,7 @@ def _wait_for_compile(
         ctx.checkpoint()
         runs: list[dict[str, Any]] = []
         try:
-            runs = list((client.run_diagnostics([space_id], limit=50).get("items") or []))
+            runs = list(client.run_diagnostics([space_id], limit=50).get("items") or [])
             diagnostics_ok = True
         except AkashaError:
             runs = []
@@ -310,26 +310,27 @@ def _wait_for_compile(
             active = sum(n for name, n in counts.items() if name in ACTIVE_RUN_STATUSES)
 
         if current and progress.get("expected"):
-            ctx.log(
-                f"编译进度：{progress['succeeded'] + progress['skipped'] + progress['failed']}"
-                f"/{progress['expected']}（成功 {progress['succeeded']}，"
-                f"跳过 {progress['skipped']}，失败 {progress['failed']}）"
+            ctx.progress(
+                progress["succeeded"] + progress["skipped"] + progress["failed"],
+                progress["expected"],
+                "编译语料",
             )
         elif counts:
-            ctx.log(f"编译中：{counts}")
+            ctx.progress(0, None, "等待远端编译")
         if counts and active == 0:
             return {
                 "status_counts": counts,
                 "no_runs": False,
                 "timed_out": False,
                 "runs": current,
+                "progress": progress,
             }
         if not counts and expect_runs == 0:
             return {"status_counts": counts, "no_runs": True, "timed_out": False}
         if time.monotonic() > deadline:
             return {"status_counts": counts, "no_runs": not counts, "timed_out": True}
         if not counts:
-            ctx.log("等待本次编译 Run 出现")
+            ctx.progress(0, None, "等待远端编译")
         time.sleep(config.poll_interval_seconds)
 
 
@@ -402,6 +403,13 @@ def _quality_gate(client: AkashaClient, space_id: str) -> dict[str, Any]:
     }
     passed = all(isinstance(v, int) and v == 0 for v in gates.values())
     return {"passed": passed, "gates": gates}
+
+
+def _progress_of(runs: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        key: sum(int((run.get("progress") or {}).get("text", {}).get(key) or 0) for run in runs)
+        for key in ("expected", "succeeded", "failed", "skipped")
+    }
 
 
 def run(ctx: TaskContext) -> None:
@@ -484,9 +492,7 @@ def _execute(
     if not compile_store.compile_docs(ctx.db, compile_id):
         for dataset in datasets:
             ctx.checkpoint()
-            # 编译三段共用一把刻度（抽子集 0、导入 1、等编译 2、完成 3），
-            # 免得各段用各自的总量让进度条来回跳。细节放 note 里。
-            ctx.progress(0, 3, f"抽子集 {dataset}")
+            ctx.progress(0, None, f"抽子集 {dataset}")
             stats = build_subset(
                 ctx.db,
                 compile_id,
@@ -550,8 +556,8 @@ def _execute(
 
         _import_docs(ctx, client, compile_id, space_id, import_concurrency)
 
-        # 等编译的总量拿不到，用「导入完 = 2/3」这一档，收尾时推到 3/3。
-        ctx.progress(2, 3, "等待编译")
+        total_docs = len(compile_store.compile_docs(ctx.db, compile_id))
+        ctx.progress(0, total_docs, "等待编译")
         try:
             before = client.run_diagnostics([space_id], limit=50).get("items") or []
         except AkashaError:
@@ -560,35 +566,140 @@ def _execute(
             str(run.get("runId") or run.get("id")) for run in before if run.get("runId") or run.get("id")
         }
         baseline_sequence = max((int(run.get("spaceJobSequence") or 0) for run in before), default=0)
+        previous_run_ids = [str(value) for value in ctx.params.get("remote_compile_run_ids") or []]
+        previous_runs = [
+            run
+            for run in before
+            if str(run.get("runId") or run.get("id") or "") in set(previous_run_ids)
+        ]
+        active_previous = [
+            run
+            for run in previous_runs
+            if str(run.get("status") or "") in ACTIVE_RUN_STATUSES
+        ]
+
         ctx.checkpoint()
-        result = client.compile_spaces([space_id])
-        accepted = int(result.get("acceptedRunCount") or 0)
-        coalesced = int(result.get("coalescedRunCount") or 0)
-        remote_run_ids = {
-            str(run["runId"])
-            for run in result.get("runs") or []
-            if isinstance(run, dict) and run.get("runId")
-        }
-        if remote_run_ids:
-            ctx.freeze(remote_compile_run_ids=sorted(remote_run_ids))
-        if ctx.pause_requested:
-            for remote_run_id in remote_run_ids:
-                client.cancel_compile_run(
-                    remote_run_id, "Akasha-Benchmark task paused during compile submission"
+        if active_previous:
+            remote_run_ids = {
+                str(run.get("runId") or run.get("id")) for run in active_previous
+            }
+            accepted, coalesced = len(remote_run_ids), 0
+            ctx.log(f"接管仍在运行的远端编译：{', '.join(sorted(remote_run_ids))}")
+            wait = _wait_for_compile(
+                ctx,
+                client,
+                space_id,
+                config,
+                expect_runs=len(remote_run_ids),
+                expected_run_ids=remote_run_ids,
+            )
+        elif previous_run_ids:
+            failed_page_ids = client.retryable_run_page_ids(previous_run_ids)
+            if failed_page_ids:
+                result = client.retry_pages(failed_page_ids)
+                remote_run_ids = {str(value) for value in result.get("jobIds") or []}
+                if not remote_run_ids:
+                    raise RuntimeError(
+                        f"Akasha 已接收 {len(failed_page_ids)} 篇失败页面，但没有返回重试 Run ID"
+                    )
+                ctx.freeze(remote_compile_run_ids=sorted(remote_run_ids))
+                ctx.log(
+                    f"批量重试 {len(failed_page_ids)} 篇失败页面，"
+                    f"远端 Run {', '.join(sorted(remote_run_ids))}"
                 )
-            ctx.checkpoint()
-        ctx.log(f"已请求编译：accepted={accepted} coalesced={coalesced}")
-        wait = _wait_for_compile(
-            ctx,
-            client,
-            space_id,
-            config,
-            expect_runs=accepted + coalesced,
-            coalesced_runs=coalesced,
-            expected_run_ids=remote_run_ids,
-            baseline_run_ids=baseline_run_ids,
-            baseline_sequence=baseline_sequence,
-        )
+                if ctx.pause_requested:
+                    for remote_run_id in remote_run_ids:
+                        client.cancel_compile_run(
+                            remote_run_id,
+                            "Akasha-Benchmark task paused during retry submission",
+                        )
+                    ctx.checkpoint()
+                accepted, coalesced = len(remote_run_ids), 0
+                wait = _wait_for_compile(
+                    ctx,
+                    client,
+                    space_id,
+                    config,
+                    expect_runs=len(remote_run_ids),
+                    expected_run_ids=remote_run_ids,
+                )
+            elif previous_runs and all(
+                str(run.get("status") or "") == "cancelled"
+                and not int((run.get("progress") or {}).get("text", {}).get("expected") or 0)
+                for run in previous_runs
+            ):
+                # Run 在初始化逐页记录前就被取消；retry-pages 只接受已有编译记录
+                # 的页面，这种情况只能重新提交首次全空间编译。
+                result = client.compile_spaces([space_id])
+                accepted = int(result.get("acceptedRunCount") or 0)
+                coalesced = int(result.get("coalescedRunCount") or 0)
+                remote_run_ids = {
+                    str(run["runId"])
+                    for run in result.get("runs") or []
+                    if isinstance(run, dict) and run.get("runId")
+                }
+                if remote_run_ids:
+                    ctx.freeze(remote_compile_run_ids=sorted(remote_run_ids))
+                ctx.log("上次 Run 在逐页初始化前被取消，重新提交首次编译", "warn")
+                wait = _wait_for_compile(
+                    ctx,
+                    client,
+                    space_id,
+                    config,
+                    expect_runs=accepted + coalesced,
+                    coalesced_runs=coalesced,
+                    expected_run_ids=remote_run_ids,
+                    baseline_run_ids=baseline_run_ids,
+                    baseline_sequence=baseline_sequence,
+                )
+            else:
+                # 远端 Run 已经终态且没有失败页：后端重启可能只漏了质量检查。
+                ctx.log("已保存的远端编译没有失败页面，只刷新质量闸门")
+                wait = {
+                    "status_counts": {
+                        str(run.get("status") or "unknown"): sum(
+                            1
+                            for item in previous_runs
+                            if str(item.get("status") or "unknown")
+                            == str(run.get("status") or "unknown")
+                        )
+                        for run in previous_runs
+                    },
+                    "no_runs": False,
+                    "timed_out": False,
+                    "runs": previous_runs,
+                    "progress": _progress_of(previous_runs),
+                }
+                accepted = coalesced = 0
+        else:
+            result = client.compile_spaces([space_id])
+            accepted = int(result.get("acceptedRunCount") or 0)
+            coalesced = int(result.get("coalescedRunCount") or 0)
+            remote_run_ids = {
+                str(run["runId"])
+                for run in result.get("runs") or []
+                if isinstance(run, dict) and run.get("runId")
+            }
+            if remote_run_ids:
+                ctx.freeze(remote_compile_run_ids=sorted(remote_run_ids))
+            if ctx.pause_requested:
+                for remote_run_id in remote_run_ids:
+                    client.cancel_compile_run(
+                        remote_run_id, "Akasha-Benchmark task paused during compile submission"
+                    )
+                ctx.checkpoint()
+            ctx.log(f"已请求编译：accepted={accepted} coalesced={coalesced}")
+            wait = _wait_for_compile(
+                ctx,
+                client,
+                space_id,
+                config,
+                expect_runs=accepted + coalesced,
+                coalesced_runs=coalesced,
+                expected_run_ids=remote_run_ids,
+                baseline_run_ids=baseline_run_ids,
+                baseline_sequence=baseline_sequence,
+            )
         if wait["no_runs"]:
             # 一个 Run 都没有：page 停在「已上传、未编译」，没有源文本也没有 chunk。
             raise RuntimeError(
@@ -612,6 +723,9 @@ def _execute(
             )
 
         quality = _quality_gate(client, space_id)
+        # 质量接口只报告空间里缺了多少产物，不报告是否仍有可用产物。保存本次
+        # Run 的逐页结果，让查询层能区分「全军覆没」与「仅少数页面失败」。
+        quality["progress"] = wait.get("progress") or {}
         compile_store.update_compile_run(ctx.db, compile_id, quality_json=dumps(quality))
         ctx.db.commit()
         ctx.log(f"质量闸门 {quality['gates']} -> {'通过' if quality['passed'] else '未通过'}")
@@ -621,9 +735,12 @@ def _execute(
             for line in reasons:
                 ctx.log(f"编译失败原因：{line}", "error")
             detail = f"；{reasons[0]}" if reasons else ""
-            raise RuntimeError(f"编译质量闸门未通过：半成品索引产出的指标没有意义{detail}")
+            raise RuntimeError(
+                f"编译质量闸门未通过：整批结果不完整；成功页面仍可供查询层使用{detail}"
+            )
 
-    ctx.progress(3, 3, "编译完成")
+    total_docs = len(compile_store.compile_docs(ctx.db, compile_id))
+    ctx.progress(total_docs, total_docs, "编译完成")
     ctx.log("编译完成，可以进入查询层")
 
 
@@ -711,7 +828,7 @@ def _import_docs(
                         )
                     else:
                         done += 1
-                ctx.progress(1, 3, f"导入语料 {done}/{total}")
+                ctx.progress(done, total, "导入语料")
             return failures
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:

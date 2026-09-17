@@ -6,6 +6,7 @@ import {
   Failed,
   Loading,
   Pager,
+  RecordSearch,
   num,
   useAction,
   useAsync,
@@ -205,31 +206,24 @@ function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' 
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
-      <div className="row" style={{ marginBottom: 10 }}>
+      <div className="record-filters">
         <h3 style={{ margin: 0 }}>
           {dataset} {tab === 'samples' ? '样本' : '语料'}
         </h3>
-        <input
-          placeholder={tab === 'samples' ? '按问题、答案或 sample_id 搜索' : '按标题或 doc_id 搜索'}
+        <RecordSearch
+          placeholder={
+            tab === 'samples'
+              ? '搜索 sample_id、问题或参考答案'
+              : '搜索 doc_id 或文档标题'
+          }
           value={term}
-          onChange={(event) => setTerm(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              setQ(term)
-              setOffset(0)
-            }
-          }}
-          style={{ minWidth: 280 }}
-        />
-        <button
-          className="action"
-          onClick={() => {
-            setQ(term)
+          onChange={setTerm}
+          onSearch={(value) => {
+            setQ(value)
             setOffset(0)
+            setSampleId(null)
           }}
-        >
-          搜索
-        </button>
+        />
       </div>
 
       {active.loading && <Loading what="内容" />}
@@ -273,9 +267,8 @@ function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' 
               <div className="small">
                 <span className="tag accent">{doc.doc_id}</span> {doc.title}
               </div>
-              <pre className="block tall" style={{ marginTop: 4 }}>
+              <pre className="block" style={{ marginTop: 4 }}>
                 {doc.text}
-                {doc.truncated && '\n\n…（已截断）'}
               </pre>
             </div>
           ))}

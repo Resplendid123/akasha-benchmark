@@ -25,6 +25,15 @@ DEFAULT_PAGE = 20
 MAX_PAGE = 200
 
 
+def _contains_text(value: Any, needle: str) -> bool:
+    """递归搜索原始 JSON 的值；字段名不属于数据内容，不参与匹配。"""
+    if isinstance(value, dict):
+        return any(_contains_text(item, needle) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_text(item, needle) for item in value)
+    return value is not None and needle in str(value).lower()
+
+
 @router.get("/datasets")
 def datasets(request: Request) -> dict[str, Any]:
     """各组数据集的原始文件状态与归一化状态，连同各自的身份规则与 provides。"""
@@ -78,6 +87,7 @@ def raw_samples(
     request: Request,
     name: str,
     kind: str = "qa",
+    q: str | None = None,
     limit: int = Query(DEFAULT_PAGE, le=MAX_PAGE),
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -99,6 +109,9 @@ def raw_samples(
     rows = load_json(path)
     if not isinstance(rows, list):
         raise HTTPException(500, f"{path.name}: 期望一个 JSON 数组")
+    needle = (q or "").strip().lower()
+    if needle:
+        rows = [row for row in rows if _contains_text(row, needle)]
 
     return {
         "dataset": adapter.name,
@@ -174,7 +187,7 @@ def normalized_corpus(
     limit: int = Query(10, le=50),
     offset: int = 0,
 ) -> dict[str, Any]:
-    """归一化后的语料。正文裁到可读长度。"""
+    """归一化后的语料。正文按数据库内容原样返回。"""
     with db(request) as connection:
         if data_store.get_dataset(connection, name) is None:
             raise HTTPException(404, f"{name} 还没归一化")
@@ -190,10 +203,7 @@ def normalized_corpus(
         "total": len(rows),
         "offset": offset,
         "limit": limit,
-        "docs": [
-            {**r, "text": (r["text"] or "")[:2000], "truncated": len(r["text"] or "") > 2000}
-            for r in rows[offset : offset + limit]
-        ],
+        "docs": rows[offset : offset + limit],
     }
 
 

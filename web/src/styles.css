@@ -105,6 +105,18 @@ h5 {
 
 .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
 .row.tight { gap: 6px; }
+.record-filters {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.config-panel > .panel-head h3 { margin: 0; }
+.config-panel-body { margin-top: 12px; }
+.pager { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.pager-jump { display: inline-flex; align-items: center; gap: 5px; margin-left: 4px; }
+.pager-jump input { width: 64px; min-width: 0; padding: 3px 6px; }
+.record-search, .answer-mode-filter {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.record-search input { min-width: 280px; }
 .spread { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
@@ -160,9 +172,13 @@ tbody tr.selected { background: var(--accent-soft); }
 }
 .table-actions > .action { flex: 0 0 auto; }
 .tasks-table th:nth-child(6),
-.tasks-table td:nth-child(6) { white-space: nowrap; }
+.tasks-table td:nth-child(6),
+.tasks-table th:nth-child(7),
+.tasks-table td:nth-child(7) { white-space: nowrap; }
 @media (max-width: 900px) {
   .records-table { display: block; overflow-x: auto; }
+  .record-search { flex: 1 1 100%; }
+  .record-search input { min-width: 0; flex: 1 1 auto; }
 }
 
 /* --- 语义色：三档，文字都取深色调 --- */
@@ -299,6 +315,23 @@ pre.block.tall { max-height: min(300px, 60vh); }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 13px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
+.kv-row { display: contents; }
+.compact-kv { margin-top: 8px; }
+.metric-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.detail-list { display: grid; gap: 8px; margin-top: 8px; }
+.detail-card, .judge-card {
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2);
+  padding: 9px 11px;
+}
+.judge-card + .judge-card { margin-top: 10px; }
+.detail-meta { display: flex; flex-wrap: wrap; gap: 5px 14px; margin: 5px 0; color: var(--muted); font-size: 12px; }
+.readable-text { white-space: pre-wrap; word-break: break-word; margin-top: 7px; font-size: 13px; }
+.detail-card blockquote {
+  margin: 7px 0 0; padding: 7px 10px; border-left: 3px solid var(--accent);
+  background: #fff; color: var(--text);
+}
+.verdict-item { border-top: 1px solid var(--border); padding-top: 7px; font-size: 13px; }
+.verdict-item:first-child { border-top: 0; padding-top: 0; }
 
 /* 密码与 api_key 一套样式：显隐按钮在输入框内，不占用文字区域。 */
 .secret-input { position: relative; display: flex; width: 100%; }

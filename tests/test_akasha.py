@@ -144,6 +144,26 @@ class FakeClient:
     def page_log(self, space_ids, *, limit=100):
         return {"items": list(self.page_log_items)}
 
+    def run_pages(self, run_id, *, page=1, limit=100):
+        return {"items": [], "total": 0, "page": page, "limit": limit}
+
+    def retryable_run_page_ids(self, run_ids):
+        failed: dict[str, None] = {}
+        for run_id in run_ids:
+            page = 1
+            while True:
+                result = self.run_pages(run_id, page=page, limit=100)
+                for item in result["items"]:
+                    if item.get("status") == "failed" or item.get("mergeStatus") == "failed":
+                        failed.setdefault(item["sourcePageId"], None)
+                if page * int(result.get("limit") or 100) >= int(result.get("total") or 0):
+                    break
+                page += 1
+        return list(failed)
+
+    def retry_pages(self, page_ids):
+        return {"queuedPageCount": len(page_ids), "jobIds": ["retry-run-1"]}
+
     def query(self, question, space_ids, score_threshold=None):
         from akasha_benchmark.akasha_client import Response
 
@@ -296,6 +316,73 @@ def test_unauthorized_client_reuses_jwt_refreshed_by_another_client(
     akasha_client._AUTH_TOKENS.clear()
 
 
+def test_client_collects_failed_run_pages_across_pages(monkeypatch):
+    client = AkashaClient(AkashaConfig())
+    calls: list[tuple[str, int, int]] = []
+
+    def run_pages(run_id, *, page=1, limit=100):
+        calls.append((run_id, page, limit))
+        if page == 1:
+            return {
+                "items": [
+                    {"sourcePageId": "ok", "status": "succeeded"},
+                    {"sourcePageId": "text-failed", "status": "failed"},
+                    {"sourcePageId": "ordinary-skip", "status": "skipped"},
+                ],
+                "total": 101,
+                "limit": 100,
+            }
+        return {
+            "items": [
+                {
+                    "sourcePageId": "merge-failed",
+                    "status": "succeeded",
+                    "mergeStatus": "failed",
+                },
+                {"sourcePageId": "text-failed", "status": "failed"},
+                {
+                    "sourcePageId": "cancelled",
+                    "status": "skipped",
+                    "errorCode": "manual_cancelled",
+                },
+            ],
+            "total": 101,
+            "limit": 100,
+        }
+
+    monkeypatch.setattr(client, "run_pages", run_pages)
+    try:
+        assert client.retryable_run_page_ids(["run-1"]) == [
+            "text-failed",
+            "merge-failed",
+            "cancelled",
+        ]
+        assert calls == [("run-1", 1, 100), ("run-1", 2, 100)]
+    finally:
+        client.close()
+
+
+def test_client_retries_pages_in_batches_of_100(monkeypatch):
+    client = AkashaClient(AkashaConfig())
+    batches: list[list[str]] = []
+
+    def post(path, body):
+        assert path == "llm-wiki/admin/retry-pages"
+        batches.append(body["pageIds"])
+        return {"queuedPageCount": 1, "jobIds": [f"run-{len(batches)}"]}
+
+    monkeypatch.setattr(client, "post", post)
+    try:
+        result = client.retry_pages([*(f"page-{index}" for index in range(205)), "page-0"])
+        assert [len(batch) for batch in batches] == [100, 100, 5]
+        assert result == {
+            "queuedPageCount": 3,
+            "jobIds": ["run-1", "run-2", "run-3"],
+        }
+    finally:
+        client.close()
+
+
 def test_embedding_drift_is_detected():
     changed = {
         "configs": [
@@ -410,6 +497,60 @@ def test_compile_reports_page_failure_reason(ready_connection, monkeypatch):
     assert "8 篇" in str(caught.value)
 
 
+def test_query_can_use_partially_successful_compile(ready_connection, monkeypatch):
+    """单篇失败不应封死同一空间里已经编译成功的其余语料。"""
+
+    class Partial(FakeClient):
+        def run_diagnostics(self, space_ids, *, limit=50):
+            return {
+                "items": [
+                    {
+                        "runId": "remote-run-1",
+                        "status": "failed",
+                        "runDurationMs": 8000,
+                        "progress": {
+                            "text": {
+                                "expected": 4,
+                                "succeeded": 3,
+                                "failed": 1,
+                                "skipped": 0,
+                            }
+                        },
+                    }
+                ]
+            }
+
+    def factory(config):
+        client = Partial(config)
+        client.quality = {
+            "summary": {
+                "missingChunkPageCount": 1,
+                "missingEmbeddingPageCount": 1,
+                "missingSourcePageCount": 1,
+                "stalePageCount": 0,
+            }
+        }
+        return client
+
+    monkeypatch.setattr(compile, "AkashaClient", factory)
+    ctx = context(
+        ready_connection,
+        {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "partial"},
+    )
+    with pytest.raises(RuntimeError, match="质量闸门"):
+        execute(compile.run, ctx)
+
+    run = compile_store.compile_run_by_run_id(ready_connection, "partial")
+    assert run["status"] == run_store.STATUS_FAILED
+    compile_id = int(run["id"])
+    assert compile_store.compile_ready(ready_connection, compile_id)["ready"] is True
+
+    query_client = FakeClient(None)
+    monkeypatch.setattr(query, "AkashaClient", lambda config: query_client)
+    execute(query.run, context(ready_connection, {"compile_id": compile_id}))
+    assert query_client.queries
+
+
 def test_compile_fails_when_no_run_was_accepted(ready_connection, monkeypatch):
     """一个编译 Run 都没有算没编译，不算编译好了（两者的 active 都是 0）。"""
 
@@ -437,7 +578,7 @@ def test_compile_waits_when_runs_are_still_active(ready_connection, monkeypatch)
             return {"statusCounts": counts}
 
     monkeypatch.setattr(compile, "AkashaClient", lambda config: Slow(config))
-    monkeypatch.setattr(compile.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(compile.time, "sleep", lambda _seconds: None)
     ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r0"})
     execute(compile.run, ctx)
 
@@ -564,25 +705,96 @@ def test_compile_succeeds_and_records_pages(ready_connection, monkeypatch):
         "remote_compile_run_ids"
     ] == ["remote-run-1"]
     assert compile_store.compile_ready(ready_connection, int(run["id"]))["ready"] is True
+    task = task_store.get_task(ready_connection, ctx.task_id)
+    assert (task["progress_done"], task["progress_total"], task["progress_note"]) == (
+        len(docs),
+        len(docs),
+        "编译完成",
+    )
+    assert all("编译进度" not in entry["message"] for entry in task_store.task_logs(ready_connection, ctx.task_id))
 
 
-def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
+def test_compile_resume_retries_only_failed_remote_pages(ready_connection, monkeypatch):
     clients: list[FakeClient] = []
-    remote_runs = 0
+    compile_calls = 0
+    quality_checks = 0
+    retried: list[list[str]] = []
+    failed_page_id = "00000000-0000-0000-0000-000000000004"
+
+    class Resumable(FakeClient):
+        def compile_spaces(self, space_ids):
+            nonlocal compile_calls
+            compile_calls += 1
+            if compile_calls > 1:
+                pytest.fail("继续任务不应再次触发全空间编译")
+            return {
+                "acceptedRunCount": 1,
+                "coalescedRunCount": 0,
+                "runs": [{"runId": "remote-run-1", "disposition": "created"}],
+            }
+
+        def run_diagnostics(self, space_ids, *, limit=50):
+            items = [
+                {
+                    "runId": "remote-run-1",
+                    "status": "partial",
+                    "progress": {
+                        "text": {
+                            "expected": 4,
+                            "succeeded": 3,
+                            "failed": 1,
+                            "skipped": 0,
+                        }
+                    },
+                }
+            ]
+            if retried:
+                items.append(
+                    {
+                        "runId": "retry-run-1",
+                        "status": "succeeded",
+                        "progress": {
+                            "text": {
+                                "expected": 1,
+                                "succeeded": 1,
+                                "failed": 0,
+                                "skipped": 0,
+                            }
+                        },
+                    }
+                )
+            return {"items": items}
+
+        def quality_diagnostics(self, space_ids):
+            nonlocal quality_checks
+            quality_checks += 1
+            missing = 1 if quality_checks == 1 else 0
+            return {
+                "summary": {
+                    "missingChunkPageCount": missing,
+                    "missingEmbeddingPageCount": 0,
+                    "missingSourcePageCount": missing,
+                    "stalePageCount": 0,
+                }
+            }
+
+        def run_pages(self, run_id, *, page=1, limit=100):
+            assert run_id == "remote-run-1"
+            return {
+                "items": [
+                    {"sourcePageId": "00000000-0000-0000-0000-000000000001", "status": "succeeded"},
+                    {"sourcePageId": failed_page_id, "status": "failed"},
+                ],
+                "total": 2,
+                "page": page,
+                "limit": limit,
+            }
+
+        def retry_pages(self, page_ids):
+            retried.append(list(page_ids))
+            return {"queuedPageCount": 1, "jobIds": ["retry-run-1"]}
 
     def factory(config):
-        class Resumable(FakeClient):
-            def compile_spaces(self, space_ids):
-                nonlocal remote_runs
-                remote_runs += 1
-                return {
-                    "acceptedRunCount": 1,
-                    "coalescedRunCount": 0,
-                    "runs": [
-                        {"runId": f"remote-run-{remote_runs}", "disposition": "created"}
-                    ],
-                }
-
         client = Resumable(config)
         clients.append(client)
         return client
@@ -590,17 +802,171 @@ def test_compile_resume_skips_imported_docs(ready_connection, monkeypatch):
     monkeypatch.setattr(compile, "AkashaClient", factory)
     params = {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "r1"}
     ctx = context(ready_connection, params)
-    execute(compile.run, ctx)
+    with pytest.raises(RuntimeError, match="质量闸门"):
+        execute(compile.run, ctx)
     first_run_clients = len(clients)
-    first = sum(len(client.imported) for client in clients)
+    imported = sum(len(client.imported) for client in clients)
 
-    # 同一任务续跑，子集与已导入文档保持不变。
-    execute(compile.run, ctx)
+    execute(compile.run, context(ready_connection, {}, task_id=ctx.task_id))
+
+    assert imported > 0
     assert all(client.imported == [] for client in clients[first_run_clients:])
-    assert first > 0
+    assert compile_calls == 1
+    assert retried == [[failed_page_id]]
     assert task_store.get_task(ready_connection, ctx.task_id)["params"][
         "remote_compile_run_ids"
-    ] == ["remote-run-2"]
+    ] == ["retry-run-1"]
+
+
+def test_compile_resume_adopts_active_remote_run(ready_connection, monkeypatch):
+    compile_id = compile_store.create_compile_run(
+        ready_connection,
+        run_id="recover",
+        datasets=["hotpotqa"],
+        seed=1,
+        qa_limit=1,
+        negatives_ratio=1.0,
+    )
+    compile.build_subset(
+        ready_connection,
+        compile_id,
+        "hotpotqa",
+        seed=1,
+        qa_limit=1,
+        negatives_ratio=1.0,
+    )
+    compile_store.update_compile_run(
+        ready_connection,
+        compile_id,
+        space_id="space-1",
+        workspace_id="w",
+        model_configs_json=dumps(CONFIGS),
+    )
+    for index, doc in enumerate(compile_store.compile_docs(ready_connection, compile_id)):
+        compile_store.record_page(
+            ready_connection,
+            compile_id,
+            doc["dataset"],
+            doc["doc_id"],
+            page_id=f"page-{index}",
+            error=None,
+        )
+    params = {
+        "datasets": ["hotpotqa"],
+        "seed": 1,
+        "qa_limit": 1,
+        "negatives_ratio": 1.0,
+        "full_corpus": False,
+        "import_concurrency": 1,
+        "run_id": "recover",
+        "remote_compile_run_ids": ["active-run"],
+    }
+    task_id = task_store.create_task(ready_connection, stage="test", params=params)
+    task_store.set_task_target(ready_connection, task_id, "compile", compile_id)
+    ready_connection.commit()
+    polls = 0
+
+    class Recovering(FakeClient):
+        def run_diagnostics(self, space_ids, *, limit=50):
+            nonlocal polls
+            polls += 1
+            status = "compiling" if polls == 1 else "succeeded"
+            succeeded = 0 if status == "compiling" else 1
+            return {
+                "items": [
+                    {
+                        "runId": "active-run",
+                        "status": status,
+                        "progress": {
+                            "text": {
+                                "expected": 1,
+                                "succeeded": succeeded,
+                                "failed": 0,
+                                "skipped": 0,
+                            }
+                        },
+                    }
+                ]
+            }
+
+        def compile_spaces(self, space_ids):
+            pytest.fail("接管活动 Run 时不应新建全空间编译")
+
+        def retry_pages(self, page_ids):
+            pytest.fail("接管活动 Run 时不应提交页面重试")
+
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: Recovering(config))
+    monkeypatch.setattr(compile.time, "sleep", lambda _seconds: None)
+
+    execute(compile.run, context(ready_connection, {}, task_id=task_id))
+
+    assert polls == 2
+    assert task_store.get_task(ready_connection, task_id)["status"] == task_store.SUCCEEDED
+
+
+def test_compile_resume_resubmits_when_cancelled_before_page_initialization(
+    ready_connection, monkeypatch
+):
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
+    ctx = context(
+        ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 1, "run_id": "early"}
+    )
+    execute(compile.run, ctx)
+    task_store.transition(ready_connection, ctx.task_id, task_store.PAUSED)
+    ready_connection.commit()
+    submitted = False
+    compile_calls = 0
+
+    class CancelledBeforeInit(FakeClient):
+        def run_diagnostics(self, space_ids, *, limit=50):
+            cancelled = {
+                "runId": "remote-run-1",
+                "status": "cancelled",
+                "progress": {
+                    "text": {"expected": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+                },
+            }
+            if not submitted:
+                return {"items": [cancelled]}
+            return {
+                "items": [
+                    cancelled,
+                    {
+                        "runId": "new-run",
+                        "status": "succeeded",
+                        "progress": {
+                            "text": {
+                                "expected": 1,
+                                "succeeded": 1,
+                                "failed": 0,
+                                "skipped": 0,
+                            }
+                        },
+                    },
+                ]
+            }
+
+        def compile_spaces(self, space_ids):
+            nonlocal submitted, compile_calls
+            submitted = True
+            compile_calls += 1
+            return {
+                "acceptedRunCount": 1,
+                "coalescedRunCount": 0,
+                "runs": [{"runId": "new-run", "disposition": "created"}],
+            }
+
+        def retry_pages(self, page_ids):
+            pytest.fail("没有逐页记录的页面不能调用 retry-pages")
+
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: CancelledBeforeInit(config))
+
+    execute(compile.run, context(ready_connection, {}, task_id=ctx.task_id))
+
+    assert compile_calls == 1
+    assert task_store.get_task(ready_connection, ctx.task_id)["params"][
+        "remote_compile_run_ids"
+    ] == ["new-run"]
 
 
 def test_compile_imports_concurrently(ready_connection, monkeypatch):

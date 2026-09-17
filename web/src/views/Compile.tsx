@@ -3,12 +3,14 @@ import { api } from '../api'
 import type { CompileRun, DatasetEntry } from '../types'
 import {
   CleanupButton,
+  ConfigPanel,
   DatasetPicker,
   Failed,
   Field,
   Loading,
   Pager,
   Pass,
+  RecordSearch,
   StatusTag,
   Timing,
   num,
@@ -81,6 +83,7 @@ export function Compile({
               <th>质量闸门</th>
               <th className="num">语料</th>
               <th className="num">已导入</th>
+              <th className="num">编译成功</th>
               <th>耗时</th>
               <th>可用于查询</th>
               <th />
@@ -104,6 +107,9 @@ export function Compile({
                   <td>{run.quality ? <Pass ok={run.quality.passed} /> : <span className="tag">未执行</span>}</td>
                   <td className="num">{docs}</td>
                   <td className="num">{imported}</td>
+                  <td className="num" title={run.compiled_pages_error ?? '由 PostgreSQL 编译产物统计'}>
+                    {num(run.compiled_pages)}
+                  </td>
                   <td>
                     {/* 每篇耗时是估算，不是实测。 */}
                     <Timing
@@ -177,8 +183,7 @@ function NewCompile({
   const effectiveQaLimit = fullQa ? selectedQaMax : qaLimit
 
   return (
-    <div className="panel">
-      <h3 style={{ marginTop: 0 }}>新建编译</h3>
+    <ConfigPanel storageKey="compile" title="新建编译">
       {datasets.length === 0 && (
         <div className="note warn">还没有归一化过的数据集，请先在「归一化」页处理。</div>
       )}
@@ -276,7 +281,7 @@ function NewCompile({
           {start.busy ? '启动中…' : '开始编译'}
         </button>
       </div>
-    </div>
+    </ConfigPanel>
   )
 }
 
@@ -284,35 +289,45 @@ function CompileDetail({ run }: { run: CompileRun }) {
   const [dataset, setDataset] = useState<string>('')
   const [goldOnly, setGoldOnly] = useState(false)
   const [offset, setOffset] = useState(0)
-  const [pageId, setPageId] = useState<string | null>(null)
-  const limit = 10
+  const [openDoc, setOpenDoc] = useState<{ pageId: string; title: string } | null>(null)
+  const [term, setTerm] = useState('')
+  const [q, setQ] = useState('')
+  const limit = 5
 
   const docs = useAsync(
     () =>
       api.compileDocs(run.id, {
         dataset: dataset || undefined,
         gold_only: goldOnly,
+        q,
         limit,
         offset,
       }),
-    [run.id, dataset, goldOnly, offset],
+    [run.id, dataset, goldOnly, q, limit, offset],
   )
+
+  if (openDoc) {
+    return (
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="spread">
+          <h3 style={{ margin: 0 }}>编译变化</h3>
+          <button className="action small" onClick={() => setOpenDoc(null)}>
+            ← 返回文档列表
+          </button>
+        </div>
+        <LineageView pageId={openDoc.pageId} title={openDoc.title} />
+      </div>
+    )
+  }
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
-      <div className="spread">
-        <h3 style={{ margin: 0 }}>
-          {run.run_id} <span className="muted small">#{run.id}</span>
-        </h3>
-        <span className="small mono muted">space {run.space_id ?? '—'}</span>
-      </div>
-
-      {!run.readiness.ready && (
+      {run.readiness.warnings.length > 0 && (
         <div className="note warn">
-          <strong>这次编译还不能用于查询。</strong>
+          <strong>这次编译可用于查询，但结果不完整。</strong>
           <ul>
-            {run.readiness.reasons.map((reason) => (
-              <li key={reason}>{reason}</li>
+            {run.readiness.warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
             ))}
           </ul>
         </div>
@@ -329,31 +344,7 @@ function CompileDetail({ run }: { run: CompileRun }) {
         </p>
       )}
 
-      <table>
-        <thead>
-          <tr>
-            <th>数据集</th>
-            <th className="num">样本</th>
-            <th className="num">语料</th>
-            <th className="num">gold</th>
-            <th className="num">已导入</th>
-          </tr>
-        </thead>
-        <tbody>
-          {Object.values(run.stats).map((entry) => (
-            <tr key={entry.dataset}>
-              <td>{entry.dataset}</td>
-              <td className="num">{num(entry.samples)}</td>
-              <td className="num">{num(entry.docs)}</td>
-              <td className="num">{num(entry.gold)}</td>
-              <td className="num">{num(entry.imported)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <h4>已导入的文档</h4>
-      <div className="row tight" style={{ marginBottom: 8 }}>
+      <div className="record-filters">
         <select
           value={dataset}
           onChange={(e) => {
@@ -379,6 +370,16 @@ function CompileDetail({ run }: { run: CompileRun }) {
           />
           只看 gold
         </label>
+        <RecordSearch
+          placeholder="搜索 doc_id、文档标题或 page_id"
+          value={term}
+          onChange={setTerm}
+          onSearch={(value) => {
+            setQ(value)
+            setOffset(0)
+            setOpenDoc(null)
+          }}
+        />
       </div>
 
       {docs.loading && <Loading what="文档" />}
@@ -397,7 +398,7 @@ function CompileDetail({ run }: { run: CompileRun }) {
               </tr>
             </thead>
             <tbody>
-              {docs.data.docs.map((doc) => (
+              {docs.data.docs.slice(0, limit).map((doc) => (
                 <tr key={`${doc.dataset}/${doc.doc_id}`}>
                   <td className="mono small">{doc.doc_id}</td>
                   <td className="small muted">{doc.dataset}</td>
@@ -410,9 +411,14 @@ function CompileDetail({ run }: { run: CompileRun }) {
                     {doc.page_id && (
                       <button
                         className="action small"
-                        onClick={() => setPageId(pageId === doc.page_id ? null : doc.page_id)}
+                        onClick={() =>
+                          setOpenDoc({
+                            pageId: doc.page_id!,
+                            title: doc.title || doc.doc_id,
+                          })
+                        }
                       >
-                        {pageId === doc.page_id ? '收起' : '编译变化'}
+                        编译变化
                       </button>
                     )}
                     {doc.error && (
@@ -429,13 +435,20 @@ function CompileDetail({ run }: { run: CompileRun }) {
         </>
       )}
 
-      {pageId && <LineageView key={pageId} pageId={pageId} />}
     </div>
   )
 }
 
 /** 原文 vs 编译产物并排。编译产物才是被检索的文本。 */
-export function LineageView({ pageId, question = '' }: { pageId: string; question?: string }) {
+export function LineageView({
+  pageId,
+  question = '',
+  title,
+}: {
+  pageId: string
+  question?: string
+  title?: string
+}) {
   const { data, error, loading } = useAsync(
     () => api.lineage(pageId, question),
     [pageId, question],
@@ -447,9 +460,11 @@ export function LineageView({ pageId, question = '' }: { pageId: string; questio
 
   return (
     <div className="panel flat" style={{ marginTop: 12 }}>
-      <div className="note plain small">
+      <div className={title ? 'small muted' : 'note plain small'}>
+        {title && <><strong>{title}</strong> · </>}
         编译扩写比 {data.diff.expansion_ratio?.toFixed(2) ?? '—'}，
-        实词留存 {data.diff.retention ? `${(data.diff.retention * 100).toFixed(1)}%` : '—'}。
+        实词留存 {data.diff.retention ? `${(data.diff.retention * 100).toFixed(1)}%` : '—'}，
+        编译丢掉的实词 {data.diff.dropped_total} 个。
       </div>
 
       {data.question_terms_lost.length > 0 && (
@@ -497,15 +512,15 @@ export function LineageView({ pageId, question = '' }: { pageId: string; questio
         </div>
       </div>
 
-      <h4>编译丢掉的实词（{data.diff.dropped_total}）</h4>
-      <div>
-        {data.diff.dropped.map((term) => (
-          <span key={term} className="chip dropped">
-            {term}
-          </span>
-        ))}
-        {data.diff.dropped.length === 0 && <span className="small muted">无</span>}
-      </div>
+      {data.diff.dropped.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          {data.diff.dropped.map((term) => (
+            <span key={term} className="chip dropped">
+              {term}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

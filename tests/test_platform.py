@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,9 +12,11 @@ from fastapi.testclient import TestClient
 from akasha_benchmark.datasets import DATASET_NAMES
 from akasha_benchmark.stages import STAGES, StageSpec
 from akasha_benchmark.store import (
+    attribution_store,
     compile_store,
     config_store,
     connect,
+    eval_store,
     query_store,
     run_store,
     task_store,
@@ -31,6 +34,31 @@ def settings(db_path) -> Settings:
 @pytest.fixture
 def client(settings) -> TestClient:
     return TestClient(create_app(settings))
+
+
+class _AkashaStub:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def login(self):
+        pass
+
+
+def _compile_run(connection, **overrides) -> int:
+    params = {
+        "run_id": "r",
+        "datasets": [],
+        "seed": 1,
+        "qa_limit": 1,
+        "negatives_ratio": 1.0,
+    }
+    return compile_store.create_compile_run(connection, **(params | overrides))
 
 
 # ------------------------------------------------------------ 任务生命周期
@@ -128,19 +156,7 @@ def test_compile_task_action_cancels_remote_bullmq_run(settings, db, monkeypatch
     """暂停和清理通过 Akasha 控制面取消精确 Run，不暂停共享 BullMQ 队列。"""
     calls: list[tuple[str, str]] = []
 
-    class FakeAkasha:
-        def __init__(self, config):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def login(self):
-            pass
-
+    class FakeAkasha(_AkashaStub):
         def cancel_compile_run(self, run_id, reason):
             calls.append((run_id, reason))
             return {"disposition": "cancelled", "removedJobCount": 2}
@@ -167,19 +183,7 @@ def test_cleanup_finds_active_remote_run_for_legacy_compile_task(settings, db, m
     """旧任务没保存 runId 时，用绑定空间找活动 Run。"""
     calls: list[str] = []
 
-    class FakeAkasha:
-        def __init__(self, config):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def login(self):
-            pass
-
+    class FakeAkasha(_AkashaStub):
         def run_diagnostics(self, space_ids, *, limit=50):
             return {"items": [{"runId": "active-run", "status": "compiling"}]}
 
@@ -188,9 +192,7 @@ def test_cleanup_finds_active_remote_run_for_legacy_compile_task(settings, db, m
             return {"disposition": "cancelled", "removedJobCount": 1}
 
     monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
-    compile_id = compile_store.create_compile_run(
-        db, run_id="legacy", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
-    )
+    compile_id = _compile_run(db, run_id="legacy")
     compile_store.update_compile_run(db, compile_id, space_id="space-1")
     task_id = task_store.create_task(db, stage="compile", params={})
     task_store.set_task_target(db, task_id, "compile", compile_id)
@@ -411,7 +413,7 @@ def test_provider_probe_returns_the_reply(client, monkeypatch):
     # 发的是一句 hi。user 消息里必须带 json —— JudgeClient 固定要求 json_object
     # 输出，而有些 provider 规定消息里出现 "json" 才允许这个格式。
     assert len(sent) == 1
-    system, user = sent[0]
+    _, user = sent[0]
     assert user.startswith("hi")
     assert "json" in user.lower()
 
@@ -530,19 +532,7 @@ def test_akasha_config_apply_pushes_all_features(client, monkeypatch):
 
     pushed = []
 
-    class Fake:
-        def __init__(self, cfg):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return None
-
-        def login(self):
-            pass
-
+    class Fake(_AkashaStub):
         def put_model_config(self, feature, payload):
             pushed.append((feature, payload))
             return {}
@@ -592,9 +582,7 @@ def test_connection_test_flags_compiles_in_another_workspace(client, db_path, mo
     """预检：不必等起了任务才发现这些编译在当前连接下用不了。"""
     connection = connect(db_path)
     try:
-        compile_id = compile_store.create_compile_run(
-            connection, run_id="r1", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
-        )
+        compile_id = _compile_run(connection, run_id="r1")
         compile_store.update_compile_run(
             connection, compile_id, space_id="s1", workspace_id="w-original"
         )
@@ -605,19 +593,7 @@ def test_connection_test_flags_compiles_in_another_workspace(client, db_path, mo
 
     from akasha_platform.api import config as config_api
 
-    class Fake:
-        def __init__(self, cfg):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return None
-
-        def login(self):
-            pass
-
+    class Fake(_AkashaStub):
         def current_user(self):
             return {
                 "user": {"id": "u", "email": "e@x", "role": "owner"},
@@ -656,6 +632,50 @@ def test_raw_samples_serves_qa_and_corpus_separately(client, dataset_dir, monkey
     assert client.get("/api/datasets/hotpotqa/raw?kind=bogus").status_code == 422
 
 
+def test_raw_samples_searches_qa_and_corpus(client, dataset_dir, monkeypatch):
+    """原始结构因数据集而异，搜索应覆盖嵌套字段而不依赖适配器。"""
+    from akasha_platform.api import datasets as datasets_api
+
+    monkeypatch.setattr(datasets_api, "DEFAULT_DATASET_DIR", dataset_dir)
+
+    qa = client.get(
+        "/api/datasets/hotpotqa/raw",
+        params={"kind": "qa", "q": "venice", "limit": 1},
+    ).json()
+    assert qa["total"] == 1
+    assert qa["rows"][0]["_id"] == "q2"
+
+    corpus = client.get(
+        "/api/datasets/hotpotqa/raw",
+        params={"kind": "corpus", "q": "film festival", "limit": 1},
+    ).json()
+    assert corpus["total"] == 1
+    assert corpus["rows"][0]["title"] == "Venice"
+
+    empty = client.get(
+        "/api/datasets/hotpotqa/raw", params={"kind": "corpus", "q": "not-found"}
+    ).json()
+    assert empty["total"] == 0
+    assert empty["rows"] == []
+
+
+def test_normalized_corpus_returns_full_text(client, normalized):
+    long_text = "x" * 800
+    normalized.execute(
+        "UPDATE corpus_doc SET text = ? WHERE dataset = 'hotpotqa' AND doc_id = '0'",
+        (long_text,),
+    )
+    normalized.commit()
+
+    body = client.get(
+        "/api/datasets/hotpotqa/corpus", params={"q": "Rita Moreno", "limit": 1}
+    ).json()
+
+    assert body["total"] == 1
+    assert body["docs"][0]["text"] == long_text
+    assert "truncated" not in body["docs"][0]
+
+
 def test_provider_rename_updates_the_same_row(client):
     """带 id 的改名改的是那一条 —— 不带 id 会按 label 认行，于是变成新增。"""
     created = client.put(
@@ -682,7 +702,11 @@ def test_provider_rename_onto_a_taken_label_is_rejected(client):
             "/api/providers/judge",
             json={"label": label, "base_url": "https://x/v1", "model": "m"},
         )
-    first = client.get("/api/providers?role=judge").json()[0]
+    first = next(
+        provider
+        for provider in client.get("/api/providers?role=judge").json()
+        if provider["label"] == "a"
+    )
 
     conflict = client.put(
         "/api/providers/judge",
@@ -716,19 +740,7 @@ def test_model_config_put_fills_the_only_legal_provider(client, monkeypatch):
 
     from akasha_platform.api import config as config_api
 
-    class Fake:
-        def __init__(self, cfg):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return None
-
-        def login(self):
-            pass
-
+    class Fake(_AkashaStub):
         def put_model_config(self, feature, payload):
             sent.update({"feature": feature, "payload": payload})
             return {"ok": True}
@@ -751,14 +763,254 @@ def test_missing_records_return_404(client):
         assert client.get(path).status_code == 404, path
 
 
+def test_compile_query_and_eval_records_are_searchable(client, normalized):
+    compile_id = _compile_run(
+        normalized, run_id="searchable", datasets=["hotpotqa"], qa_limit=2
+    )
+    compile_store.replace_compile_subset(
+        normalized,
+        compile_id,
+        "hotpotqa",
+        [],
+        [
+            {"doc_id": "0", "is_gold": True},
+            {"doc_id": "2", "is_gold": False},
+        ],
+    )
+    compile_store.record_page(
+        normalized, compile_id, "hotpotqa", "0", page_id="page-rita", error=None
+    )
+    compile_store.record_page(
+        normalized, compile_id, "hotpotqa", "2", page_id="page-venice", error=None
+    )
+    compile_store.update_compile_run(normalized, compile_id, config_group="group-a")
+    query_id = query_store.create_query_run(
+        normalized,
+        name="search-query",
+        compile_id=compile_id,
+        score_threshold=None,
+        concurrency=1,
+        model_configs={},
+    )
+    cases = (
+        ("sample-rita", "Who won the award?", "Rita Moreno", "knowledge"),
+        ("sample-venice", "Which city hosts the festival?", "Venice", "general"),
+    )
+    eval_id = eval_store.create_eval_run(
+        normalized,
+        name="search-eval",
+        query_id=query_id,
+        ks=[2],
+        metrics=["em"],
+        judge_provider_id=None,
+    )
+    for sample_id, question, answer, answer_mode in cases:
+        query_store.record_response(
+            normalized,
+            query_id,
+            sample_id=sample_id,
+            dataset="hotpotqa",
+            question=question,
+            http_status=200,
+            latency_ms=1,
+            error=None,
+            response={"answerMode": answer_mode, "answer": answer},
+        )
+        eval_store.record_sample_eval(
+            normalized,
+            eval_id,
+            sample_id=sample_id,
+            dataset="hotpotqa",
+            answer_mode=answer_mode,
+            http_status=200,
+            answer=answer,
+            detail={"question": question},
+            metrics={"em": 1.0},
+        )
+    attribution_id = attribution_store.create_attribution_run(
+        normalized,
+        name="search-attribution",
+        eval_id=eval_id,
+        metric="em",
+        sample_limit=2,
+        provider_id=None,
+    )
+    attribution_store.record_attribution(
+        normalized,
+        attribution_id,
+        sample_id="sample-venice",
+        dataset="hotpotqa",
+        root_cause="not_a_failure",
+        evidence={},
+        narrative=None,
+        rule_based=True,
+    )
+    normalized.commit()
+
+    docs = client.get(
+        f"/api/compiles/{compile_id}/docs", params={"q": "venice", "limit": 1}
+    ).json()
+    assert docs["total"] == 1
+    assert docs["docs"][0]["doc_id"] == "2"
+
+    responses = client.get(
+        f"/api/queries/{query_id}/responses",
+        params={"q": "city hosts", "limit": 1},
+    ).json()
+    assert responses["total"] == 1
+    assert responses["responses"][0]["sample_id"] == "sample-venice"
+
+    samples = client.get(
+        f"/api/evals/{eval_id}/samples",
+        params={"answer_mode": "general", "limit": 1},
+    ).json()
+    assert samples["total"] == 1
+    assert samples["samples"][0]["sample_id"] == "sample-venice"
+    assert samples["count_by_answer_mode"] == {"general": 1, "knowledge": 1}
+
+    tree = client.get("/api/compiles").json()["compiles"]
+    compile_run = next(run for run in tree if run["id"] == compile_id)
+    query_run = next(run for run in compile_run["queries"] if run["id"] == query_id)
+    eval_run = next(run for run in query_run["evals"] if run["id"] == eval_id)
+    attribution_run = next(
+        run for run in eval_run["attributions"] if run["id"] == attribution_id
+    )
+    assert (query_run["config_group"], query_run["sample_count"], query_run["success_count"]) == (
+        "group-a",
+        2,
+        2,
+    )
+    assert (eval_run["config_group"], eval_run["sample_count"], eval_run["success_count"]) == (
+        "group-a",
+        2,
+        2,
+    )
+    assert (
+        attribution_run["config_group"],
+        attribution_run["sample_count"],
+        attribution_run["success_count"],
+    ) == ("group-a", 2, 1)
+
+
+def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, monkeypatch):
+    from akasha_platform.api import runs as runs_api
+
+    for index in range(4):
+        compile_id = _compile_run(normalized, run_id=f"tree-{index}")
+        query_id = query_store.create_query_run(
+            normalized,
+            name=f"tree-query-{index}",
+            compile_id=compile_id,
+            score_threshold=None,
+            concurrency=1,
+            model_configs={},
+        )
+        eval_id = eval_store.create_eval_run(
+            normalized,
+            name=f"tree-eval-{index}",
+            query_id=query_id,
+            ks=[2],
+            metrics=["em"],
+            judge_provider_id=None,
+        )
+        attribution_store.create_attribution_run(
+            normalized,
+            name=f"tree-attribution-{index}",
+            eval_id=eval_id,
+            metric="em",
+            sample_limit=1,
+            provider_id=None,
+        )
+    normalized.commit()
+
+    selects: list[str] = []
+
+    @contextmanager
+    def traced_db(_request):
+        connection = connect(client.app.state.settings.db_path, read_only=True)
+        connection.set_trace_callback(
+            lambda sql: selects.append(sql)
+            if sql.lstrip().upper().startswith("SELECT")
+            else None
+        )
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(runs_api, "db", traced_db)
+
+    response = client.get("/api/compiles")
+
+    assert response.status_code == 200
+    assert len(response.json()["compiles"]) == 4
+    assert len(selects) <= 15
+
+
+def test_compile_success_count_comes_from_saved_progress(client, normalized):
+    compile_id = _compile_run(normalized, run_id="pg-count", datasets=["hotpotqa"])
+    docs = [{"doc_id": str(index), "is_gold": index == 0} for index in range(3)]
+    compile_store.replace_compile_subset(normalized, compile_id, "hotpotqa", [], docs)
+    page_ids = [f"00000000-0000-0000-0000-00000000000{index}" for index in range(3)]
+    for index, page_id in enumerate(page_ids):
+        compile_store.record_page(
+            normalized, compile_id, "hotpotqa", str(index), page_id=page_id, error=None
+        )
+    normalized.commit()
+
+    from akasha_benchmark.store import dumps
+
+    compile_store.update_compile_run(
+        normalized,
+        compile_id,
+        quality_json=dumps({"passed": False, "progress": {"succeeded": 2, "failed": 1}}),
+    )
+    normalized.commit()
+
+    run = next(
+        entry for entry in client.get("/api/compiles").json()["compiles"]
+        if entry["id"] == compile_id
+    )
+    assert run["compiled_pages"] == 2
+    assert run["compiled_pages_error"] is None
+
+
+def test_compile_success_count_falls_back_for_legacy_success(client, normalized):
+    compile_id = _compile_run(normalized, run_id="pg-down")
+    compile_store.replace_compile_subset(
+        normalized, compile_id, "hotpotqa", [], [{"doc_id": "0", "is_gold": True}]
+    )
+    compile_store.record_page(
+        normalized,
+        compile_id,
+        "hotpotqa",
+        "0",
+        page_id="00000000-0000-0000-0000-000000000000",
+        error=None,
+    )
+    normalized.commit()
+
+    from akasha_benchmark.store import dumps
+
+    compile_store.update_compile_run(
+        normalized,
+        compile_id,
+        quality_json=dumps({"passed": True}),
+        status=run_store.STATUS_SUCCEEDED,
+    )
+    normalized.commit()
+
+    response = client.get("/api/compiles")
+    assert response.status_code == 200
+    run = next(entry for entry in response.json()["compiles"] if entry["id"] == compile_id)
+    assert run["compiled_pages"] == 1
+    assert run["compiled_pages_error"] is None
+
+
 def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, monkeypatch):
     calls: list[str] = []
 
-    class FakeAkasha:
-        def __init__(self, config): pass
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def login(self): pass
+    class FakeAkasha(_AkashaStub):
         def run_diagnostics(self, space_ids, *, limit=50):
             return {"items": [{"runId": "run-1", "status": "compiling"}]}
         def cancel_compile_run(self, run_id, reason):
@@ -768,9 +1020,7 @@ def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, mon
     monkeypatch.setattr("akasha_platform.api.runs.AkashaClient", FakeAkasha)
     connection = connect(db_path)
     try:
-        compile_id = compile_store.create_compile_run(
-            connection, run_id="r", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
-        )
+        compile_id = _compile_run(connection)
         compile_store.update_compile_run(connection, compile_id, space_id="space-1")
         connection.commit()
     finally:
@@ -788,9 +1038,7 @@ def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, mon
 def test_cleanup_refused_while_a_task_writes_the_record(client, db_path):
     connection = connect(db_path)
     try:
-        compile_id = compile_store.create_compile_run(
-            connection, run_id="r", datasets=[], seed=1, qa_limit=1, negatives_ratio=1.0
-        )
+        compile_id = _compile_run(connection)
         task_id = task_store.create_task(connection, stage="compile", params={})
         task_store.transition(connection, task_id, task_store.RUNNING)
         task_store.set_task_target(connection, task_id, "compile", compile_id)

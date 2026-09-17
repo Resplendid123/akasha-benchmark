@@ -74,6 +74,7 @@ export function Tasks() {
               <th>进度</th>
               <th>参数</th>
               <th>开始</th>
+              <th>结束</th>
               <th />
             </tr>
           </thead>
@@ -154,6 +155,7 @@ function Row({
           .join(' ') || '—'}
       </td>
       <td className="small muted mono">{formatDateTime(task.started_at)}</td>
+      <td className="small muted mono">{formatDateTime(task.finished_at)}</td>
       <td className="table-actions-cell">
         <div className="table-actions">
           <button className="action small" onClick={onToggle}>

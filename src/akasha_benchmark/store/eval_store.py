@@ -222,6 +222,95 @@ def sample_evals(
     ]
 
 
+def sample_eval_page(
+    connection: sqlite3.Connection,
+    eval_id: int,
+    *,
+    dataset: str | None = None,
+    answer_mode: str | None = None,
+    search: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[int, dict[str, int], list[dict[str, Any]]]:
+    """评测样本列表；过滤、计数与分页都留在 SQLite。"""
+    where = ["eval_id = ?"]
+    params: list[Any] = [eval_id]
+    if dataset:
+        where.append("dataset = ?")
+        params.append(dataset)
+    if search:
+        where.append(
+            "(LOWER(sample_id) LIKE ? OR "
+            "LOWER(COALESCE(json_extract(detail_json, '$.question'), '')) LIKE ? "
+            "OR LOWER(COALESCE(answer, '')) LIKE ?)"
+        )
+        pattern = f"%{search.lower()}%"
+        params.extend((pattern, pattern, pattern))
+    scope = " AND ".join(where)
+    counts = {
+        (row["answer_mode"] or "missing"): int(row["n"])
+        for row in connection.execute(
+            f"SELECT answer_mode, COUNT(*) AS n FROM sample_eval "
+            f"WHERE {scope} GROUP BY answer_mode",
+            params,
+        )
+    }
+    if answer_mode:
+        where.append("COALESCE(answer_mode, 'missing') = ?")
+        params.append(answer_mode)
+    scope = " AND ".join(where)
+    total = int(
+        connection.execute(f"SELECT COUNT(*) FROM sample_eval WHERE {scope}", params).fetchone()[0]
+    )
+    rows = [
+        {
+            **{k: v for k, v in dict(row).items() if k != "detail_json"},
+            "detail": loads(row["detail_json"], {}),
+        }
+        for row in connection.execute(
+            f"SELECT * FROM sample_eval WHERE {scope} ORDER BY sample_id LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+    ]
+    return total, counts, rows
+
+
+def sample_metrics_for(
+    connection: sqlite3.Connection, eval_id: int, sample_ids: list[str]
+) -> dict[str, dict[str, float]]:
+    if not sample_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in sample_ids)
+    result: dict[str, dict[str, float]] = {}
+    for row in connection.execute(
+        f"SELECT sample_id, metric, value FROM sample_metric "
+        f"WHERE eval_id = ? AND sample_id IN ({placeholders})",
+        (eval_id, *sample_ids),
+    ):
+        result.setdefault(row["sample_id"], {})[row["metric"]] = row["value"]
+    return result
+
+
+def judge_verdicts_for(
+    connection: sqlite3.Connection, eval_id: int, sample_ids: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    if not sample_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in sample_ids)
+    result: dict[str, list[dict[str, Any]]] = {}
+    for row in connection.execute(
+        f"SELECT * FROM judge_verdict WHERE eval_id = ? "
+        f"AND sample_id IN ({placeholders}) ORDER BY sample_id, metric",
+        (eval_id, *sample_ids),
+    ):
+        verdict = {
+            **{k: v for k, v in dict(row).items() if k != "detail_json"},
+            "detail": None,
+        }
+        result.setdefault(row["sample_id"], []).append(verdict)
+    return result
+
+
 def sample_eval(
     connection: sqlite3.Connection, eval_id: int, sample_id: str
 ) -> dict[str, Any] | None:
@@ -317,6 +406,20 @@ def judged_sample_ids(
         sql += " AND metric = ?"
         params.append(metric)
     return {row["sample_id"] for row in connection.execute(sql, params)}
+
+
+def completed_judge_sample_ids(
+    connection: sqlite3.Connection, eval_id: int, metric: str
+) -> set[str]:
+    """无需重试的 Judge：已评分或正常无定义；失败项可在续跑时重试。"""
+    return {
+        row["sample_id"]
+        for row in connection.execute(
+            "SELECT sample_id FROM judge_verdict "
+            "WHERE eval_id = ? AND metric = ? AND failure_kind IS NULL",
+            (eval_id, metric),
+        )
+    }
 
 
 def judge_verdicts(

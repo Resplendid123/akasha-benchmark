@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../api'
 import type { DatasetEntry } from '../types'
-import { DatasetPicker, Failed, Loading, Pager, num, useAction, useAsync } from '../ui'
+import { DatasetPicker, Failed, Loading, Pager, RecordSearch, num, useAction, useAsync } from '../ui'
 
 /** 数据集层：原始文件的下载与校验，以及原始样例。 */
 export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
@@ -140,10 +140,12 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
 /** 原始样例，一页一条，不走适配器。 */
 function RawPreview({ dataset, kind }: { dataset: string; kind: 'qa' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
+  const [term, setTerm] = useState('')
+  const [q, setQ] = useState('')
   const limit = 1
   const { data, error, loading } = useAsync(
-    () => api.rawSamples(dataset, { kind, limit, offset }),
-    [dataset, kind, offset],
+    () => api.rawSamples(dataset, { kind, q, limit, offset }),
+    [dataset, kind, q, offset],
   )
 
   if (loading) return <Loading what="原始样例" />
@@ -159,6 +161,17 @@ function RawPreview({ dataset, kind }: { dataset: string; kind: 'qa' | 'corpus' 
           {dataset} 原始{kind === 'qa' ? '样本' : '语料'}
         </h3>
         <span className="small muted mono">{data.source_file}</span>
+      </div>
+      <div className="record-filters" style={{ marginTop: 10 }}>
+        <RecordSearch
+          placeholder={`搜索原始${kind === 'qa' ? '样本' : '语料'}的任意字段`}
+          value={term}
+          onChange={setTerm}
+          onSearch={(value) => {
+            setQ(value)
+            setOffset(0)
+          }}
+        />
       </div>
       <pre className="block tall">{row ? JSON.stringify(row, null, 2) : '（没有内容）'}</pre>
       <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />

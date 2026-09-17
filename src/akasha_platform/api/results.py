@@ -27,6 +27,8 @@ def eval_samples(
     request: Request,
     eval_id: int,
     dataset: str | None = None,
+    answer_mode: str | None = None,
+    q: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -36,12 +38,18 @@ def eval_samples(
     with db(request) as connection:
         if eval_store.get_eval_run(connection, eval_id) is None:
             raise HTTPException(404, f"评测 #{eval_id} 不存在")
-        rows = eval_store.sample_evals(connection, eval_id, dataset=dataset)
-        verdicts = eval_store.judge_verdicts(connection, eval_id, include_detail=False)
-        by_sample: dict[str, list[dict[str, Any]]] = {}
-        for verdict in verdicts:
-            summary = {**verdict, "detail": None}
-            by_sample.setdefault(verdict["sample_id"], []).append(summary)
+        total, counts, rows = eval_store.sample_eval_page(
+            connection,
+            eval_id,
+            dataset=dataset,
+            answer_mode=answer_mode,
+            search=(q or "").strip() or None,
+            limit=limit,
+            offset=offset,
+        )
+        sample_ids = [row["sample_id"] for row in rows]
+        metrics = eval_store.sample_metrics_for(connection, eval_id, sample_ids)
+        verdicts = eval_store.judge_verdicts_for(connection, eval_id, sample_ids)
         samples = [
             {
                 "sample_id": row["sample_id"],
@@ -50,12 +58,19 @@ def eval_samples(
                 "answer_mode": row["answer_mode"],
                 "http_status": row["http_status"],
                 "answer": row["answer"],
-                "metrics": eval_store.sample_metrics_of(connection, eval_id, row["sample_id"]),
-                "judge_verdicts": by_sample.get(row["sample_id"], []),
+                "metrics": metrics.get(row["sample_id"], {}),
+                "judge_verdicts": verdicts.get(row["sample_id"], []),
             }
-            for row in rows[offset : offset + limit]
+            for row in rows
         ]
-    return {"eval_id": eval_id, "total": len(rows), "offset": offset, "limit": limit, "samples": samples}
+    return {
+        "eval_id": eval_id,
+        "total": total,
+        "count_by_answer_mode": counts,
+        "offset": offset,
+        "limit": limit,
+        "samples": samples,
+    }
 
 
 @router.get("/evals/{eval_id}")

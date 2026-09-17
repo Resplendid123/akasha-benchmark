@@ -234,6 +234,71 @@ export function ModeTag({ mode }: { mode: string | null }) {
   return <span className={`tag ${label === 'knowledge' ? 'ok' : 'warn'}`}>{label}</span>
 }
 
+export function RecordSearch({
+  value,
+  placeholder,
+  onChange,
+  onSearch,
+}: {
+  value: string
+  placeholder: string
+  onChange: (value: string) => void
+  onSearch: (value: string) => void
+}) {
+  const submit = () => onSearch(value.trim())
+  return (
+    <div className="record-search">
+      <input
+        aria-label="搜索记录"
+        placeholder={placeholder}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => event.key === 'Enter' && submit()}
+      />
+      <button className="action small" onClick={submit}>
+        搜索
+      </button>
+    </div>
+  )
+}
+
+export function AnswerModeFilter({
+  counts,
+  value,
+  onChange,
+}: {
+  counts: Record<string, number>
+  value: string
+  onChange: (value: string) => void
+}) {
+  const modes = [
+    'knowledge',
+    'general',
+    ...Object.keys(counts).filter((mode) => mode !== 'knowledge' && mode !== 'general').sort(),
+  ]
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0)
+  return (
+    <div className="answer-mode-filter">
+      <span className="small muted">答案模式</span>
+      <button
+        className={`action small${value === '' ? ' primary' : ''}`}
+        onClick={() => onChange('')}
+      >
+        全部 · {total}
+      </button>
+      {modes.map((mode) => (
+        <button
+          key={mode}
+          className={`action small${value === mode ? ' primary' : ''}`}
+          onClick={() => onChange(value === mode ? '' : mode)}
+        >
+          {mode} · {counts[mode] ?? 0}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export function Pass({ ok, yes = '通过', no = '未通过' }: { ok: boolean; yes?: string; no?: string }) {
   return <span className={`tag ${ok ? 'ok' : 'bad'}`}>{ok ? yes : no}</span>
 }
@@ -275,9 +340,23 @@ export function Pager({
   limit: number
   onChange: (offset: number) => void
 }) {
+  const pageCount = Math.max(1, Math.ceil(total / limit))
+  const currentPage = Math.min(pageCount, Math.floor(offset / limit) + 1)
+  const [targetPage, setTargetPage] = useState(String(currentPage))
+
+  useEffect(() => {
+    setTargetPage(String(currentPage))
+  }, [currentPage])
+
   if (total <= limit) return null
+  const jump = () => {
+    const parsed = Number.parseInt(targetPage, 10)
+    const page = Number.isFinite(parsed) ? Math.max(1, Math.min(pageCount, parsed)) : currentPage
+    setTargetPage(String(page))
+    onChange((page - 1) * limit)
+  }
   return (
-    <div className="row tight small muted" style={{ marginTop: 10 }}>
+    <div className="pager small muted">
       <button
         className="action small"
         disabled={offset === 0}
@@ -286,7 +365,7 @@ export function Pager({
         ← 上一页
       </button>
       <span>
-        {Math.floor(offset / limit) + 1} / {Math.ceil(total / limit)}（共 {total} 条）
+        {currentPage} / {pageCount}（共 {total} 条）
       </span>
       <button
         className="action small"
@@ -295,6 +374,20 @@ export function Pager({
       >
         下一页 →
       </button>
+      <span className="pager-jump">
+        跳到
+        <input
+          aria-label="跳转页码"
+          type="number"
+          min={1}
+          max={pageCount}
+          value={targetPage}
+          onChange={(event) => setTargetPage(event.target.value)}
+          onKeyDown={(event) => event.key === 'Enter' && jump()}
+        />
+        页
+        <button className="action small" onClick={jump}>跳转</button>
+      </span>
     </div>
   )
 }
@@ -319,6 +412,49 @@ export function Collapsible({
         {shown ? '▾' : '▸'} {title}
       </button>
       {shown && children}
+    </div>
+  )
+}
+
+export function ConfigPanel({
+  storageKey,
+  title,
+  children,
+}: {
+  storageKey: string
+  title: string
+  children: React.ReactNode
+}) {
+  const key = `akasha-benchmark:config-panel:${storageKey}`
+  const [open, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem(key) !== 'closed'
+    } catch {
+      return true
+    }
+  })
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    try {
+      localStorage.setItem(key, next ? 'open' : 'closed')
+    } catch {
+      // 浏览器禁用本地存储时仍允许当前页面正常收起。
+    }
+  }
+  return (
+    <div className="panel config-panel">
+      <div className="panel-head">
+        <h3>{title}</h3>
+        <button
+          className="action small"
+          aria-expanded={open}
+          onClick={toggle}
+        >
+          {open ? '↑ 收起配置' : '↓ 展开配置'}
+        </button>
+      </div>
+      {open && <div className="config-panel-body">{children}</div>}
     </div>
   )
 }

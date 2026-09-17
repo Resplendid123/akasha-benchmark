@@ -118,6 +118,8 @@ CREATE TABLE IF NOT EXISTS query_run (
     finished_at        TEXT
 );
 
+CREATE INDEX IF NOT EXISTS query_run_compile_idx ON query_run(compile_id, id);
+
 CREATE TABLE IF NOT EXISTS query_sample (
     query_id  INTEGER NOT NULL REFERENCES query_run(id) ON DELETE CASCADE,
     sample_id TEXT NOT NULL REFERENCES sample(sample_id) ON DELETE CASCADE,
@@ -149,6 +151,11 @@ CREATE TABLE IF NOT EXISTS eval_run (
     created_at        TEXT NOT NULL,
     finished_at       TEXT
 );
+
+CREATE INDEX IF NOT EXISTS query_response_mode_idx
+ON query_response(query_id, json_extract(response_json, '$.answerMode'));
+
+CREATE INDEX IF NOT EXISTS eval_run_query_idx ON eval_run(query_id, id);
 
 CREATE TABLE IF NOT EXISTS sample_eval (
     eval_id     INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
@@ -217,6 +224,8 @@ CREATE TABLE IF NOT EXISTS attribution_run (
     created_at  TEXT NOT NULL,
     finished_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS attribution_run_eval_idx ON attribution_run(eval_id, id);
 
 CREATE TABLE IF NOT EXISTS attribution_result (
     attribution_id INTEGER NOT NULL REFERENCES attribution_run(id) ON DELETE CASCADE,

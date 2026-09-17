@@ -83,6 +83,9 @@ def evaluate_dataset(
     ks: tuple[int, ...],
     selected: frozenset[str],
     ctx: TaskContext | None = None,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
+    report_progress: bool = False,
 ) -> dict[str, Any]:
     """算一个数据集的指标并写库，返回汇总。"""
     adapter = get_adapter(dataset)
@@ -168,10 +171,14 @@ def evaluate_dataset(
             detail=detail,
             metrics=metrics,
         )
+        if ctx and report_progress:
+            ctx.progress(
+                progress_offset + position,
+                progress_total if progress_total is not None else len(responses),
+                "评测样本",
+            )
         if position % 50 == 0 or position == len(responses):
             connection.commit()
-            if ctx:
-                ctx.progress(position, len(responses), dataset)
     connection.commit()
 
     knowledge = [e for e in per_sample if e["answer_mode"] == "knowledge"]
@@ -216,8 +223,13 @@ def _judge_task(
         prompt = faithfulness.build_prompt(question, answer, body)
         return (prompt, faithfulness.parse_verdict) if prompt else None
     if metric == "answer_relevancy":
-        prompt = answer_relevancy.build_prompt(question, answer, body)
-        return (prompt, answer_relevancy.parse_verdict) if prompt else None
+        built = answer_relevancy.build_prompt(question, answer, body)
+        if not built:
+            return None
+        system, user, sentences = built
+        return (system, user), lambda payload: answer_relevancy.parse_verdict(
+            payload, sentences
+        )
     if metric == "context_relevancy":
         built = context_relevancy.build_prompt(question, answer, body)
         if not built:
@@ -266,11 +278,7 @@ def _record_reply(
                 "raw_http_response": (reply.raw or "")[:2000],
             },
         )
-        ctx.log(
-            f"{metric} parse_error sample={row['sample_id']}: "
-            f"{exc}\n--- reply.raw ---\n{(reply.raw or '')[:3500]}",
-            level="warning",
-        )
+        ctx.log(f"{metric} parse_error sample={row['sample_id']}: {exc}", level="warning")
         return
     eval_store.record_judge_verdict(
         ctx.db,
@@ -285,11 +293,7 @@ def _record_reply(
             "raw_http_response": (reply.raw or "")[:2000],
         },
     )
-    ctx.log(
-        f"{metric} sample={row['sample_id']} score={score} "
-        f"--- reply.raw ---\n{(reply.raw or '')[:3500]}",
-        level="info",
-    )
+    ctx.log(f"{metric} sample={row['sample_id']} score={score}", level="info")
     if score is not None:
         eval_store.record_sample_eval(
             ctx.db,
@@ -311,33 +315,26 @@ def _judge(
     provider: JudgeProvider,
     metrics: list[str],
 ) -> None:
-    """逐条 judge 指标跑。失败该条排除，不记 0。"""
+    """按样本顺序执行 Judge；同一样本的全部指标优先并发完成。"""
     for metric in metrics:
-        _judge_one(ctx, eval_id, query_id, provider, metric)
-
-
-def _judge_one(
-    ctx: TaskContext, eval_id: int, query_id: int, provider: JudgeProvider, metric: str
-) -> None:
-    # 逐指标问，否则判过 faithfulness 的样本会让 answer_relevancy 整批跳过。
-    eval_store.restore_judge_metrics(ctx.db, eval_id, metric)
+        eval_store.restore_judge_metrics(ctx.db, eval_id, metric)
     ctx.db.commit()
-    already = eval_store.judged_sample_ids(ctx.db, eval_id, metric)
-    rows = [r for r in eval_store.sample_evals(ctx.db, eval_id) if r["sample_id"] not in already]
-    if already:
-        ctx.log(f"{metric} 续跑：已判 {len(already)} 条，待判 {len(rows)} 条")
-
+    already_by_metric = {
+        metric: eval_store.completed_judge_sample_ids(ctx.db, eval_id, metric)
+        for metric in metrics
+    }
+    rows = eval_store.sample_evals(ctx.db, eval_id)
     concurrency = max(1, provider.concurrency)
-    done = 0
-    # 分批：主线程拼 prompt、并发调用、按序落库，暂停只等当前批收尾。
-    for start in range(0, len(rows), concurrency):
+
+    for position, row in enumerate(rows, 1):
         ctx.checkpoint()
-        batch = rows[start : start + concurrency]
-        pending: list[tuple[dict[str, Any], Any, tuple[str, str]]] = []
-        for row in batch:
-            response = query_store.response_of(ctx.db, query_id, row["sample_id"])
-            body = (response or {}).get("response") or {}
-            references = (row["detail"] or {}).get("reference_answers") or []
+        response = query_store.response_of(ctx.db, query_id, row["sample_id"])
+        body = (response or {}).get("response") or {}
+        references = (row["detail"] or {}).get("reference_answers") or []
+        pending: list[tuple[str, Any, tuple[str, str]]] = []
+        for metric in metrics:
+            if row["sample_id"] in already_by_metric[metric]:
+                continue
             task = _judge_task(
                 metric,
                 (response or {}).get("question") or "",
@@ -358,31 +355,36 @@ def _judge_one(
                 )
             else:
                 prompt, parse = task
-                pending.append((row, parse, prompt))
+                pending.append((metric, parse, prompt))
 
-        replies = complete_many(provider, [p for _, _, p in pending], concurrency)
-        for (row, parse, _), reply in zip(pending, replies):
+        replies = (
+            complete_many(provider, [prompt for _, _, prompt in pending], concurrency)
+            if pending
+            else []
+        )
+        for (metric, parse, _), reply in zip(pending, replies):
             _record_reply(ctx, eval_id, metric, row, parse, reply)
 
         ctx.db.commit()
-        done += len(batch)
-        if start % (concurrency * 5) == 0 or done == len(rows):
-            ctx.progress(done, len(rows), metric)
+        ctx.progress(position, len(rows), "Judge")
 
-    summary = eval_store.judge_summary(ctx.db, eval_id, metric)
-    for dataset, mean, count in eval_store.judge_means_by_dataset(ctx.db, eval_id, metric):
-        eval_store.record_metric_summary(ctx.db, eval_id, dataset, "judge", {metric: mean}, count)
-    ctx.db.commit()
-    ctx.log(
-        f"{metric} 均值 {summary['mean']}，已评分 {summary['scored']}，"
-        f"失败率 {summary['failure_rate']:.3f}"
-    )
-    if summary["failure_rate"] > MAX_JUDGE_FAILURE_RATE:
-        raise RuntimeError(
-            f"{metric} 的 Judge 失败率 {summary['failure_rate']:.3f} 超过 "
-            f"{MAX_JUDGE_FAILURE_RATE}。均值只覆盖成功的那部分，已不代表整体。"
-            f"失败类型：{summary['failures_by_kind']}"
+    for metric in metrics:
+        summary = eval_store.judge_summary(ctx.db, eval_id, metric)
+        for dataset, mean, count in eval_store.judge_means_by_dataset(ctx.db, eval_id, metric):
+            eval_store.record_metric_summary(
+                ctx.db, eval_id, dataset, "judge", {metric: mean}, count
+            )
+        ctx.db.commit()
+        ctx.log(
+            f"{metric} 均值 {summary['mean']}，已评分 {summary['scored']}，"
+            f"失败率 {summary['failure_rate']:.3f}"
         )
+        if summary["failure_rate"] > MAX_JUDGE_FAILURE_RATE:
+            raise RuntimeError(
+                f"{metric} 的 Judge 失败率 {summary['failure_rate']:.3f} 超过 "
+                f"{MAX_JUDGE_FAILURE_RATE}。均值只覆盖成功的那部分，已不代表整体。"
+                f"失败类型：{summary['failures_by_kind']}"
+            )
 
 
 def run(ctx: TaskContext) -> None:
@@ -434,9 +436,15 @@ def run(ctx: TaskContext) -> None:
         )
         ctx.bind("eval", eval_id)
 
-    for index, dataset in enumerate(datasets):
+    response_counts = {
+        dataset: len(query_store.responses_of(ctx.db, query_id, dataset))
+        for dataset in datasets
+    }
+    sample_total = sum(response_counts.values())
+    ctx.progress(0, sample_total, "评测样本")
+    progress_offset = 0
+    for dataset in datasets:
         ctx.checkpoint()
-        ctx.progress(index, len(datasets), f"{dataset} 计算指标")
         summary = evaluate_dataset(
             ctx.db,
             eval_id,
@@ -446,7 +454,11 @@ def run(ctx: TaskContext) -> None:
             ks,
             frozenset(metrics),
             ctx,
+            progress_offset,
+            sample_total,
+            provider is None,
         )
+        progress_offset += response_counts[dataset]
         ctx.log(
             f"{dataset}: 样本 {summary['responses_evaluated']}，"
             f"HTTP 失败 {summary['http_failures']}，"
@@ -465,5 +477,4 @@ def run(ctx: TaskContext) -> None:
         ]
         ctx.log(f"执行 Judge：{provider.model}，指标 {judge_metrics}")
         _judge(ctx, eval_id, query_id, provider, judge_metrics)
-
-    ctx.progress(len(datasets), len(datasets), "评测完成")
+    ctx.progress(sample_total, sample_total, "评测完成")

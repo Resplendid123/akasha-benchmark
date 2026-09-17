@@ -12,6 +12,7 @@ import type {
 import {
   CauseTag,
   CleanupButton,
+  ConfigPanel,
   Collapsible,
   Failed,
   Field,
@@ -68,7 +69,7 @@ export function Attribution({
       {done.length === 0 ? (
         <div className="note warn">还没有已完成的评测记录。</div>
       ) : (
-        <div className="panel">
+        <ConfigPanel storageKey="attribution" title="归因配置">
           <Field label="选择评测">
             <select value={current?.id ?? ''} onChange={(e) => onSelectEval(Number(e.target.value))}>
               {done.map((run) => (
@@ -88,7 +89,7 @@ export function Attribution({
               }}
             />
           )}
-        </div>
+        </ConfigPanel>
       )}
 
       {current && current.attributions.length > 0 && (
@@ -98,9 +99,12 @@ export function Attribution({
             <thead>
               <tr>
                 <th>名称</th>
+                <th>配置组</th>
                 <th>状态</th>
                 <th>依据指标</th>
                 <th className="num">样本数</th>
+                <th className="num">成功</th>
+                <th>模型归因</th>
                 <th>耗时</th>
                 <th />
               </tr>
@@ -111,11 +115,18 @@ export function Attribution({
                   <td className="mono small">
                     {run.name} <span className="muted">#{run.id}</span>
                   </td>
+                  <td className="small">{run.config_group ?? '—'}</td>
                   <td>
                     <StatusTag status={run.status} />
                   </td>
                   <td className="mono small">{run.metric}</td>
-                  <td className="num">{run.sample_limit}</td>
+                  <td className="num">{run.sample_count}</td>
+                  <td className="num">{run.success_count}</td>
+                  <td>
+                    <span className={`tag ${run.provider_id !== null ? 'ok' : ''}`}>
+                      {run.provider_id !== null ? '使用' : '未使用'}
+                    </span>
+                  </td>
                   <td>
                     <Timing startedAt={run.created_at} finishedAt={run.finished_at} />
                   </td>
@@ -184,6 +195,13 @@ function NewAttribution({
     if (first && !candidates.includes(metric)) setMetric(first)
   }, [candidates.join(','), metric])
 
+  useEffect(() => {
+    const latest = providers.data?.[0]
+    if (latest && !(providers.data ?? []).some((provider) => provider.id === providerId)) {
+      setProviderId(latest.id)
+    }
+  }, [providers.data, providerId])
+
   return (
     <div style={{ marginTop: 12 }}>
       {start.error && <Failed error={start.error} />}
@@ -215,7 +233,6 @@ function NewAttribution({
               value={providerId}
               onChange={(e) => setProviderId(e.target.value === '' ? '' : Number(e.target.value))}
             >
-              <option value="">最近配置的</option>
               {(providers.data ?? []).map((provider) => (
                 <option key={provider.id} value={provider.id}>
                   {provider.label} · {provider.model}
@@ -266,7 +283,6 @@ function NewAttribution({
   )
 }
 
-// 逐样本表的每页行数。
 const PAGE = 5
 
 /** 模型的归因结论。``disagreement`` 单独标红，它表示根因可能判错了。 */
@@ -349,8 +365,7 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
 
   return (
     <div className="panel" style={{ marginTop: 14 }}>
-      <div className="panel-head">
-        <h3>{data.name} 的根因</h3>
+      <div className="row tight" style={{ justifyContent: 'flex-end' }}>
         <Timing
           startedAt={data.created_at}
           finishedAt={data.finished_at}

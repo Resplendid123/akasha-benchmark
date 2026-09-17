@@ -165,6 +165,67 @@ def responses_of(
     ]
 
 
+def response_page(
+    connection: sqlite3.Connection,
+    query_id: int,
+    *,
+    dataset: str | None = None,
+    answer_mode: str | None = None,
+    search: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[int, dict[str, int], list[dict[str, Any]]]:
+    """查询响应列表；过滤、计数与分页都留在 SQLite。"""
+    where = ["query_id = ?"]
+    params: list[Any] = [query_id]
+    if dataset:
+        where.append("dataset = ?")
+        params.append(dataset)
+    if search:
+        where.append(
+            "(LOWER(sample_id) LIKE ? OR LOWER(question) LIKE ? "
+            "OR LOWER(COALESCE(json_extract(response_json, '$.answer'), '')) LIKE ?)"
+        )
+        pattern = f"%{search.lower()}%"
+        params.extend((pattern, pattern, pattern))
+    scope = " AND ".join(where)
+    counts = {
+        (row["answer_mode"] or "missing"): int(row["n"])
+        for row in connection.execute(
+            f"""
+            SELECT json_extract(response_json, '$.answerMode') AS answer_mode, COUNT(*) AS n
+            FROM query_response WHERE {scope} GROUP BY answer_mode
+            """,
+            params,
+        )
+    }
+    if answer_mode:
+        where.append("COALESCE(json_extract(response_json, '$.answerMode'), 'missing') = ?")
+        params.append(answer_mode)
+    scope = " AND ".join(where)
+    total = int(
+        connection.execute(
+            f"SELECT COUNT(*) FROM query_response WHERE {scope}", params
+        ).fetchone()[0]
+    )
+    rows = [
+        dict(row)
+        for row in connection.execute(
+            f"""
+            SELECT query_id, sample_id, dataset, question, http_status, latency_ms, error,
+                   requested_at,
+                   json_extract(response_json, '$.answerMode') AS answer_mode,
+                   SUBSTR(COALESCE(json_extract(response_json, '$.answer'), ''), 1, 600) AS answer,
+                   COALESCE(json_array_length(response_json, '$.retrievedSources'), 0) AS retrieved_count,
+                   COALESCE(json_array_length(response_json, '$.citations'), 0) AS citation_count
+            FROM query_response WHERE {scope} ORDER BY sample_id LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        )
+    ]
+    return total, counts, rows
+
+
 def response_of(
     connection: sqlite3.Connection, query_id: int, sample_id: str
 ) -> dict[str, Any] | None:
