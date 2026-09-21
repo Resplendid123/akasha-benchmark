@@ -22,8 +22,61 @@ from akasha_benchmark.store import (
     task_store,
 )
 from akasha_platform.main import create_app
+from akasha_benchmark.metrics.interpretation import build_metric_evidence
 from akasha_platform.settings import Settings
 from akasha_platform.tasks import TaskRejected, TaskRunner
+
+
+def test_citation_precision_evidence_matches_scoring_scope():
+    evidence = build_metric_evidence(
+        ["citation_precision"],
+        [5],
+        {"citation_precision": 0.5},
+        {"gold_doc_ids": ["g1", "g2"], "reference_answers": []},
+        {
+            "citations": [
+                {"sourcePageId": "p-gold", "title": "Gold"},
+                {"sourcePageId": "p-other", "title": "Other"},
+                {"sourcePageId": "p-gold", "title": "duplicate"},
+                {"sourcePageId": "p-missing", "title": "Missing"},
+            ],
+            "snippets": [
+                {
+                    "id": "s1",
+                    "title": "Gold chunk",
+                    "text": "gold evidence text",
+                    "retrievalReasons": ["semantic"],
+                    "sourceWindows": [{"sourcePageId": "p-gold"}],
+                }
+            ],
+            "citationEvidence": [
+                {
+                    "sourcePageId": "p-gold",
+                    "excerpts": [{"text": "exact cited sentence"}],
+                }
+            ],
+        },
+        {"p-gold": "g1", "p-other": "d2"},
+        {
+            "g1": {"doc_id": "g1", "title": "Gold document"},
+            "g2": {"doc_id": "g2", "title": "Uncited gold"},
+            "d2": {"doc_id": "d2", "title": "Other document"},
+        },
+        [],
+    )["citation_precision"]
+
+    assert evidence["formula"] == "实际引用中命中 Gold（1）/ 实际引用（2）"
+    assert [(doc["doc_id"], doc["is_gold"]) for doc in evidence["documents"]] == [
+        ("g1", True),
+        ("d2", False),
+        (None, False),
+    ]
+    assert evidence["snippets"][0]["text"] == "gold evidence text"
+    assert evidence["citation_excerpts"][0]["excerpts"] == ["exact cited sentence"]
+    assert [(doc["doc_id"], doc["cited"]) for doc in evidence["gold_documents"]] == [
+        ("g1", True),
+        ("g2", False),
+    ]
 
 
 @pytest.fixture
@@ -116,6 +169,30 @@ def test_failure_is_recorded_on_the_task(settings, monkeypatch):
     task = runner.start("unit", {})
     failed = _wait(settings, int(task["id"]), {task_store.FAILED})
     assert "炸了" in (failed["error"] or "")
+
+
+def test_failed_query_can_create_retry_task_without_original_task(settings, db, monkeypatch):
+    compile_id = _compile_run(db, run_id="retry-query-compile")
+    query_id = query_store.create_query_run(
+        db, name="retry-query", compile_id=compile_id, score_threshold=None,
+        concurrency=3, model_configs={},
+    )
+    query_store.record_response(
+        db, query_id, sample_id="failed", dataset="hotpotqa", question="q",
+        http_status=500, latency_ms=1, error="failed", response=None,
+    )
+    db.commit()
+
+    runner = TaskRunner(settings)
+    monkeypatch.setattr(runner, "_spawn", lambda *args: None)
+    task = runner.retry_failed_query(query_id)
+
+    assert task["target_kind"] == "query"
+    assert task["target_id"] == query_id
+    assert task["params"]["retry_failed"] is True
+    assert task["params"]["concurrency"] == 3
+    assert task["progress_total"] == 1
+    assert query_store.get_query_run(db, query_id)["status"] == "paused"
 
 
 def test_pause_stops_at_checkpoint_and_resume_continues(settings, monkeypatch):
@@ -239,27 +316,25 @@ def test_same_stage_does_not_run_twice(settings, monkeypatch):
     release.set()
 
 
-def test_compile_allows_three_active_tasks(settings, monkeypatch):
+def test_compile_tasks_are_serialized_while_applying_models(settings, monkeypatch):
     runner = TaskRunner(settings)
     monkeypatch.setattr(runner, "_spawn", lambda *args: None)
 
-    tasks = [runner.start("compile", {}) for _ in range(3)]
-    assert len({task["id"] for task in tasks}) == 3
-    with pytest.raises(TaskRejected, match="并发上限 3"):
+    runner.start("compile", {})
+    with pytest.raises(TaskRejected, match="正在运行"):
         runner.start("compile", {})
 
 
-def test_compile_resume_obeys_three_task_limit(settings, db, monkeypatch):
+def test_compile_resume_obeys_serial_model_application(settings, db, monkeypatch):
     paused_id = task_store.create_task(db, stage="compile", params={})
     task_store.transition(db, paused_id, task_store.PAUSED)
-    for _ in range(3):
-        task_id = task_store.create_task(db, stage="compile", params={})
-        task_store.transition(db, task_id, task_store.RUNNING)
+    task_id = task_store.create_task(db, stage="compile", params={})
+    task_store.transition(db, task_id, task_store.RUNNING)
     db.commit()
 
     runner = TaskRunner(settings)
     monkeypatch.setattr(runner, "_spawn", lambda *args: None)
-    with pytest.raises(TaskRejected, match="并发上限 3"):
+    with pytest.raises(TaskRejected, match="正在运行"):
         runner.resume(paused_id)
     assert task_store.get_task(db, paused_id)["status"] == task_store.PAUSED
 
@@ -446,13 +521,13 @@ def test_provider_probe_404s_on_unknown_endpoint(client):
     assert client.post("/api/providers/9999/probe").status_code == 404
 
 
-def test_provider_stores_and_returns_concurrency(client):
+def test_provider_does_not_expose_or_use_concurrency(client):
     client.put(
         "/api/providers/judge",
         json={"label": "d", "base_url": "https://x/v1", "model": "m", "concurrency": 4},
     )
     provider = client.get("/api/providers?role=judge").json()[0]
-    assert provider["concurrency"] == 4
+    assert "concurrency" not in provider
 
     from akasha_benchmark.judge.providers import resolve_provider
 
@@ -465,13 +540,12 @@ def test_provider_stores_and_returns_concurrency(client):
             base_url="https://x/v1",
             model="m",
             api_key="key",
-            concurrency=3,
         )
         connection.commit()
         resolved = resolve_provider(connection, provider_id, "judge")
     finally:
         connection.close()
-    assert resolved.concurrency == 3
+    assert not hasattr(resolved, "concurrency")
 
 
 def test_akasha_config_group_roundtrip_hides_keys(client):
@@ -505,6 +579,118 @@ def test_akasha_config_group_roundtrip_hides_keys(client):
     configs = loads(stored["configs_json"], {})
     assert configs["compiler"]["apiKey"] == "secret"
     assert configs["compiler"]["model"] == "c2"
+
+
+def test_akasha_models_are_independent_and_hide_keys(client):
+    created = client.put(
+        "/api/akasha-models",
+        json={
+            "feature": "answer",
+            "label": "answer-a",
+            "base_url": "https://answer.example/v1",
+            "model": "answer-model",
+            "api_key": "secret",
+        },
+    ).json()
+    body = client.get("/api/akasha-models?feature=answer").json()
+    row = next(item for item in body["models"] if item["id"] == created["id"])
+    assert row["feature"] == "answer"
+    assert row["api_key_set"] is True
+    assert "api_key" not in row
+
+    client.put(
+        "/api/akasha-models",
+        json={
+            "id": created["id"],
+            "feature": "answer",
+            "label": "answer-a",
+            "base_url": "https://answer.example/v1",
+            "model": "answer-model-2",
+            "api_key": "",
+        },
+    )
+    connection = connect(client.app.state.settings.db_path, read_only=True)
+    try:
+        stored = config_store.get_akasha_model(connection, created["id"])
+    finally:
+        connection.close()
+    assert stored["model"] == "answer-model-2"
+    assert stored["api_key"] == "secret"
+
+
+def test_embedding_model_dimension_roundtrip_and_validation(client):
+    created = client.put(
+        "/api/akasha-models",
+        json={
+            "feature": "embedding",
+            "label": "embedding-a",
+            "base_url": "https://embedding.example/v1",
+            "model": "embedding-model",
+            "parameters": {"dimension": 1024},
+        },
+    )
+    assert created.status_code == 200
+    row = next(
+        item
+        for item in client.get("/api/akasha-models?feature=embedding").json()["models"]
+        if item["id"] == created.json()["id"]
+    )
+    assert row["parameters"]["dimension"] == 1024
+
+    invalid = client.put(
+        "/api/akasha-models",
+        json={
+            "feature": "embedding",
+            "label": "bad-dimension",
+            "base_url": "https://embedding.example/v1",
+            "model": "embedding-model",
+            "parameters": {"dimension": 0},
+        },
+    )
+    assert invalid.status_code == 422
+    assert "dimension" in invalid.json()["detail"]
+
+
+def test_embedding_model_apply_sends_dimension(client, monkeypatch):
+    client.put(
+        "/api/connection",
+        json={"base_url": "http://x", "email": "e@x", "password": "p"},
+    )
+    created = client.put(
+        "/api/akasha-models",
+        json={
+            "feature": "embedding",
+            "label": "embedding-a",
+            "base_url": "https://embedding.example/v1",
+            "model": "embedding-model",
+            "parameters": {"dimension": 1536},
+        },
+    ).json()
+    pushed = []
+
+    from akasha_platform.api import config as config_api
+
+    class Fake(_AkashaStub):
+        def put_model_config(self, feature, payload):
+            pushed.append((feature, payload))
+            return {}
+
+    monkeypatch.setattr(config_api, "AkashaClient", Fake)
+    response = client.post(f"/api/akasha-models/{created['id']}/apply")
+
+    assert response.status_code == 200
+    assert pushed == [
+        (
+            "embedding",
+            {
+                "provider": "openai-compatible",
+                "model": "embedding-model",
+                "baseUrl": "https://embedding.example/v1",
+                "apiKey": "",
+                "parameters": {"dimension": 1536},
+            },
+        )
+    ]
 
 
 def test_akasha_config_delete(client):
@@ -659,6 +845,16 @@ def test_raw_samples_searches_qa_and_corpus(client, dataset_dir, monkeypatch):
     assert empty["rows"] == []
 
 
+def test_normalized_sample_search_matches_gold_title_and_content(client, normalized):
+    by_title = client.get("/api/datasets/hotpotqa/samples", params={"q": "Venice"}).json()
+    by_content = client.get(
+        "/api/datasets/hotpotqa/samples", params={"q": "film festival"}
+    ).json()
+
+    assert [row["sample_id"] for row in by_title["samples"]] == ["hotpotqa:q2"]
+    assert [row["sample_id"] for row in by_content["samples"]] == ["hotpotqa:q2"]
+
+
 def test_normalized_corpus_returns_full_text(client, normalized):
     long_text = "x" * 800
     normalized.execute(
@@ -720,6 +916,31 @@ def test_normalized_dataset_browsing_filters_and_pages_in_sqlite(
 )
 def test_paged_routes_reject_invalid_bounds(client, path):
     assert client.get(path).status_code == 422
+
+
+def test_tasks_route_pages_ten_at_a_time(client):
+    connection = connect(client.app.state.settings.db_path)
+    try:
+        for index in range(12):
+            task_id = task_store.create_task(
+                connection, stage="unit", params={"index": index}
+            )
+            task_store.transition(connection, task_id, task_store.SUCCEEDED)
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = client.get("/api/tasks").json()
+    assert first["total"] == 12
+    assert first["inactive_total"] == 12
+    assert first["limit"] == 10
+    assert first["offset"] == 0
+    assert [task["id"] for task in first["tasks"]] == list(range(12, 2, -1))
+
+    second = client.get("/api/tasks", params={"limit": 10, "offset": 10}).json()
+    assert second["total"] == 12
+    assert second["offset"] == 10
+    assert [task["id"] for task in second["tasks"]] == [2, 1]
 
 
 def test_provider_rename_updates_the_same_row(client):
@@ -837,6 +1058,7 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
         score_threshold=None,
         concurrency=1,
         model_configs={},
+        config_group="group-b",
     )
     cases = (
         ("sample-rita", "Who won the award?", "Rita Moreno", "knowledge"),
@@ -877,8 +1099,6 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
         normalized,
         name="search-attribution",
         eval_id=eval_id,
-        metric="em",
-        sample_limit=2,
         provider_id=None,
     )
     attribution_store.record_attribution(
@@ -922,12 +1142,12 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
         run for run in eval_run["attributions"] if run["id"] == attribution_id
     )
     assert (query_run["config_group"], query_run["sample_count"], query_run["success_count"]) == (
-        "group-a",
+        "group-b",
         2,
         2,
     )
     assert (eval_run["config_group"], eval_run["sample_count"], eval_run["success_count"]) == (
-        "group-a",
+        "确定性指标",
         2,
         2,
     )
@@ -935,7 +1155,7 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
         attribution_run["config_group"],
         attribution_run["sample_count"],
         attribution_run["success_count"],
-    ) == ("group-a", 2, 1)
+    ) == ("规则归因", 2, 1)
 
 
 def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, monkeypatch):
@@ -958,14 +1178,14 @@ def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, 
             ks=[2],
             metrics=["em"],
             judge_provider_id=None,
+            concurrency=3,
         )
         attribution_store.create_attribution_run(
             normalized,
             name=f"tree-attribution-{index}",
             eval_id=eval_id,
-            metric="em",
-            sample_limit=1,
             provider_id=None,
+            concurrency=4,
         )
     normalized.commit()
 
@@ -990,7 +1210,41 @@ def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, 
 
     assert response.status_code == 200
     assert len(response.json()["compiles"]) == 4
+    evaluation = response.json()["compiles"][0]["queries"][0]["evals"][0]
+    assert evaluation["concurrency"] == 3
+    assert evaluation["attributions"][0]["concurrency"] == 4
     assert len(selects) <= 15
+
+
+def test_compile_tree_ignores_unknown_historical_metrics(client, normalized):
+    compile_id = _compile_run(normalized, run_id="legacy-metric")
+    query_id = query_store.create_query_run(
+        normalized,
+        name="legacy-metric-query",
+        compile_id=compile_id,
+        score_threshold=None,
+        concurrency=1,
+        model_configs={},
+    )
+    eval_id = eval_store.create_eval_run(
+        normalized,
+        name="legacy-metric-eval",
+        query_id=query_id,
+        ks=[2],
+        metrics=["em"],
+        judge_provider_id=None,
+    )
+    normalized.execute(
+        "UPDATE eval_run SET metrics_json = ? WHERE id = ?",
+        ('["em", "removed_metric"]', eval_id),
+    )
+    normalized.commit()
+
+    response = client.get("/api/compiles")
+
+    assert response.status_code == 200
+    evaluation = response.json()["compiles"][0]["queries"][0]["evals"][0]
+    assert evaluation["metrics"] == ["em"]
 
 
 def test_compile_success_count_comes_from_saved_progress(client, normalized):
@@ -1181,8 +1435,6 @@ def test_cleanup_protects_active_descendants(
         db,
         name="a",
         eval_id=eval_id,
-        metric="em",
-        sample_limit=1,
         provider_id=None,
     )
     ids = {"compile": compile_id, "query": query_id, "eval": eval_id, "attribution": attribution_id}

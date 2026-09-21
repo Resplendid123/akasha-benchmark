@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from akasha_benchmark.akasha_client import AkashaClient, AkashaError
+from akasha_benchmark.akasha_configs import apply_config_group, apply_models
 from akasha_benchmark.judge import JudgeClient, JudgeConfigError
 from akasha_benchmark.judge.providers import resolve_provider
-from akasha_benchmark import model_configs as model_configs_module
 from akasha_benchmark.model_configs import FEATURES, drift
 from akasha_benchmark.store import compile_store, config_store, dumps, loads
 
@@ -33,7 +34,12 @@ def get_connection(request: Request) -> dict[str, Any]:
             for r in compile_store.list_compile_runs(connection)
             if r["space_id"]
         ]
-    return {**{k: v for k, v in row.items() if k != "id"}, "compiles": compiles}
+    visible = {
+        key: row[key]
+        for key in (*config_store.CONNECTION_FIELDS, "updated_at")
+        if key in row
+    }
+    return {**visible, "compiles": compiles}
 
 
 @router.put("/connection")
@@ -85,18 +91,6 @@ def test_connection(request: Request) -> dict[str, Any]:
             if reason:
                 blocked.append({"id": int(row["id"]), "run_id": row["run_id"], "reason": reason})
 
-    # 选中的本地组与远端逐项比对（不含 apiKey），供前端提示是否需要应用。
-    with db(request) as connection:
-        group = config_store.selected_config_group(connection)
-    group_drift = None
-    if group is not None:
-        configs = loads(group["configs_json"], {})
-        group_drift = {
-            "id": int(group["id"]),
-            "label": group["label"],
-            "drift": drift(model_configs, model_configs_module.group_to_live(configs)),
-        }
-
     return {
         "ok": True,
         "user": {"id": user.get("id"), "email": user.get("email"), "role": role},
@@ -112,7 +106,6 @@ def test_connection(request: Request) -> dict[str, Any]:
             "丢弃 chunk，症状看起来像召回质量差。编译前请提权。"
         ),
         "model_configs": model_configs,
-        "group_drift": group_drift,
     }
 
 
@@ -189,7 +182,7 @@ def list_providers(request: Request, role: str | None = None) -> list[dict[str, 
         rows = config_store.list_providers(connection, role)
     return [
         {
-            **{k: v for k, v in row.items() if k != "api_key"},
+            **{k: v for k, v in row.items() if k not in ("api_key", "concurrency")},
             "api_key_set": bool((row["api_key"] or "").strip()),
         }
         for row in rows
@@ -214,11 +207,6 @@ def put_provider(
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, f"id 必须是整数，收到 {payload['id']!r}") from exc
 
-    try:
-        concurrency = max(1, int(payload.get("concurrency") or 1))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(422, f"concurrency 必须是整数，收到 {payload.get('concurrency')!r}") from exc
-
     api_key = str(payload.get("api_key") or "")
     with writable(request) as connection:
         rows = config_store.list_providers(connection, role)
@@ -241,7 +229,6 @@ def put_provider(
                 base_url=base_url,
                 model=model,
                 api_key=api_key,
-                concurrency=concurrency,
                 provider_id=provider_id,
             )
         except (TypeError, ValueError) as exc:
@@ -251,7 +238,6 @@ def put_provider(
         "role": role,
         "label": label,
         "api_key_set": bool(api_key),
-        "concurrency": concurrency,
     }
 
 
@@ -381,35 +367,25 @@ def apply_akasha_config(request: Request, group_id: int) -> dict[str, Any]:
         group = config_store.get_config_group(connection, group_id)
     if group is None:
         raise HTTPException(404, f"配置组 #{group_id} 不存在")
-    configs = loads(group["configs_json"], {})
-
     config = config_of(request)
     try:
         config.require_credentials()
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
-    applied: list[str] = []
     try:
         with AkashaClient(config) as client:
             client.login()
-            for feature in FEATURES:
-                entry = configs.get(feature) or {}
-                body = {"provider": "openai-compatible", **entry}
-                client.put_model_config(feature, body)
-                applied.append(feature)
+            with writable(request) as connection:
+                result = apply_config_group(connection, client, group_id)
     except AkashaError as exc:
         raise HTTPException(502, str(exc)) from exc
     except OSError as exc:
         raise HTTPException(502, f"连不上 {config.base_url}：{exc}") from exc
 
-    # 应用即选中：这一组现在就是远端的真实配置，drift 基准也该是它。
-    with writable(request) as connection:
-        config_store.set_selected_group(connection, group_id)
-
-    requires_rebuild = any(f in {"compiler", "embedding"} for f in applied)
+    requires_rebuild = any(f in {"compiler", "embedding"} for f in result["applied"])
     return {
-        "applied": applied,
+        "applied": result["applied"],
         "requires_new_compile": requires_rebuild,
         "impact": "需要重新编译" if requires_rebuild else "不影响已有编译",
     }
@@ -420,16 +396,31 @@ def export_config(request: Request) -> dict[str, Any]:
     """导出全部配置，含明文密钥，可回填。"""
     with db(request) as connection:
         row = config_store.get_connection_row(connection)
-        connection_data = {k: v for k, v in row.items() if k not in ("id", "updated_at")}
+        connection_data = {
+            key: row[key] for key in config_store.CONNECTION_FIELDS if key in row
+        }
         providers = config_store.list_providers(connection)
         groups = config_store.list_config_groups(connection)
+        akasha_models = config_store.list_akasha_models(connection)
     return {
         "connection": connection_data,
         "providers": [
-            {k: v for k, v in p.items() if k not in ("id", "updated_at")} for p in providers
+            {k: v for k, v in p.items() if k not in ("id", "updated_at", "concurrency")}
+            for p in providers
         ],
         "akasha_configs": [
             {"label": g["label"], "configs": loads(g["configs_json"], {})} for g in groups
+        ],
+        "akasha_models": [
+            {
+                "feature": row["feature"],
+                "label": row["label"],
+                "base_url": row["base_url"],
+                "model": row["model"],
+                "api_key": row["api_key"],
+                "parameters": loads(row["parameters_json"], {}),
+            }
+            for row in akasha_models
         ],
     }
 
@@ -440,6 +431,7 @@ def import_config(request: Request, payload: dict[str, Any] = Body(...)) -> dict
     connection_data = payload.get("connection") or {}
     providers = payload.get("providers") or []
     akasha_configs = payload.get("akasha_configs") or []
+    akasha_models = payload.get("akasha_models") or []
     try:
         fields = config_store.sanitize_connection(connection_data)
     except ValueError as exc:
@@ -456,7 +448,6 @@ def import_config(request: Request, payload: dict[str, Any] = Body(...)) -> dict
                     base_url=str(p.get("base_url") or ""),
                     model=str(p.get("model") or ""),
                     api_key=str(p.get("api_key") or ""),
-                    concurrency=max(1, int(p.get("concurrency") or 1)),
                 )
             for g in akasha_configs:
                 config_store.upsert_config_group(
@@ -464,10 +455,121 @@ def import_config(request: Request, payload: dict[str, Any] = Body(...)) -> dict
                     label=str(g.get("label") or ""),
                     configs_json=dumps(g.get("configs") or {}),
                 )
+                for feature, entry in (g.get("configs") or {}).items():
+                    if feature not in FEATURES or not isinstance(entry, dict):
+                        continue
+                    config_store.upsert_akasha_model(
+                        connection,
+                        feature=feature,
+                        label=str(g.get("label") or "default"),
+                        base_url=str(entry.get("baseUrl") or ""),
+                        model=str(entry.get("model") or ""),
+                        api_key=str(entry.get("apiKey") or ""),
+                        parameters=entry.get("parameters") if isinstance(entry.get("parameters"), dict) else {},
+                    )
+            for model in akasha_models:
+                config_store.upsert_akasha_model(
+                    connection,
+                    feature=str(model.get("feature") or ""),
+                    label=str(model.get("label") or "default"),
+                    base_url=str(model.get("base_url") or ""),
+                    model=str(model.get("model") or ""),
+                    api_key=str(model.get("api_key") or ""),
+                    parameters=model.get("parameters") if isinstance(model.get("parameters"), dict) else {},
+                )
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
     return {
         "connection": sorted(fields),
         "providers": len(providers),
         "akasha_configs": len(akasha_configs),
+        "akasha_models": len(akasha_models),
     }
+
+
+def _akasha_model_view(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "feature": row["feature"],
+        "label": row["label"],
+        "base_url": row["base_url"],
+        "model": row["model"],
+        "parameters": loads(row["parameters_json"], {}),
+        "api_key_set": bool((row["api_key"] or "").strip()),
+        "updated_at": row["updated_at"],
+    }
+
+
+@router.get("/akasha-models")
+def list_akasha_models(request: Request, feature: str | None = None) -> dict[str, Any]:
+    if feature is not None and feature not in FEATURES:
+        raise HTTPException(422, f"未知配置项 {feature!r}")
+    with db(request) as connection:
+        rows = config_store.list_akasha_models(connection, feature)
+    return {"features": list(FEATURES), "models": [_akasha_model_view(row) for row in rows]}
+
+
+@router.put("/akasha-models")
+def put_akasha_model(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    feature = str(payload.get("feature") or "")
+    label = str(payload.get("label") or "").strip()
+    base_url = str(payload.get("base_url") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    if feature not in FEATURES or not label or not base_url or not model:
+        raise HTTPException(422, "feature、label、base_url 与 model 必填")
+    try:
+        model_id = None if payload.get("id") is None else int(payload["id"])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "id 必须是整数") from exc
+    with writable(request) as connection:
+        existing = config_store.get_akasha_model(connection, model_id) if model_id else None
+        if model_id is not None and existing is None:
+            raise HTTPException(404, f"Akasha 模型配置 #{model_id} 不存在")
+        api_key = str(payload.get("api_key") or "") or str((existing or {}).get("api_key") or "")
+        parameters = (
+            payload["parameters"]
+            if isinstance(payload.get("parameters"), dict)
+            else loads((existing or {}).get("parameters_json"), {})
+        )
+        dimension = parameters.get("dimension") if feature == "embedding" else None
+        if dimension is not None and (
+            isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0
+        ):
+            raise HTTPException(422, "embedding parameters.dimension 必须是正整数")
+        try:
+            model_id = config_store.upsert_akasha_model(
+                connection, feature=feature, label=label, base_url=base_url, model=model,
+                api_key=api_key, parameters=parameters, model_id=model_id,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, f"{feature} 下已经有一个叫 {label!r} 的端点") from exc
+    return {"id": model_id, "feature": feature, "label": label}
+
+
+@router.delete("/akasha-models/{model_id}")
+def delete_akasha_model(request: Request, model_id: int) -> dict[str, Any]:
+    with writable(request) as connection:
+        removed = config_store.delete_akasha_model(connection, model_id)
+    if not removed:
+        raise HTTPException(404, f"Akasha 模型配置 #{model_id} 不存在")
+    return {"deleted": removed}
+
+
+@router.post("/akasha-models/{model_id}/apply")
+def apply_akasha_model(request: Request, model_id: int) -> dict[str, Any]:
+    with db(request) as connection:
+        record = config_store.get_akasha_model(connection, model_id)
+    if record is None:
+        raise HTTPException(404, f"Akasha 模型配置 #{model_id} 不存在")
+    config = config_of(request)
+    try:
+        config.require_credentials()
+        with AkashaClient(config) as client:
+            client.login()
+            with db(request) as connection:
+                apply_models(connection, client, {record["feature"]: model_id})
+    except AkashaError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(502, f"连不上 {config.base_url}：{exc}") from exc
+    return {"applied": record["feature"]}

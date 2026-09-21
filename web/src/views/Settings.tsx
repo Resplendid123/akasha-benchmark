@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { api, getToken, setToken } from '../api'
 import type {
   AkashaConfigGroup,
+  AkashaFeature,
+  AkashaModelProvider,
   Connection,
   ConnectionTest,
   ModelConfig,
@@ -130,12 +132,10 @@ function AccessToken() {
   )
 }
 
-// 各数值字段的下限。间隔可以是 0，超时不行。并发挪到各模型端点。
+// 各数值字段的下限。间隔可以是 0，超时不行；模型调用并发由各运行层选择。
 const NUMBER_FIELDS = [
-  ['timeout_seconds', '请求超时（秒）', 1],
-  ['request_interval_seconds', '请求间隔（秒）', 0],
-  ['poll_interval_seconds', '编译轮询间隔（秒）', 0],
-  ['poll_timeout_seconds', '编译轮询超时（秒）', 1],
+  ['timeout_seconds', '模型请求超时（秒）', 1],
+  ['request_interval_seconds', '模型请求间隔（秒）', 0],
 ] as const
 
 type Form = Record<string, string>
@@ -296,18 +296,6 @@ function ConnectionForm() {
         </div>
       )}
 
-      {test.result?.group_drift &&
-        Object.values(test.result.group_drift.drift).some(Boolean) && (
-          <div className="note warn">
-            本地选中组「{test.result.group_drift.label}」与远端配置不一致（
-            {Object.entries(test.result.group_drift.drift)
-              .filter(([, changed]) => changed)
-              .map(([feature]) => feature)
-              .join('、')}
-            ）。可在下方「应用到 Akasha」推送整组。
-          </div>
-        )}
-
     </div>
   )
 }
@@ -340,7 +328,7 @@ function ModelConfigs() {
         )}
       </div>
 
-      <AkashaGroups />
+      <AkashaModels />
     </>
   )
 }
@@ -393,7 +381,7 @@ const blankGroupForm = (features: string[]): GroupForm => ({
 })
 
 /** 本地保存的 Akasha 模型配置组：多组可存，选中一组可整组应用到远端。 */
-function AkashaGroups() {
+export function AkashaGroups() {
   const { data, error, loading, reload } = useAsync(() => api.akashaConfigs(), [])
   // null 收起，'new' 新建，数字是在改那一条。
   const [mode, setMode] = useState<number | 'new' | null>(null)
@@ -662,7 +650,149 @@ function GroupRow({
   )
 }
 
-const BLANK = { label: '', base_url: '', model: '', api_key: '', concurrency: 1 }
+const BLANK = { label: '', base_url: '', model: '', api_key: '' }
+
+type AkashaModelForm = {
+  feature: AkashaFeature
+  label: string
+  base_url: string
+  model: string
+  api_key: string
+  dimension: string
+  parameters: Record<string, unknown>
+}
+
+const emptyAkashaModel = (feature: AkashaFeature): AkashaModelForm => ({
+  feature, label: '', base_url: '', model: '', api_key: '', dimension: '', parameters: {},
+})
+
+/** 四类 Akasha 模型分开保存，编译与查询在各自页面自由组合。 */
+function AkashaModels() {
+  const { data, error, loading, reload } = useAsync(() => api.akashaModels(), [])
+  const [editing, setEditing] = useState<number | 'new' | null>(null)
+  const [form, setForm] = useState<AkashaModelForm>(emptyAkashaModel('answer'))
+  const save = useAction<unknown>()
+  const remove = useAction<unknown>()
+  const apply = useAction<unknown>()
+  const models = data?.models ?? []
+
+  if (loading && !data) return <Loading what="Akasha 模型配置" />
+
+  const edit = (item: AkashaModelProvider) => {
+    setEditing(item.id)
+    setForm({
+      feature: item.feature, label: item.label, base_url: item.base_url,
+      model: item.model, api_key: '',
+      dimension: item.parameters.dimension === undefined ? '' : String(item.parameters.dimension),
+      parameters: item.parameters,
+    })
+    save.reset()
+  }
+  const create = (feature: AkashaFeature) => {
+    setEditing('new')
+    setForm(emptyAkashaModel(feature))
+    save.reset()
+  }
+  const close = () => {
+    setEditing(null)
+    save.reset()
+  }
+  const dimension = Number(form.dimension)
+  const dimensionInvalid = form.feature === 'embedding' && form.dimension.trim() !== ''
+    && (!Number.isInteger(dimension) || dimension <= 0)
+  const label = form.label.trim()
+  const taken = models.some((item) =>
+    item.feature === form.feature && item.label === label && item.id !== editing)
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>Akasha 独立模型配置</h3>
+      </div>
+      {error && <Failed error={error} />}
+      {save.error && <Failed error={save.error} />}
+      {remove.error && <Failed error={remove.error} />}
+      {apply.error && <Failed error={apply.error} />}
+      {data?.features.map((feature) => (
+        <div key={feature} className="metric-family">
+          <div className="spread">
+            <h4>{FEATURE_LABELS[feature]?.title ?? feature}</h4>
+            <button className="action small" disabled={save.busy} onClick={() => create(feature)}>
+              新增端点
+            </button>
+          </div>
+          <table className={`endpoint-table${feature === 'embedding' ? ' embedding-endpoint-table' : ''}`}>
+            <colgroup>
+              <col className="endpoint-label-col" />
+              <col className="endpoint-name-col" />
+              <col className="endpoint-url-col" />
+              {feature === 'embedding' && <col className="endpoint-dimension-col" />}
+              <col className="endpoint-key-col" />
+              <col className="endpoint-actions-col" />
+            </colgroup>
+            <thead><tr><th>标签</th><th>模型</th><th>base_url(/v1)</th>{feature === 'embedding' && <th>维度</th>}<th>密钥</th><th /></tr></thead>
+            <tbody>
+              {models.filter((item) => item.feature === feature).map((item) => (
+                <tr key={item.id} className={item.id === editing ? 'selected' : ''}>
+                  <td>{item.label}</td>
+                  <td className="mono small">{item.model}</td>
+                  <td className="mono small muted truncate">{item.base_url}</td>
+                  {feature === 'embedding' && <td className="mono small">{String(item.parameters.dimension ?? '—')}</td>}
+                  <td><Pass ok={item.api_key_set} yes="已设置" no="缺失" /></td>
+                  <td className="table-actions-cell"><div className="table-actions">
+                    <button className="action small" onClick={() => edit(item)}>编辑</button>
+                    <button className="action small" disabled={apply.busy} onClick={() => apply.run(() => api.applyAkashaModel(item.id))}>应用</button>
+                    <button className="action small danger" disabled={remove.busy} onClick={() => {
+                      if (!window.confirm(`删除「${item.label}」？`)) return
+                      remove.run(async () => { const result = await api.deleteAkashaModel(item.id); reload(); return result })
+                    }}>删除</button>
+                  </div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {models.every((item) => item.feature !== feature) && editing === null && (
+            <p className="small muted">还没有配端点。</p>
+          )}
+          {editing !== null && form.feature === feature && (
+            <>
+              <h4>{typeof editing === 'number' ? `编辑端点 #${editing}` : '新增端点'}</h4>
+              <div className="form-grid inline">
+                <Field label="标签" hint="同一类型下不重名"><input value={form.label} onChange={(e) => setForm({ ...form, label: e.target.value })} placeholder="default" /></Field>
+                <Field label="模型"><input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></Field>
+                <Field label="base_url"><input value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></Field>
+                <SecretField label="api_key" hint={typeof editing === 'number' ? '留空保留原值' : undefined} value={form.api_key} onChange={(api_key) => setForm({ ...form, api_key })} />
+                {feature === 'embedding' && (
+                  <Field label="向量维度" hint="可选，填写正整数">
+                    <input type="number" min={1} step={1} value={form.dimension} onChange={(e) => setForm({ ...form, dimension: e.target.value })} placeholder="1024" />
+                  </Field>
+                )}
+              </div>
+              {dimensionInvalid && <div className="note bad">向量维度必须是正整数。</div>}
+              {taken && <div className="note bad">该类型下已经有一个叫「{label}」的端点。</div>}
+              <div className="panel-actions">
+                <button className="action primary" disabled={save.busy || dimensionInvalid || taken || !label || !form.model.trim() || !form.base_url.trim()} onClick={() => save.run(async () => {
+                  const parameters = { ...form.parameters }
+                  if (feature === 'embedding') {
+                    if (form.dimension.trim()) parameters.dimension = dimension
+                    else delete parameters.dimension
+                  }
+                  const result = await api.saveAkashaModel({
+                    feature: form.feature, label, base_url: form.base_url.trim(),
+                    model: form.model.trim(), api_key: form.api_key, parameters,
+                    ...(typeof editing === 'number' ? { id: editing } : {}),
+                  })
+                  close(); reload(); return result
+                })}>保存</button>
+                <button className="action" onClick={close}>取消</button>
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
 
 /** 一行端点。探测与删除的状态逐行独立，所以拆成组件。 */
 function ProviderRow({
@@ -688,7 +818,6 @@ function ProviderRow({
         <td>
           <Pass ok={provider.api_key_set} yes="已设置" no="缺失" />
         </td>
-        <td className="small mono">{provider.concurrency}</td>
         <td>
           <div className="row tight">
             <button className="action small" onClick={onEdit}>
@@ -726,7 +855,7 @@ function ProviderRow({
       </tr>
       {(probe.result || probe.error || remove.error) && (
         <tr>
-          <td colSpan={6}>
+          <td colSpan={5}>
             {remove.error && <Failed error={remove.error} />}
             {probe.error && <Failed error={probe.error} />}
             {probe.result && <ProbeResult result={probe.result} onClose={probe.reset} />}
@@ -765,7 +894,7 @@ function ProbeResult({ result, onClose }: { result: ProviderProbe; onClose: () =
   )
 }
 
-/** 表单默认收起，由「新建端点」或表格里的「编辑」打开。
+/** 表单默认收起，由「新增端点」或表格里的「编辑」打开。
  *
  * 编辑时提交 id：后端按 (role, label) upsert，不带 id 会把改名变成新增。
  */
@@ -799,7 +928,6 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
       base_url: provider.base_url,
       model: provider.model,
       api_key: '',
-      concurrency: provider.concurrency,
     })
     save.reset()
   }
@@ -814,21 +942,32 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
     <div className="panel">
       <div className="panel-head">
         <h3>{title}</h3>
-        <span className="small muted">{providers.length} 个端点</span>
+        <div className="row tight">
+          <span className="small muted">{providers.length} 个端点</span>
+          <button className="action small" disabled={save.busy} onClick={create}>
+            新增端点
+          </button>
+        </div>
       </div>
 
       {error && <Failed error={error} />}
       {save.error && <Failed error={save.error} />}
 
       {providers.length > 0 && (
-        <table>
+        <table className="endpoint-table">
+          <colgroup>
+            <col className="endpoint-label-col" />
+            <col className="endpoint-name-col" />
+            <col className="endpoint-url-col" />
+            <col className="endpoint-key-col" />
+            <col className="endpoint-actions-col" />
+          </colgroup>
           <thead>
             <tr>
               <th>标签</th>
               <th>模型</th>
               <th>base_url(/v1)</th>
               <th>密钥</th>
-              <th>并发</th>
               <th />
             </tr>
           </thead>
@@ -857,9 +996,9 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
 
       {mode !== null && (
         <>
-          <h4>{editing === null ? '新建端点' : `编辑端点 #${editing}`}</h4>
+          <h4>{editing === null ? '新增端点' : `编辑端点 #${editing}`}</h4>
           <div className="form-grid inline">
-            <Field label="标签" hint="同一角色下不重名">
+            <Field label="标签" hint="同一类型下不重名">
               <input
                 value={form.label}
                 onChange={(e) => set({ label: e.target.value })}
@@ -882,15 +1021,6 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
               value={form.api_key}
               onChange={(value) => set({ api_key: value })}
             />
-            <Field label="并发" hint="judge / 归因调用的并发数">
-              <input
-                type="number"
-                min={1}
-                max={16}
-                value={form.concurrency}
-                onChange={(e) => set({ concurrency: Number(e.target.value) })}
-              />
-            </Field>
           </div>
 
           {taken && (
@@ -901,12 +1031,8 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
         </>
       )}
 
-      <div className="panel-actions">
-        {mode === null ? (
-          <button className="action" onClick={create}>
-            新建端点
-          </button>
-        ) : (
+      {mode !== null && (
+        <div className="panel-actions">
           <>
             <button
               className="action primary"
@@ -925,14 +1051,14 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
                 })
               }
             >
-              {save.busy ? '保存中…' : editing === null ? '创建端点' : '保存修改'}
+              {save.busy ? '保存中…' : '保存'}
             </button>
             <button className="action" disabled={save.busy} onClick={close}>
               取消
             </button>
           </>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -30,9 +30,10 @@ from ..metrics import attribution, multihop, qa, registry, retrieval
 from ..store import compile_store, eval_store, query_store, run_store
 from ..task import TaskContext
 
-DEFAULT_KS = (2, 5, 10)
+DEFAULT_KS = retrieval.DEFAULT_KS
 # judge 失败率超过这个值就判整轮失败：排除得太多时均值不代表整体。
 MAX_JUDGE_FAILURE_RATE = 0.1
+MAX_JUDGE_CONCURRENCY = 16
 
 
 def _mean(values: list[float]) -> float:
@@ -314,6 +315,7 @@ def _judge(
     query_id: int,
     provider: JudgeProvider,
     metrics: list[str],
+    concurrency: int,
 ) -> None:
     """按样本顺序执行 Judge；同一样本的全部指标优先并发完成。"""
     for metric in metrics:
@@ -324,8 +326,6 @@ def _judge(
         for metric in metrics
     }
     rows = eval_store.sample_evals(ctx.db, eval_id)
-    concurrency = max(1, provider.concurrency)
-
     for position, row in enumerate(rows, 1):
         ctx.checkpoint()
         response = query_store.response_of(ctx.db, query_id, row["sample_id"])
@@ -410,6 +410,9 @@ def run(ctx: TaskContext) -> None:
         raise ValueError("k 必须大于 0")
     metrics = resolve_metrics(list(params.get("metrics") or []))
     judge_selected = any(registry.get_metric(name).kind == registry.KIND_JUDGE for name in metrics)
+    concurrency = int(params.get("concurrency") or 1)
+    if not 1 <= concurrency <= MAX_JUDGE_CONCURRENCY:
+        raise ValueError(f"Judge 并发必须在 1 到 {MAX_JUDGE_CONCURRENCY} 之间")
 
     provider: JudgeProvider | None = None
     provider_id = params.get("judge_provider_id")
@@ -421,7 +424,8 @@ def run(ctx: TaskContext) -> None:
     name = str(params.get("name") or "").strip() or f"{query_run['name']}-e-{uuid.uuid4().hex[:6]}"
     eval_id = ctx.target("eval")
     ctx.freeze(
-        name=name, datasets=datasets, ks=list(ks), metrics=metrics, judge_provider_id=provider_id
+        name=name, datasets=datasets, ks=list(ks), metrics=metrics,
+        judge_provider_id=provider_id, concurrency=concurrency
     )
     if eval_id is None:
         if eval_store.eval_run_by_name(ctx.db, name):
@@ -433,6 +437,7 @@ def run(ctx: TaskContext) -> None:
             ks=list(ks),
             metrics=metrics,
             judge_provider_id=provider_id if judge_selected else None,
+            concurrency=concurrency if judge_selected else 1,
         )
         ctx.bind("eval", eval_id)
 
@@ -476,5 +481,5 @@ def run(ctx: TaskContext) -> None:
             name for name in metrics if registry.get_metric(name).kind == registry.KIND_JUDGE
         ]
         ctx.log(f"执行 Judge：{provider.model}，指标 {judge_metrics}")
-        _judge(ctx, eval_id, query_id, provider, judge_metrics)
+        _judge(ctx, eval_id, query_id, provider, judge_metrics, concurrency)
     ctx.progress(sample_total, sample_total, "评测完成")

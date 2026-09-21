@@ -15,15 +15,15 @@ from typing import Any
 from akasha_benchmark.akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
 from akasha_benchmark.config import load_config
 from akasha_benchmark.stages import STAGES, chain, clean_params
-from akasha_benchmark.store import compile_store, connect, task_store
+from akasha_benchmark.store import compile_store, connect, query_store, task_store
 from akasha_benchmark.task import Paused, TaskContext, execute
 
 from .settings import Settings
 
 # 这些阶段与任何在跑的任务互斥：它们改的是下游所有层的输入。
 EXCLUSIVE = frozenset({"download", "normalize"})
-# 编译产物与远端 Space 按任务隔离，允许有限并行；其他同名阶段仍串行。
-STAGE_CONCURRENCY = {"compile": 3}
+# Akasha 模型配置是远端全局状态；编译任务串行，单任务内部仍可并发上传。
+STAGE_CONCURRENCY: dict[str, int] = {}
 
 
 class TaskRejected(RuntimeError):
@@ -108,6 +108,49 @@ class TaskRunner:
             connection.close()
 
         self._spawn(task_id, head["stage"], params)
+        return record
+
+    def retry_failed_query(self, query_id: int) -> dict[str, Any]:
+        """从查询产物重建任务，只重试已有失败响应。"""
+        connection = connect(self.settings.db_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_free(connection, "query")
+            query_run = query_store.get_query_run(connection, query_id)
+            if query_run is None:
+                raise TaskRejected(f"查询 #{query_id} 不存在")
+            failures = query_store.failed_response_count(connection, query_id)
+            if failures == 0:
+                raise TaskRejected(f"查询 #{query_id} 没有失败响应")
+            datasets = sorted(
+                {row["dataset"] for row in query_store.query_samples(connection, query_id)}
+            )
+            if not datasets:
+                datasets = query_store.response_datasets(connection, query_id)
+            params = {
+                "compile_id": int(query_run["compile_id"]),
+                "datasets": datasets,
+                "concurrency": int(query_run["concurrency"]),
+                "name": query_run["name"],
+                "score_threshold": query_run["score_threshold"],
+                "sample_limit": None,
+                "answer_model_id": query_run.get("answer_model_id"),
+                "retry_failed": True,
+            }
+            task_id = task_store.create_task(connection, stage="query", params=params)
+            task_store.set_task_target(connection, task_id, "query", query_id)
+            task_store.update_progress(
+                connection, task_id, done=0, total=failures, note="等待重试失败响应"
+            )
+            connection.execute(
+                "UPDATE query_run SET status=?, finished_at=NULL WHERE id=?",
+                (task_store.PAUSED, query_id),
+            )
+            connection.commit()
+            record = task_store.get_task(connection, task_id) or {}
+        finally:
+            connection.close()
+        self._spawn(task_id, "query", params)
         return record
 
     def resume(self, task_id: int) -> dict[str, Any]:

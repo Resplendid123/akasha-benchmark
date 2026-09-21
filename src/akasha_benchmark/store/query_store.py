@@ -17,19 +17,26 @@ def create_query_run(
     score_threshold: float | None,
     concurrency: int,
     model_configs: Any,
+    config_group: str | None = None,
+    answer_model_id: int | None = None,
+    model_selection: dict[str, Any] | None = None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO query_run
-            (name, compile_id, score_threshold, concurrency,
+            (name, compile_id, score_threshold, concurrency, config_group, answer_model_id,
+             model_selection_json,
              model_configs_json, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             name,
             compile_id,
             score_threshold,
             concurrency,
+            config_group,
+            answer_model_id,
+            dumps(model_selection),
             dumps(model_configs),
             STATUS_RUNNING,
             utc_now(),
@@ -243,6 +250,15 @@ def delete_failed_responses(connection: sqlite3.Connection, query_id: int) -> in
         "AND (http_status < 200 OR http_status >= 300)",
         (query_id,),
     ).rowcount
+
+
+def failed_response_count(connection: sqlite3.Connection, query_id: int) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) AS n FROM query_response WHERE query_id=? "
+        "AND (http_status < 200 OR http_status >= 300)",
+        (query_id,),
+    ).fetchone()
+    return int(row["n"] if row else 0)
 
 
 def query_stats(connection: sqlite3.Connection, query_id: int) -> dict[str, Any]:

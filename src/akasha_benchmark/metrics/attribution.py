@@ -33,6 +33,7 @@ def evaluate_sample(
     page_to_doc: dict[str, str],
 ) -> dict[str, float]:
     """单条样本的归因指标。"""
+    del citation_evidence  # 原始证据仍供详情展示，不再生成独立指标。
     gold_set = set(gold)
     cited = to_doc_ids(citations, page_to_doc)
     retrieved_docs = to_doc_ids(retrieved, page_to_doc)
@@ -40,21 +41,11 @@ def evaluate_sample(
     cited_set, retrieved_set = set(cited), set(retrieved_docs)
     truncated = retrieved_set - cited_set
 
-    evidence_backed = sum(1 for e in citation_evidence if e.get("excerpts"))
-    evidence_total = len(citation_evidence)
-
     return {
         "citation_precision": len(cited_set & gold_set) / len(cited_set) if cited_set else 0.0,
         "citation_recall": len(cited_set & gold_set) / len(gold_set) if gold_set else 0.0,
-        "citation_count": float(len(cited_set)),
-        "retrieved_count": float(len(retrieved_set)),
         # 被检索到但没进答案引用的文档数。
         "truncation_loss": float(len(truncated)),
         # 其中本来是 gold 的那些。
         "truncated_gold": float(len(truncated & gold_set)),
-        # excerpts 非空的引用占比。
-        "evidence_verifiable_rate": (
-            evidence_backed / evidence_total if evidence_total else 0.0
-        ),
-        "evidence_entries": float(evidence_total),
     }

@@ -19,8 +19,6 @@ class AkashaConfig:
     database_url: str = ""
     timeout_seconds: float = 120.0
     request_interval_seconds: float = 0.5
-    poll_interval_seconds: float = 30.0
-    poll_timeout_seconds: float = 7200.0
 
     def api(self, path: str) -> str:
         return f"{self.base_url.rstrip('/')}{API_PREFIX}/{path.lstrip('/')}"

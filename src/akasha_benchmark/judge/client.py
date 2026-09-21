@@ -56,7 +56,6 @@ class JudgeProvider:
     api_key: str = ""
     timeout_seconds: float = 120.0
     provider_id: int | None = None
-    concurrency: int = 1
 
     def resolve_key(self) -> str:
         key = (self.api_key or "").strip()

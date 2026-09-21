@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { CompileRun, QueryRun } from '../types'
 import {
@@ -11,32 +11,44 @@ import {
   Loading,
   ModeTag,
   Pager,
+  RecordNav,
   RecordSearch,
   StatusTag,
   Timing,
   num,
   useAction,
   useAsync,
+  usePagedRecordNavigation,
   usePoll,
 } from '../ui'
 
 /** 查询层：选一次编译的空间，配置查询参数，逐条跑 query。 */
 export function Query({
   activeCompile,
+  activeQuery,
   onSelectCompile,
+  onOpenCompile,
   onEvaluate,
+  onOpenSettings,
   onOpenTasks,
 }: {
   activeCompile: number | null
+  activeQuery: number | null
   onSelectCompile: (id: number) => void
+  onOpenCompile: (compileId: number) => void
   onEvaluate: (queryId: number) => void
+  onOpenSettings: () => void
   onOpenTasks: () => void
 }) {
   const compiles = useAsync(() => api.compiles(), [])
-  const [openQuery, setOpenQuery] = useState<number | null>(null)
+  const [openQuery, setOpenQuery] = useState<number | null>(activeQuery)
   const cleanup = useAction<unknown>()
+  const retry = useAction<unknown>()
 
   const runs = compiles.data?.compiles ?? []
+  useEffect(() => {
+    if (activeQuery !== null) setOpenQuery(activeQuery)
+  }, [activeQuery])
   usePoll(
     runs.some((c) => c.queries.some((q) => q.status === 'running')),
     compiles.reload,
@@ -54,6 +66,7 @@ export function Query({
       <h2>查询层</h2>
 
       {cleanup.error && <Failed error={cleanup.error} />}
+      {retry.error && <Failed error={retry.error} />}
 
       {ready.length === 0 ? (
         <div className="note warn">
@@ -77,6 +90,7 @@ export function Query({
           {compile && (
             <NewQuery
               compile={compile}
+              onOpenSettings={onOpenSettings}
               onStarted={() => {
                 compiles.reload()
                 onOpenTasks()
@@ -93,10 +107,11 @@ export function Query({
             <thead>
               <tr>
                 <th>名称</th>
-                <th>配置组</th>
+                <th>Answer 模型</th>
                 <th>状态</th>
                 <th className="num">样本数</th>
                 <th className="num">成功</th>
+                <th className="num">并发</th>
                 <th>耗时</th>
                 <th />
               </tr>
@@ -104,6 +119,7 @@ export function Query({
             <tbody>
               {compile.queries.map((run) => {
                 const stats = Object.values(run.stats)
+                const failures = stats.reduce((sum, entry) => sum + entry.failures, 0)
                 const mean = stats.length
                   ? stats.reduce((sum, s) => sum + (s.latency_mean ?? 0), 0) / stats.length
                   : null
@@ -118,6 +134,7 @@ export function Query({
                     </td>
                   <td className="num">{run.sample_count}</td>
                   <td className="num">{run.success_count}</td>
+                  <td className="num mono">{run.concurrency}</td>
                     <td>
                       <Timing
                         startedAt={run.created_at}
@@ -141,6 +158,25 @@ export function Query({
                         >
                           去评测
                         </button>
+                        <button className="action small" onClick={() => onOpenCompile(run.compile_id)}>
+                          回到编译
+                        </button>
+                        {failures > 0 && (
+                          <button
+                            className="action small primary"
+                            disabled={retry.busy}
+                            onClick={() =>
+                              retry.run(async () => {
+                                const task = await api.retryFailedQuery(run.id)
+                                compiles.reload()
+                                onOpenTasks()
+                                return task
+                              })
+                            }
+                          >
+                            重试失败（{failures}）
+                          </button>
+                        )}
                         <CleanupButton
                           what={`查询 ${run.name}`}
                           detail="响应与它下面的评测、归因都会从数据库删除。"
@@ -169,15 +205,39 @@ export function Query({
   )
 }
 
-function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () => void }) {
+function NewQuery({
+  compile,
+  onStarted,
+  onOpenSettings,
+}: {
+  compile: CompileRun
+  onStarted: () => void
+  onOpenSettings: () => void
+}) {
+  const models = useAsync(() => api.akashaModels('answer'), [])
   const [selected, setSelected] = useState<string[]>(compile.datasets)
   const [name, setName] = useState('')
   const [limit, setLimit] = useState<number | ''>('')
   const [threshold, setThreshold] = useState<number | ''>('')
   const [concurrency, setConcurrency] = useState(1)
+  const [answerModelId, setAnswerModelId] = useState<number | ''>('')
   const start = useAction<unknown>()
 
   const available = Object.keys(compile.stats)
+  const answerModels = models.data?.models ?? []
+
+  useEffect(() => {
+    if (answerModels.length === 0) {
+      setAnswerModelId('')
+      return
+    }
+    if (!answerModels.some((entry) => entry.id === answerModelId)) {
+      setAnswerModelId(answerModels[0]!.id)
+    }
+  }, [answerModels, answerModelId])
+
+  if (models.loading) return <Loading what="Answer 模型配置" />
+  if (models.error) return <Failed error={models.error} />
 
   return (
     <div style={{ marginTop: 12 }}>
@@ -195,6 +255,21 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
       <div className="row" style={{ marginTop: 10 }}>
         <Field label="查询名称" hint="留空自动生成">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="自动" />
+        </Field>
+        <Field label="Answer 模型" hint="选择即在查询启动时应用到 Akasha">
+          <select
+            value={answerModelId}
+            onChange={(event) =>
+              setAnswerModelId(event.target.value === '' ? '' : Number(event.target.value))
+            }
+          >
+            <option value="">未选择</option>
+            {answerModels.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.label} · {entry.model}
+              </option>
+            ))}
+          </select>
         </Field>
         <Field label="每组样本数" hint="留空则跑全部">
           <input
@@ -228,13 +303,14 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
       <div className="panel-actions">
         <button
           className="action primary"
-          disabled={start.busy || selected.length === 0}
+          disabled={start.busy || selected.length === 0 || answerModelId === ''}
           onClick={() =>
             start.run(async () => {
               const task = await api.startTask('query', {
                 compile_id: compile.id,
                 datasets: selected,
                 concurrency,
+                answer_model_id: answerModelId,
                 ...(name.trim() ? { name: name.trim() } : {}),
                 ...(limit === '' ? {} : { sample_limit: limit }),
                 ...(threshold === '' ? {} : { score_threshold: threshold }),
@@ -244,9 +320,17 @@ function NewQuery({ compile, onStarted }: { compile: CompileRun; onStarted: () =
             })
           }
         >
-          {start.busy ? '启动中…' : '开始查询'}
+          {start.busy ? '应用模型并启动中…' : '应用模型并开始查询'}
         </button>
       </div>
+      {answerModels.length === 0 && (
+        <div className="note warn">
+          还没有 Answer 模型配置。
+          <button className="action small" style={{ marginLeft: 8 }} onClick={onOpenSettings}>
+            去设置
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -263,6 +347,17 @@ function Responses({ queryId }: { queryId: number }) {
     () => api.responses(queryId, { answer_mode: mode || undefined, q, limit, offset }),
     [queryId, mode, q, offset],
   )
+  const nav = usePagedRecordNavigation({
+    items: data?.responses ?? [],
+    total: data?.total ?? 0,
+    responseOffset: data?.offset ?? offset,
+    offset,
+    limit,
+    selectedKey: sampleId,
+    itemKey: (row) => row.sample_id,
+    onSelect: (row) => setSampleId(row.sample_id),
+    onOffsetChange: setOffset,
+  })
 
   // 完整响应覆盖整个列表框，带返回按钮。
   if (sampleId) {
@@ -272,9 +367,17 @@ function Responses({ queryId }: { queryId: number }) {
           <h3 style={{ margin: 0 }}>
             查询 #{queryId} · 样本 {sampleId}
           </h3>
-          <button className="action small" onClick={() => setSampleId(null)}>
-            ← 返回响应列表
-          </button>
+          <RecordNav
+            hasPrevious={nav.hasPrevious}
+            hasNext={nav.hasNext}
+            onPrevious={nav.previous}
+            onNext={nav.next}
+            onBack={() => setSampleId(null)}
+            backLabel="返回响应列表"
+            position={nav.position}
+            total={data?.total ?? 0}
+            busy={loading || nav.navigating}
+          />
         </div>
         <FullResponse key={sampleId} queryId={queryId} sampleId={sampleId} />
       </div>

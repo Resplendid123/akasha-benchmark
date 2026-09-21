@@ -6,7 +6,7 @@ import sqlite3
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .db import utc_now
+from .db import dumps, loads, utc_now
 
 CONNECTION_FIELDS = (
     "base_url",
@@ -15,15 +15,11 @@ CONNECTION_FIELDS = (
     "database_url",
     "timeout_seconds",
     "request_interval_seconds",
-    "poll_interval_seconds",
-    "poll_timeout_seconds",
 )
 
 _FLOATS = {
     "timeout_seconds",
     "request_interval_seconds",
-    "poll_interval_seconds",
-    "poll_timeout_seconds",
 }
 
 ROLES = ("judge", "attribution")
@@ -89,7 +85,6 @@ def upsert_provider(
     base_url: str,
     model: str,
     api_key: str,
-    concurrency: int = 1,
     provider_id: int | None = None,
 ) -> int:
     """存一个端点。给了 ``provider_id`` 就改那一行（可改 label），否则按
@@ -100,26 +95,24 @@ def upsert_provider(
         connection.execute(
             """
             UPDATE model_provider
-               SET label = ?, base_url = ?, model = ?, api_key = ?,
-                   concurrency = ?, updated_at = ?
+               SET label = ?, base_url = ?, model = ?, api_key = ?, updated_at = ?
              WHERE id = ? AND role = ?
             """,
-            (label, base_url, model, api_key, concurrency, utc_now(), provider_id, role),
+            (label, base_url, model, api_key, utc_now(), provider_id, role),
         )
         return provider_id
     connection.execute(
         """
         INSERT INTO model_provider
-            (role, label, base_url, model, api_key, concurrency, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (role, label, base_url, model, api_key, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(role, label) DO UPDATE SET
             base_url = excluded.base_url,
             model = excluded.model,
             api_key = excluded.api_key,
-            concurrency = excluded.concurrency,
             updated_at = excluded.updated_at
         """,
-        (role, label, base_url, model, api_key, concurrency, utc_now()),
+        (role, label, base_url, model, api_key, utc_now()),
     )
     row = connection.execute(
         "SELECT id FROM model_provider WHERE role = ? AND label = ?", (role, label)
@@ -214,3 +207,78 @@ def set_selected_group(connection: sqlite3.Connection, group_id: int) -> None:
     connection.execute(
         "UPDATE akasha_config_group SET selected = 1 WHERE id = ?", (group_id,)
     )
+
+
+# --- Akasha 独立模型配置 ---
+
+AKASHA_FEATURES = ("compiler", "embedding", "answer", "image")
+
+
+def list_akasha_models(
+    connection: sqlite3.Connection, feature: str | None = None
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM akasha_model_provider"
+    params: tuple[Any, ...] = ()
+    if feature is not None:
+        sql += " WHERE feature = ?"
+        params = (feature,)
+    return [
+        dict(row)
+        for row in connection.execute(sql + " ORDER BY feature, label, id", params)
+    ]
+
+
+def get_akasha_model(connection: sqlite3.Connection, model_id: int) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT * FROM akasha_model_provider WHERE id = ?", (model_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_akasha_model(
+    connection: sqlite3.Connection,
+    *,
+    feature: str,
+    label: str,
+    base_url: str,
+    model: str,
+    api_key: str,
+    parameters: dict[str, Any] | None = None,
+    model_id: int | None = None,
+) -> int:
+    if feature not in AKASHA_FEATURES:
+        raise ValueError(f"feature must be one of {AKASHA_FEATURES}")
+    values = (feature, label, base_url, model, api_key, dumps(parameters or {}), utc_now())
+    if model_id is not None:
+        connection.execute(
+            """
+            UPDATE akasha_model_provider
+               SET feature=?, label=?, base_url=?, model=?, api_key=?,
+                   parameters_json=?, updated_at=?
+             WHERE id=?
+            """,
+            (*values, model_id),
+        )
+        return model_id
+    connection.execute(
+        """
+        INSERT INTO akasha_model_provider
+            (feature, label, base_url, model, api_key, parameters_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(feature, label) DO UPDATE SET
+            base_url=excluded.base_url, model=excluded.model, api_key=excluded.api_key,
+            parameters_json=excluded.parameters_json, updated_at=excluded.updated_at
+        """,
+        values,
+    )
+    row = connection.execute(
+        "SELECT id FROM akasha_model_provider WHERE feature=? AND label=?",
+        (feature, label),
+    ).fetchone()
+    return int(row["id"])
+
+
+def delete_akasha_model(connection: sqlite3.Connection, model_id: int) -> int:
+    return connection.execute(
+        "DELETE FROM akasha_model_provider WHERE id=?", (model_id,)
+    ).rowcount

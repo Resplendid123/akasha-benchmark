@@ -1,7 +1,7 @@
 """Akasha 四项模型配置的规范化与比对。
 
-编译时固化一份快照，查询前与当前配置比对；embedding 不一致时拒绝执行，
-避免使用与当前 embedding 配置不匹配的编译产物。
+编译时固化一份快照，查询前与当前配置逐项比对；所有差异只用于告警和
+标记可比性，不阻断查询。
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def matches(left: Any, right: Any, feature: str) -> bool:
 
 
 def drift(current: Any, snapshot: Any) -> dict[str, bool]:
-    """哪些项与快照不一致。查询层对 ``embedding`` 不一致拒绝执行。"""
+    """哪些项与快照不一致；差异用于告警，不阻断查询。"""
     return {feature: not matches(current, snapshot, feature) for feature in FEATURES}
 
 

@@ -97,11 +97,17 @@ export function App() {
         {view === 'query' && (
           <Query
             activeCompile={compileId}
+            activeQuery={queryId}
             onSelectCompile={selectCompile}
+            onOpenCompile={(id) => {
+              selectCompile(id)
+              setView('compile')
+            }}
             onEvaluate={(id) => {
               selectQuery(id)
               setView('evaluate')
             }}
+            onOpenSettings={() => setView('settings')}
             onOpenTasks={openTasks}
           />
         )}
@@ -111,6 +117,12 @@ export function App() {
             activeEval={evalId}
             onSelectQuery={selectQuery}
             onSelectEval={setEvalId}
+            onOpenQuery={(compileId, queryId) => {
+              setCompileId(compileId)
+              setQueryId(queryId)
+              setEvalId(null)
+              setView('query')
+            }}
             onAttribute={(id) => {
               setEvalId(id)
               setView('attribution')
@@ -123,6 +135,11 @@ export function App() {
           <Attribution
             activeEval={evalId}
             onSelectEval={setEvalId}
+            onOpenEval={(queryId, evalId) => {
+              setQueryId(queryId)
+              setEvalId(evalId)
+              setView('evaluate')
+            }}
             onOpenSettings={() => setView('settings')}
             onOpenTasks={openTasks}
           />

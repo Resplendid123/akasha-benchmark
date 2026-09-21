@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 
 from ..akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
+from ..akasha_configs import apply_models, selection_snapshot
 from ..config import AkashaConfig, load_config
 from ..datasets import (
     DATASET_NAMES,
@@ -37,7 +38,7 @@ from ..datasets import (
     SubsetStrategy,
     get_adapter,
 )
-from ..store import compile_store, config_store, data_store, dumps, transaction
+from ..store import compile_store, data_store, dumps, transaction
 from ..task import Paused, TaskContext
 
 DEFAULT_QA_LIMIT = 20
@@ -45,6 +46,8 @@ DEFAULT_NEGATIVES_RATIO = 1.0
 DEFAULT_NARRATIVEQA_DOCS = 2
 DEFAULT_IMPORT_CONCURRENCY = 4
 MAX_IMPORT_CONCURRENCY = 16
+POLL_INTERVAL_SECONDS = 30.0
+POLL_TIMEOUT_SECONDS = 7200.0
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MARKDOWN_HEADING = re.compile(r"^\s*#+\s*.*$", re.MULTILINE)
 
@@ -113,6 +116,7 @@ def build_subset(
     seed: int,
     qa_limit: int,
     negatives_ratio: float,
+    sample_ids: list[str] | None = None,
     full_corpus: bool = False,
     narrativeqa_docs: int = DEFAULT_NARRATIVEQA_DOCS,
 ) -> dict[str, Any]:
@@ -122,6 +126,14 @@ def build_subset(
         raise ValueError(f"{adapter.name} 还没归一化")
 
     samples = data_store.samples_of(connection, adapter.name)
+    if sample_ids:
+        requested = list(dict.fromkeys(sample_ids))
+        by_sample_id = {sample["sample_id"]: sample for sample in samples}
+        missing = [sample_id for sample_id in requested if sample_id not in by_sample_id]
+        if missing:
+            raise ValueError(f"{adapter.name}: 找不到指定样本 {missing}")
+        samples = [by_sample_id[sample_id] for sample_id in requested]
+        qa_limit = len(samples)
     corpus = data_store.corpus_of(connection, adapter.name)
     by_id = {doc["doc_id"]: doc for doc in corpus}
     usable_doc_ids = {
@@ -139,7 +151,14 @@ def build_subset(
     if strategy in gold_strategies and not adapter.has(DataDependency.GOLD_DOCS):
         raise ValueError(f"{adapter.name}: 策略 {strategy.value!r} 需要 gold 标注，但本组没有")
 
-    if full_corpus:
+    if sample_ids and strategy in gold_strategies:
+        picked = samples
+        gold_ids = sorted({doc_id for sample in picked for doc_id in sample["gold_doc_ids"]})
+        pool = sorted(usable_doc_ids - set(gold_ids))
+        wanted = round(len(gold_ids) * negatives_ratio)
+        negatives = sorted(rng.sample(pool, min(wanted, len(pool))))
+        doc_ids = sorted(set(gold_ids) | set(negatives))
+    elif full_corpus:
         # 显式全量语料：QA 仍受 qa_limit 控制，语料不再按 gold/负样本抽样。
         doc_ids = sorted(usable_doc_ids)
         picked = sorted(
@@ -247,13 +266,17 @@ def _wait_for_compile(
     expected_run_ids: set[str] | None = None,
     baseline_run_ids: set[str] | None = None,
     baseline_sequence: int = 0,
+    progress_page_ids: set[str] | None = None,
+    progress_note: str = "编译语料",
+    progress_offset: int = 0,
+    progress_total: int | None = None,
 ) -> dict[str, Any]:
     """轮询到全部编译 Run 终态，返回 ``{status_counts, no_runs, timed_out}``。
 
     空的 ``statusCounts`` 与「全部终态」分开报：两者的 ``active`` 都是 0，
     但前者是压根没编译。``expect_runs`` 为 0 且看不到 Run 时立即返回。
     """
-    deadline = time.monotonic() + config.poll_timeout_seconds
+    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     baseline_run_ids = baseline_run_ids or set()
     expected_run_ids = expected_run_ids or set()
     while True:
@@ -309,11 +332,22 @@ def _wait_for_compile(
             progress = {}
             active = sum(n for name, n in counts.items() if name in ACTIVE_RUN_STATUSES)
 
-        if current and progress.get("expected"):
+        target_progress = (
+            _target_run_progress(ctx, client, current, progress_page_ids) if current else None
+        )
+        shown_progress = target_progress or progress
+        if current and shown_progress.get("expected"):
+            detail = (
+                f"（成功 {shown_progress['succeeded']}，失败 {shown_progress['failed']}，"
+                f"跳过 {shown_progress['skipped']}）"
+            )
             ctx.progress(
-                progress["succeeded"] + progress["skipped"] + progress["failed"],
-                progress["expected"],
-                "编译语料",
+                progress_offset
+                + shown_progress["succeeded"]
+                + shown_progress["skipped"]
+                + shown_progress["failed"],
+                progress_total or shown_progress["expected"],
+                progress_note + detail,
             )
         elif counts:
             ctx.progress(0, None, "等待远端编译")
@@ -323,7 +357,7 @@ def _wait_for_compile(
                 "no_runs": False,
                 "timed_out": False,
                 "runs": current,
-                "progress": progress,
+                "progress": shown_progress,
             }
         if not counts and expect_runs == 0:
             return {"status_counts": counts, "no_runs": True, "timed_out": False}
@@ -331,7 +365,68 @@ def _wait_for_compile(
             return {"status_counts": counts, "no_runs": not counts, "timed_out": True}
         if not counts:
             ctx.progress(0, None, "等待远端编译")
-        time.sleep(config.poll_interval_seconds)
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _target_run_progress(
+    ctx: TaskContext,
+    client: AkashaClient,
+    runs: list[dict[str, Any]],
+    progress_page_ids: set[str] | None = None,
+) -> dict[str, int] | None:
+    """只统计本次 compile_doc 对应的远端逐页记录。"""
+    compile_id = ctx.target("compile")
+    if compile_id is None:
+        return None
+    all_target_ids = {
+        str(row["page_id"])
+        for row in compile_store.compile_docs(ctx.db, compile_id)
+        if row.get("page_id")
+    }
+    target_ids = progress_page_ids or all_target_ids
+    if not target_ids:
+        return None
+
+    statuses: dict[str, str] = {}
+    try:
+        for run in runs:
+            run_id = str(run.get("runId") or run.get("id") or "")
+            if not run_id:
+                continue
+            page = 1
+            while True:
+                result = client.run_pages(run_id, page=page, limit=100)
+                items = result.get("items") or []
+                for item in items:
+                    page_id = str(item.get("sourcePageId") or "")
+                    if page_id in target_ids:
+                        statuses[page_id] = str(item.get("status") or "pending")
+                total = int(result.get("total") or 0)
+                page_limit = int(result.get("limit") or 100)
+                if not items or page * page_limit >= total:
+                    break
+                page += 1
+    except (AkashaError, OSError):
+        return None
+
+    if not statuses:
+        return None
+    remote_expected = sum(
+        int((run.get("progress") or {}).get("text", {}).get("expected") or 0)
+        for run in runs
+    )
+    expected = len(target_ids)
+    if progress_page_ids is None and 0 < remote_expected < len(all_target_ids):
+        # 续跑接管的是 retry-pages 子集 Run；逐页记录本身就是本轮目标集合。
+        expected = len(statuses)
+    return {
+        "expected": expected,
+        "succeeded": sum(status == "succeeded" for status in statuses.values()),
+        "failed": sum(status == "failed" for status in statuses.values()),
+        "skipped": sum(
+            status in {"skipped", "cancelled"} for status in statuses.values()
+        ),
+    }
 
 
 def _page_failures(client: AkashaClient, space_id: str) -> list[str]:
@@ -412,6 +507,119 @@ def _progress_of(runs: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _retry_batches(
+    ctx: TaskContext,
+    client: AkashaClient,
+    space_id: str,
+    config: AkashaConfig,
+    failed_page_ids: list[str] | None = None,
+) -> tuple[dict[str, Any], int]:
+    """串行提交重试批次，并把跨重启状态持久化到任务参数。"""
+    if failed_page_ids is not None:
+        pending = list(dict.fromkeys(failed_page_ids))
+        current: list[str] = []
+        current_run_ids: list[str] = []
+        all_run_ids: list[str] = []
+        completed = 0
+        total = len(pending)
+        aggregate = {"expected": total, "succeeded": 0, "failed": 0, "skipped": 0}
+    else:
+        pending = [str(value) for value in ctx.params.get("retry_pending_page_ids") or []]
+        current = [str(value) for value in ctx.params.get("retry_current_page_ids") or []]
+        current_run_ids = [
+            str(value) for value in ctx.params.get("retry_current_run_ids") or []
+        ]
+        all_run_ids = [str(value) for value in ctx.params.get("retry_run_ids") or []]
+        completed = int(ctx.params.get("retry_completed") or 0)
+        total = int(ctx.params.get("retry_total") or len(pending) + len(current))
+        aggregate = dict(
+            ctx.params.get("retry_progress")
+            or {"expected": total, "succeeded": 0, "failed": 0, "skipped": 0}
+        )
+
+    wait: dict[str, Any] = {
+        "status_counts": {},
+        "no_runs": False,
+        "timed_out": False,
+        "runs": [],
+        "progress": aggregate,
+    }
+    while current or pending:
+        ctx.checkpoint()
+        if not current:
+            current = pending[:100]
+            pending = pending[100:]
+            result = client.retry_pages(current)
+            current_run_ids = [str(value) for value in result.get("jobIds") or []]
+            if not current_run_ids:
+                raise RuntimeError(
+                    f"Akasha 已接收 {len(current)} 篇失败页面，但没有返回重试 Run ID"
+                )
+            all_run_ids.extend(
+                run_id for run_id in current_run_ids if run_id not in all_run_ids
+            )
+            ctx.log(
+                f"批量重试 {completed + 1}-{completed + len(current)} / {total}，"
+                f"远端 Run {', '.join(current_run_ids)}"
+            )
+            ctx.freeze(
+                remote_compile_run_ids=current_run_ids,
+                retry_pending_page_ids=pending,
+                retry_current_page_ids=current,
+                retry_current_run_ids=current_run_ids,
+                retry_run_ids=all_run_ids,
+                retry_completed=completed,
+                retry_total=total,
+                retry_progress=aggregate,
+            )
+
+        wait = _wait_for_compile(
+            ctx,
+            client,
+            space_id,
+            config,
+            expect_runs=len(current_run_ids),
+            expected_run_ids=set(current_run_ids),
+            progress_page_ids=set(current),
+            progress_note="重试失败语料",
+            progress_offset=completed,
+            progress_total=total,
+        )
+        if wait["no_runs"] or wait["timed_out"]:
+            return wait, len(all_run_ids)
+
+        batch_progress = wait.get("progress") or {}
+        for key in ("succeeded", "failed", "skipped"):
+            aggregate[key] = int(aggregate.get(key) or 0) + int(batch_progress.get(key) or 0)
+        completed += len(current)
+        current = []
+        current_run_ids = []
+        aggregate["expected"] = total
+        wait["progress"] = dict(aggregate)
+        ctx.freeze(
+            remote_compile_run_ids=all_run_ids,
+            retry_pending_page_ids=pending,
+            retry_current_page_ids=[],
+            retry_current_run_ids=[],
+            retry_run_ids=all_run_ids,
+            retry_completed=completed,
+            retry_total=total,
+            retry_progress=aggregate,
+        )
+
+    ctx.freeze(
+        remote_compile_run_ids=all_run_ids,
+        retry_pending_page_ids=[],
+        retry_current_page_ids=[],
+        retry_current_run_ids=[],
+        retry_run_ids=[],
+        retry_completed=0,
+        retry_total=0,
+        retry_progress={},
+    )
+    return wait, len(all_run_ids)
+
+
 def run(ctx: TaskContext) -> None:
     params = ctx.params
     datasets = list(params.get("datasets") or [])
@@ -423,9 +631,17 @@ def run(ctx: TaskContext) -> None:
 
     seed = int(params["seed"]) if params.get("seed") is not None else default_seed()
     qa_limit = int(params.get("qa_limit") or DEFAULT_QA_LIMIT)
+    sample_ids = [str(value) for value in params.get("sample_ids") or []]
     negatives_ratio = float(params.get("negatives_ratio", DEFAULT_NEGATIVES_RATIO))
     full_corpus = bool(params.get("full_corpus", False))
     import_concurrency = int(params.get("import_concurrency") or DEFAULT_IMPORT_CONCURRENCY)
+    model_ids = {
+        feature: int(params[f"{feature}_model_id"])
+        for feature in ("compiler", "embedding", "image")
+        if params.get(f"{feature}_model_id")
+    }
+    if model_ids and len(model_ids) != 3:
+        raise ValueError("编译需要同时选择 compiler、embedding、image 三项模型配置")
     if qa_limit < 1:
         raise ValueError("每个数据集的 QA 数必须大于 0")
     if negatives_ratio < 0:
@@ -437,15 +653,25 @@ def run(ctx: TaskContext) -> None:
     config.require_credentials()
 
     compile_id = ctx.target("compile")
+    if compile_id is not None and not model_ids:
+        existing_run = compile_store.get_compile_run(ctx.db, compile_id) or {}
+        restored = {
+            feature: existing_run.get(f"{feature}_model_id")
+            for feature in ("compiler", "embedding", "image")
+        }
+        if all(restored.values()):
+            model_ids = {feature: int(model_id) for feature, model_id in restored.items()}
     run_id = str(params.get("run_id") or "").strip() or f"run{uuid.uuid4().hex[:10]}"
     ctx.freeze(
         run_id=run_id,
         datasets=datasets,
         seed=seed,
         qa_limit=qa_limit,
+        sample_ids=sample_ids,
         negatives_ratio=negatives_ratio,
         full_corpus=full_corpus,
         import_concurrency=import_concurrency,
+        **{f"{feature}_model_id": model_id for feature, model_id in model_ids.items()},
     )
     if compile_id is None:
         if compile_store.compile_run_by_run_id(ctx.db, run_id):
@@ -468,9 +694,11 @@ def run(ctx: TaskContext) -> None:
         datasets,
         seed,
         qa_limit,
+        sample_ids,
         negatives_ratio,
         full_corpus,
         import_concurrency,
+        model_ids,
         config,
     )
 
@@ -482,9 +710,11 @@ def _execute(
     datasets: list[str],
     seed: int,
     qa_limit: int,
+    sample_ids: list[str],
     negatives_ratio: float,
     full_corpus: bool,
     import_concurrency: int,
+    model_ids: dict[str, int],
     config: AkashaConfig,
 ) -> None:
     # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档，
@@ -499,6 +729,7 @@ def _execute(
                 dataset,
                 seed=seed,
                 qa_limit=qa_limit,
+                sample_ids=sample_ids,
                 negatives_ratio=negatives_ratio,
                 full_corpus=full_corpus,
             )
@@ -512,6 +743,15 @@ def _execute(
 
     with AkashaClient(config) as client:
         client.login()
+        selected_models = apply_models(ctx.db, client, model_ids) if model_ids else {}
+        if selected_models:
+            ctx.log(
+                "已整体应用编译配置："
+                + "，".join(
+                    f"{feature}={record['label']}"
+                    for feature, record in selected_models.items()
+                )
+            )
         me = client.current_user()
         user = (me or {}).get("user") or {}
         workspace = (me or {}).get("workspace") or {}
@@ -524,6 +764,17 @@ def _execute(
 
         record = compile_store.get_compile_run(ctx.db, compile_id) or {}
         space_id = record.get("space_id")
+        if selected_models:
+            compile_store.update_compile_run(
+                ctx.db,
+                compile_id,
+                compiler_model_id=selected_models["compiler"]["id"],
+                embedding_model_id=selected_models["embedding"]["id"],
+                image_model_id=selected_models["image"]["id"],
+                model_selection_json=dumps(selection_snapshot(selected_models)),
+                model_configs_json=dumps(client.get_model_configs()),
+            )
+            ctx.db.commit()
         if not space_id:
             # 随机 slug，把这次编译的空间与用户自己的空间分开。
             slug = f"bench{uuid.uuid4().hex[:16]}"
@@ -535,14 +786,12 @@ def _execute(
             space_id = space.get("id")
             if not space_id:
                 raise RuntimeError(f"创建空间未返回 id：{space!r}")
-            group = config_store.selected_config_group(ctx.db)
             compile_store.update_compile_run(
                 ctx.db,
                 compile_id,
                 space_id=space_id,
                 space_name=slug,
                 workspace_id=workspace.get("id"),
-                config_group=group["label"] if group else None,
                 model_configs_json=dumps(client.get_model_configs()),
             )
             ctx.db.commit()
@@ -577,9 +826,16 @@ def _execute(
             for run in previous_runs
             if str(run.get("status") or "") in ACTIVE_RUN_STATUSES
         ]
+        retry_in_progress = bool(
+            ctx.params.get("retry_current_page_ids")
+            or ctx.params.get("retry_pending_page_ids")
+        )
 
         ctx.checkpoint()
-        if active_previous:
+        if retry_in_progress:
+            wait, accepted = _retry_batches(ctx, client, space_id, config)
+            coalesced = 0
+        elif active_previous:
             remote_run_ids = {
                 str(run.get("runId") or run.get("id")) for run in active_previous
             }
@@ -596,33 +852,11 @@ def _execute(
         elif previous_run_ids:
             failed_page_ids = client.retryable_run_page_ids(previous_run_ids)
             if failed_page_ids:
-                result = client.retry_pages(failed_page_ids)
-                remote_run_ids = {str(value) for value in result.get("jobIds") or []}
-                if not remote_run_ids:
-                    raise RuntimeError(
-                        f"Akasha 已接收 {len(failed_page_ids)} 篇失败页面，但没有返回重试 Run ID"
-                    )
-                ctx.freeze(remote_compile_run_ids=sorted(remote_run_ids))
-                ctx.log(
-                    f"批量重试 {len(failed_page_ids)} 篇失败页面，"
-                    f"远端 Run {', '.join(sorted(remote_run_ids))}"
+                ctx.progress(0, len(failed_page_ids), "重试失败语料")
+                wait, accepted = _retry_batches(
+                    ctx, client, space_id, config, failed_page_ids
                 )
-                if ctx.pause_requested:
-                    for remote_run_id in remote_run_ids:
-                        client.cancel_compile_run(
-                            remote_run_id,
-                            "Akasha-Benchmark task paused during retry submission",
-                        )
-                    ctx.checkpoint()
-                accepted, coalesced = len(remote_run_ids), 0
-                wait = _wait_for_compile(
-                    ctx,
-                    client,
-                    space_id,
-                    config,
-                    expect_runs=len(remote_run_ids),
-                    expected_run_ids=remote_run_ids,
-                )
+                coalesced = 0
             elif previous_runs and all(
                 str(run.get("status") or "") == "cancelled"
                 and not int((run.get("progress") or {}).get("text", {}).get("expected") or 0)
@@ -709,7 +943,7 @@ def _execute(
             )
         if wait["timed_out"]:
             raise RuntimeError(
-                f"编译轮询超时（{config.poll_timeout_seconds}s），"
+                f"编译轮询超时（{POLL_TIMEOUT_SECONDS}s），"
                 f"状态 {wait['status_counts']}。此时查询会得到偏低但不报错的指标。"
             )
         ctx.log(f"编译终态：{wait['status_counts']}")

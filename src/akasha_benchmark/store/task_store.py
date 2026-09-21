@@ -105,15 +105,40 @@ def get_task(connection: sqlite3.Connection, task_id: int) -> dict[str, Any] | N
 
 
 def list_tasks(
-    connection: sqlite3.Connection, *, status: str | None = None, limit: int = 100
+    connection: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     sql = "SELECT * FROM task"
     params: list[Any] = []
     if status:
         sql += " WHERE status = ?"
         params.append(status)
-    params.append(limit)
-    return [_task(row) for row in connection.execute(sql + " ORDER BY id DESC LIMIT ?", params)]
+    params.extend((limit, offset))
+    return [
+        _task(row)
+        for row in connection.execute(sql + " ORDER BY id DESC LIMIT ? OFFSET ?", params)
+    ]
+
+
+def count_tasks(connection: sqlite3.Connection, *, status: str | None = None) -> int:
+    sql = "SELECT COUNT(*) AS n FROM task"
+    params: list[Any] = []
+    if status:
+        sql += " WHERE status = ?"
+        params.append(status)
+    row = connection.execute(sql, params).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def count_inactive_tasks(connection: sqlite3.Connection) -> int:
+    marks = ", ".join("?" for _ in ACTIVE)
+    row = connection.execute(
+        f"SELECT COUNT(*) AS n FROM task WHERE status NOT IN ({marks})", ACTIVE
+    ).fetchone()
+    return int(row["n"] if row else 0)
 
 
 def active_tasks(connection: sqlite3.Connection) -> list[dict[str, Any]]:

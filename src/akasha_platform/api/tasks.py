@@ -28,10 +28,21 @@ def stages() -> list[dict[str, Any]]:
 
 @router.get("/tasks")
 def list_tasks(
-    request: Request, status: str | None = None, limit: int = Query(50, ge=1, le=500)
-) -> list[dict[str, Any]]:
+    request: Request,
+    status: str | None = None,
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
     with db(request) as connection:
-        return task_store.list_tasks(connection, status=status, limit=limit)
+        return {
+            "total": task_store.count_tasks(connection, status=status),
+            "inactive_total": task_store.count_inactive_tasks(connection),
+            "limit": limit,
+            "offset": offset,
+            "tasks": task_store.list_tasks(
+                connection, status=status, limit=limit, offset=offset
+            ),
+        }
 
 
 @router.get("/tasks/{task_id}")

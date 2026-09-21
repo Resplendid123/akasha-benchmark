@@ -174,7 +174,7 @@ function RawPreview({ dataset, kind }: { dataset: string; kind: 'qa' | 'corpus' 
         />
       </div>
       <pre className="block tall">{row ? JSON.stringify(row, null, 2) : '（没有内容）'}</pre>
-      <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} />
+      <Pager total={data.total} offset={offset} limit={limit} onChange={setOffset} itemLabels />
     </div>
   )
 }

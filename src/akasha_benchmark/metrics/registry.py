@@ -95,37 +95,22 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         "被截断掉的 gold 篇数",
         higher_is_better=False,
     ),
-    _definition(
-        "evidence_verifiable_rate", FAMILY_ATTRIBUTION, _GOLD, "有证据窗口可核对的引用占比"
-    ),
     # --- 多跳 ---
-    _definition("graph_neighbor_share", FAMILY_MULTIHOP, _GOLD, "图扩展产出的 snippet 占比"),
-    _definition("graph_neighbor_precision", FAMILY_MULTIHOP, _GOLD, "图扩展 snippet 的 gold 命中率"),
     _definition(
         "graph_exclusive_gold_share",
         FAMILY_MULTIHOP,
         _GOLD,
         "只靠图扩展才能到达的 gold 占比，即图边的净增量价值",
     ),
+    _definition(
+        "graph_neighbor_precision",
+        FAMILY_MULTIHOP,
+        _GOLD,
+        "按文档去重后，图扩展命中的文档中 gold 所占比例",
+    ),
     # --- 诊断计数：读其他指标时的分母与背景，进 registry 以便 UI 拿到方向声明 ---
     _definition(
-        "retrieved_count", FAMILY_RETRIEVAL, _GOLD, "召回条数，检索精确率的分母", higher_is_better=True
-    ),
-    _definition(
-        "citation_count", FAMILY_ATTRIBUTION, _GOLD, "被引条数，引用精确率的分母"
-    ),
-    _definition(
-        "evidence_entries", FAMILY_ATTRIBUTION, _GOLD, "带证据窗口的引用条数"
-    ),
-    _definition("snippet_count", FAMILY_MULTIHOP, _GOLD, "snippet 条数"),
-    _definition(
-        "graph_neighbor_snippets", FAMILY_MULTIHOP, _GOLD, "图扩展产出的 snippet 条数"
-    ),
-    _definition(
         "graph_neighbor_gold_snippets", FAMILY_MULTIHOP, _GOLD, "图扩展 snippet 里命中 gold 的条数"
-    ),
-    _definition(
-        "graph_exclusive_gold_count", FAMILY_MULTIHOP, _GOLD, "只靠图扩展才拿到的 gold 篇数"
     ),
     # --- judge：除 answer_correctness 外 requires 都是空集，所以四组都成立 ---
     _definition(

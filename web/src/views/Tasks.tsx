@@ -5,6 +5,7 @@ import {
   Bar,
   Failed,
   Loading,
+  Pager,
   STATUS_TEXT,
   StatusTag,
   formatDateTime,
@@ -15,19 +16,28 @@ import {
 
 /** 任务层：实时观测六层的任务，支持暂停、继续、清理。 */
 export function Tasks() {
-  const tasks = useAsync(() => api.tasks(), [])
+  const PAGE_SIZE = 10
+  const [offset, setOffset] = useState(0)
+  const tasks = useAsync(() => api.tasks({ limit: PAGE_SIZE, offset }), [offset])
   const stages = useAsync(() => api.stages(), [])
   const [open, setOpen] = useState<number | null>(null)
   const [showAudit, setShowAudit] = useState(false)
   const cleanup = useAction<{ deleted: number }>()
 
-  const list = tasks.data ?? []
+  const list = tasks.data?.tasks ?? []
   usePoll(
     list.some((t) => t.status === 'running' || t.status === 'queued'),
     tasks.reload,
   )
 
-  const removable = list.filter((t) => t.status !== 'running' && t.status !== 'queued')
+  const removableCount = tasks.data?.inactive_total ?? 0
+
+  useEffect(() => {
+    const total = tasks.data?.total
+    if (total !== undefined && total > 0 && offset >= total) {
+      setOffset(Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE)
+    }
+  }, [offset, tasks.data?.total])
 
   return (
     <>
@@ -44,54 +54,67 @@ export function Tasks() {
           </button>
           <button
             className="action small danger"
-            disabled={removable.length === 0 || cleanup.busy}
+            disabled={removableCount === 0 || cleanup.busy}
             onClick={() => {
               if (!window.confirm('清理所有已结束的任务记录？审计日志会保留。')) return
               cleanup.run(async () => {
                 const result = await api.cleanupTasks()
-                tasks.reload()
+                if (offset === 0) tasks.reload()
+                else setOffset(0)
                 return result
               })
             }}
           >
-            清理已结束（{removable.length}）
+            清理已结束（{removableCount}）
           </button>
         </div>
       </div>
 
-      {cleanup.error && <Failed error={cleanup.error} />}
       {tasks.loading && <Loading what="任务" />}
       {tasks.error && <Failed error={tasks.error} />}
-      {list.length === 0 && !tasks.loading && <p className="muted">还没有任务。</p>}
+      {tasks.data?.total === 0 && !tasks.loading && <p className="muted">还没有任务。</p>}
 
       {list.length > 0 && (
-        <table className="records-table tasks-table">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>阶段</th>
-              <th>状态</th>
-              <th>进度</th>
-              <th>参数</th>
-              <th>开始</th>
-              <th>结束</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {list.map((task) => (
-              <Row
-                key={task.id}
-                task={task}
-                label={stages.data?.find((s) => s.stage === task.stage)?.label ?? task.stage}
-                open={open === task.id}
-                onToggle={() => setOpen(open === task.id ? null : task.id)}
-                onChanged={tasks.reload}
-              />
-            ))}
-          </tbody>
-        </table>
+        <>
+          <table className="records-table tasks-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>阶段</th>
+                <th>状态</th>
+                <th>进度</th>
+                <th>参数</th>
+                <th>开始</th>
+                <th>结束</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {list.map((task) => (
+                <Row
+                  key={task.id}
+                  task={task}
+                  label={stages.data?.find((s) => s.stage === task.stage)?.label ?? task.stage}
+                  open={open === task.id}
+                  onToggle={() => setOpen(open === task.id ? null : task.id)}
+                  onChanged={tasks.reload}
+                />
+              ))}
+            </tbody>
+          </table>
+          <Pager
+            total={tasks.data?.total ?? 0}
+            offset={offset}
+            limit={PAGE_SIZE}
+            onChange={(next) => {
+              setOpen(null)
+              setOffset(next)
+            }}
+          />
+        </>
       )}
+
+      {cleanup.error && <Failed error={cleanup.error} />}
 
       {open !== null && <Logs key={open} taskId={open} onClose={() => setOpen(null)} />}
       {showAudit && <Audit />}

@@ -1,6 +1,11 @@
 -- 数据库最终结构；初始化可重复执行，不负责迁移旧数据库。
 
 -- ------------------------------------------------------------ 配置层
+CREATE TABLE IF NOT EXISTS schema_migration (
+    name       TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS akasha_connection (
     id                       INTEGER PRIMARY KEY CHECK (id = 1),
     base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3001',
@@ -9,8 +14,6 @@ CREATE TABLE IF NOT EXISTS akasha_connection (
     database_url             TEXT NOT NULL DEFAULT 'postgresql://akasha:STRONG_DB_PASSWORD@127.0.0.1:5433/akasha',  -- 只读 PG，归因链路用
     timeout_seconds          REAL NOT NULL DEFAULT 120.0,
     request_interval_seconds REAL NOT NULL DEFAULT 0.5,
-    poll_interval_seconds    REAL NOT NULL DEFAULT 30.0,
-    poll_timeout_seconds     REAL NOT NULL DEFAULT 7200.0,
     updated_at               TEXT NOT NULL
 );
 
@@ -23,18 +26,29 @@ CREATE TABLE IF NOT EXISTS model_provider (
     base_url    TEXT NOT NULL,
     model       TEXT NOT NULL,
     api_key     TEXT NOT NULL DEFAULT '',
-    concurrency INTEGER NOT NULL DEFAULT 1,  -- judge / 归因调用的并发数
     updated_at  TEXT NOT NULL,
     UNIQUE (role, label)
 );
 
--- 本地保存的 Akasha 模型配置组，可整组应用到远端。apiKey 明文存在 configs_json 里。
+-- 本地保存的 Akasha 模型配置组，可整组应用到远端。
 CREATE TABLE IF NOT EXISTS akasha_config_group (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     label        TEXT NOT NULL UNIQUE,
     configs_json TEXT NOT NULL,   -- {feature: {model, baseUrl, apiKey, parameters}}
     selected     INTEGER NOT NULL DEFAULT 0,
     updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS akasha_model_provider (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature         TEXT NOT NULL CHECK (feature IN ('compiler', 'embedding', 'answer', 'image')),
+    label           TEXT NOT NULL,
+    base_url        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    api_key         TEXT NOT NULL DEFAULT '',
+    parameters_json TEXT NOT NULL DEFAULT '{}',
+    updated_at      TEXT NOT NULL,
+    UNIQUE (feature, label)
 );
 
 -- --------------------------------------------- 数据集层 / 归一化层
@@ -78,7 +92,11 @@ CREATE TABLE IF NOT EXISTS compile_run (
     space_id           TEXT,             -- 本次编译随机创建的空间；查询打在它上面
     space_name         TEXT,             -- 随机 slug，只做展示与人工核对
     workspace_id       TEXT,             -- 那个空间属于哪个 workspace
-    config_group       TEXT,             -- 编译时选中的本地配置组标签
+    config_group       TEXT,             -- 旧版配置组标签，仅保留历史兼容
+    compiler_model_id  INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
+    embedding_model_id INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
+    image_model_id     INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
+    model_selection_json TEXT,           -- 本次编译选择的三项独立配置快照
     model_configs_json TEXT,             -- 这一次编译跑在什么模型上
     quality_json       TEXT,             -- missingChunk / missingEmbedding / missingSource / stalePageCount
     pace_json          TEXT,             -- 每篇编译耗时的估算，见 _compile_pace
@@ -112,6 +130,9 @@ CREATE TABLE IF NOT EXISTS query_run (
     compile_id         INTEGER NOT NULL REFERENCES compile_run(id) ON DELETE CASCADE,
     score_threshold    REAL,             -- 空表示用服务端默认值
     concurrency        INTEGER NOT NULL, -- 并发调用数
+    config_group       TEXT,             -- 旧版配置组标签，仅保留历史兼容
+    answer_model_id    INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
+    model_selection_json TEXT,           -- 本次查询选择的 answer 配置快照
     model_configs_json TEXT,             -- 查询时的模型快照
     status             TEXT NOT NULL,    -- running / paused / succeeded / failed
     created_at         TEXT NOT NULL,
@@ -147,6 +168,7 @@ CREATE TABLE IF NOT EXISTS eval_run (
     ks_json           TEXT NOT NULL,  -- recall@k 之类按哪些 k 展开
     metrics_json      TEXT NOT NULL,  -- 这一轮勾了哪些指标（模板名，不带 @k）
     judge_provider_id INTEGER REFERENCES model_provider(id) ON DELETE SET NULL,
+    concurrency       INTEGER NOT NULL DEFAULT 1,
     status            TEXT NOT NULL,  -- running / paused / succeeded / failed
     created_at        TEXT NOT NULL,
     finished_at       TEXT
@@ -217,9 +239,8 @@ CREATE TABLE IF NOT EXISTS attribution_run (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,
     eval_id     INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
-    metric      TEXT NOT NULL,
-    sample_limit INTEGER NOT NULL,
     provider_id INTEGER REFERENCES model_provider(id) ON DELETE SET NULL,
+    concurrency INTEGER NOT NULL DEFAULT 1,
     status      TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     finished_at TEXT

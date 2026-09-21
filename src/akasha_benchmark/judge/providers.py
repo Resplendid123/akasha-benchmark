@@ -28,5 +28,4 @@ def resolve_provider(
         base_url=record["base_url"],
         model=record["model"],
         api_key=record["api_key"],
-        concurrency=max(1, int(record["concurrency"] or 1)),
     )

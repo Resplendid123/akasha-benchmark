@@ -5,15 +5,15 @@
 | 根因                    | 判据                                          |
 | ----------------------- | --------------------------------------------- |
 | not_a_failure           | 答案正确（EM 命中或 judge 判 correct）          |
-| generation_fallback     | answer_mode != knowledge（retrievedSources 空）|
+| generation_fallback     | answer_mode != knowledge                      |
 | compiled_away           | 问题实词落在编译丢掉的词里                     |
 | citation_dropped        | truncated_gold > 0（召回到了但引用被截断）      |
 | retrieval_miss          | hit@k == 0                                    |
 | graph_edge_missing      | gold 不全且图扩展没贡献独有 gold                |
 | gold_annotation_suspect | gold 全召回、引用完整，答案仍判错               |
 
-顺序即优先级。``not_a_failure`` 必须第一（送来的是「最差 N 条」而不是
-「N 条失败」），``generation_fallback`` 第二（否则它那 0 分会被当成检索失败）。
+顺序即优先级。``not_a_failure`` 必须第一（归因覆盖全部样本，健康样本也会进入），
+``generation_fallback`` 第二（否则兜底回答可能被当成检索失败）。
 """
 
 from __future__ import annotations
@@ -33,10 +33,10 @@ CAUSE_UNKNOWN = "unknown"
 
 # 每个根因该怎么处置，含「这条能不能靠调参救」。
 REMEDIES = {
-    CAUSE_NOT_A_FAILURE: "答案是对的，这条排进最差 N 只是因为检索指标低。"
-    "不用查系统 —— 要么它没依赖被漏掉的那篇 gold，要么 F1 被长答案稀释了。",
-    CAUSE_GENERATION_FALLBACK: "生成端拒答，检索指标按定义为 0。不是检索问题，"
-    "先看 answerMode 分布而不是 recall。",
+    CAUSE_NOT_A_FAILURE: "答案是对的，不用查系统 —— 要么它没依赖被漏掉的那篇 "
+    "gold，要么 F1 被长答案稀释了。",
+    CAUSE_GENERATION_FALLBACK: "生成端转入兜底。不是检索问题；新版响应会保留"
+    "未采用的检索结果，应结合 answerMode 与 recall 判断。",
     CAUSE_COMPILED_AWAY: "编译产物里缺少问题中的实词，三条召回路径同时断。"
     "调参救不了 —— 词已经不在被索引的文本里。要改编译提示词或换 compiler。",
     CAUSE_CITATION_DROPPED: "召回到了 gold 但引用被截断。检索没问题，"
@@ -109,7 +109,7 @@ def classify(
     hit = _at_max_k(metrics, "hit@")
     coverage = _at_max_k(metrics, "full_coverage@")
     truncated = float(metrics.get("truncated_gold", 0.0) or 0.0)
-    graph_exclusive = metrics.get("graph_exclusive_gold_count")
+    graph_exclusive = float(metrics.get("graph_exclusive_gold_share", 0.0) or 0.0) > 0
     reference_contained = _contains_reference(
         str(sample.get("answer") or ""),
         [str(value) for value in detail.get("reference_answers") or []],
@@ -126,7 +126,7 @@ def classify(
         "full_coverage": coverage,
         "truncated_gold": truncated,
         "question_terms_lost": lost_terms,
-        "graph_exclusive_gold_count": graph_exclusive,
+        "graph_exclusive_gold_share": metrics.get("graph_exclusive_gold_share"),
         "f1": metrics.get("f1"),
         "faithfulness": metrics.get("faithfulness"),
         "reference_answer_contained": reference_contained,
@@ -166,13 +166,12 @@ SYSTEM_PROMPT = """你在分析一个检索增强问答系统的样本。
 重写时可能删掉原文里的修饰语与专有名词。被删掉的词不在被索引的文本里，
 所以查询命中它们时三条召回路径会同时断，且调参救不回来。
 
-`no_match` 与 `general` 两种回答无条件返回空的 retrievedSources，它们的检索
-得分按定义为 0 —— 是生成端拒答，不是检索失败。
+`no_match` 没有可用检索证据；`general` 可能保留模型未采用的 retrievedSources。
+两者都应先按生成分支解释，不能仅凭 answerMode 判成检索失败。
 
-**这条样本未必是失败的。** 送来分析的是「按某个指标最差的 N 条」，真实失败
-不足 N 条时健康样本也会进来；EM 与 F1 对解释性长答案本就失真，答案正确而
-得分低是常见的。规则分类为 `not_a_failure` 时，narrative 要说明它为什么其实
-没问题，**不要编造一个失败原因**。
+**这条样本未必是失败的。** 归因覆盖这次评测的全部样本，健康样本也会进来；
+EM 与 F1 对解释性长答案本就失真，答案正确而得分低是常见的。规则分类为
+`not_a_failure` 时，narrative 要说明它为什么其实没问题，**不要编造失败原因**。
 
 已经有一个规则归因给出了分类。你的任务是**解释因果**，不是重新分类：
 如果你认为分类错了，在 disagreement 里说明理由，不要直接改 root_cause。

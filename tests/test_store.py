@@ -60,7 +60,7 @@ def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
         db, compile_id, "d", ["d:1"], [{"doc_id": "0", "is_gold": True}]
     )
     attribution_id = attribution_store.create_attribution_run(
-        db, name="a", eval_id=eval_id, metric="recall@2", sample_limit=1, provider_id=None
+        db, name="a", eval_id=eval_id, provider_id=None
     )
 
     compile_store.delete_compile_run(db, compile_id)
@@ -69,6 +69,77 @@ def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
     assert eval_store.get_eval_run(db, eval_id) is None
     assert attribution_store.get_attribution_run(db, attribution_id) is None
     assert compile_store.compile_docs(db, compile_id) == []
+
+
+def test_init_db_removes_legacy_attribution_scope_and_keeps_runs(tmp_path):
+    path = tmp_path / "legacy.db"
+    connection = connect(path)
+    connection.execute(
+        """
+        CREATE TABLE attribution_run (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, eval_id INTEGER NOT NULL,
+            metric TEXT NOT NULL, sample_limit INTEGER NOT NULL, provider_id INTEGER,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO attribution_run VALUES (1, 'legacy', 7, 'em', 10, NULL, 'succeeded', 'now', NULL)"
+    )
+    connection.commit()
+    connection.close()
+
+    init_db(path)
+
+    connection = connect(path, read_only=True)
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(attribution_run)")}
+    run = dict(connection.execute("SELECT * FROM attribution_run WHERE id = 1").fetchone())
+    connection.close()
+    assert {"metric", "sample_limit"}.isdisjoint(columns)
+    assert run["name"] == "legacy"
+    assert run["concurrency"] == 1
+
+
+def test_init_db_removes_retired_metrics_from_historical_evals(db_path, db, eval_id):
+    db.execute(
+        "UPDATE eval_run SET metrics_json = ? WHERE id = ?",
+        ('["em", "citation_count"]', eval_id),
+    )
+    eval_store.record_sample_eval(
+        db,
+        eval_id,
+        sample_id="legacy",
+        dataset="d",
+        answer_mode="knowledge",
+        http_status=200,
+        answer="answer",
+        detail={},
+        metrics={"citation_count": 1.0},
+    )
+    db.execute(
+        "INSERT INTO metric_summary (eval_id, dataset, scope, metric, value, sample_count) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (eval_id, "d", "overall", "citation_count", 1.0, 1),
+    )
+    db.execute(
+        "INSERT INTO dataset_eval "
+        "(eval_id, dataset, responses_evaluated, http_failures, "
+        "omitted_metrics_json, answer_modes_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (eval_id, "d", 1, 0, '["citation_count"]', "{}"),
+    )
+    db.commit()
+
+    init_db(db_path)
+
+    run = eval_store.get_eval_run(db, eval_id)
+    assert run["metrics_json"] == '["em"]'
+    assert db.execute(
+        "SELECT COUNT(*) FROM sample_metric WHERE metric = 'citation_count'"
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT COUNT(*) FROM metric_summary WHERE metric = 'citation_count'"
+    ).fetchone()[0] == 0
+    assert eval_store.dataset_evals(db, eval_id)[0]["omitted_metrics"] == []
 
 
 @pytest.mark.usefixtures("sample_dataset")

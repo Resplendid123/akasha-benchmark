@@ -127,25 +127,38 @@ def sample_page(
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[int, list[dict[str, Any]]]:
-    """在 SQLite 内过滤并分页归一化样本，避免把整组数据载入内存。"""
-    where = ["dataset = ?"]
+    """过滤归一化样本；搜索覆盖问题、答案以及 gold 文档标题和正文。"""
+    where = ["s.dataset = ?"]
     params: list[Any] = [dataset]
     if search:
         where.append(
-            "(INSTR(LOWER(sample_id), ?) > 0 OR INSTR(LOWER(question), ?) > 0 "
-            "OR INSTR(LOWER(answers_json), ?) > 0)"
+            "(INSTR(LOWER(s.sample_id), ?) > 0 OR INSTR(LOWER(s.question), ?) > 0 "
+            "OR INSTR(LOWER(s.answers_json), ?) > 0 OR EXISTS ("
+            "SELECT 1 FROM json_each(s.gold_doc_ids_json) gold "
+            "JOIN corpus_doc cd ON cd.dataset = s.dataset AND cd.doc_id = gold.value "
+            "WHERE INSTR(LOWER(cd.title), ?) > 0 OR INSTR(LOWER(cd.text), ?) > 0))"
         )
         needle = search.lower()
-        params.extend((needle, needle, needle))
+        params.extend((needle, needle, needle, needle, needle))
     scope = " AND ".join(where)
     total = int(
-        connection.execute(f"SELECT COUNT(*) FROM sample WHERE {scope}", params).fetchone()[0]
+        connection.execute(f"SELECT COUNT(*) FROM sample s WHERE {scope}", params).fetchone()[0]
     )
     rows = connection.execute(
-        f"SELECT * FROM sample WHERE {scope} ORDER BY sample_id LIMIT ? OFFSET ?",
+        f"""
+        SELECT s.*, COALESCE((
+            SELECT json_group_array(cd.title)
+            FROM json_each(s.gold_doc_ids_json) gold
+            JOIN corpus_doc cd ON cd.dataset = s.dataset AND cd.doc_id = gold.value
+        ), '[]') AS gold_titles_json
+        FROM sample s WHERE {scope} ORDER BY s.sample_id LIMIT ? OFFSET ?
+        """,
         (*params, limit, offset),
     )
-    return total, [sample_from_row(row) for row in rows]
+    return total, [
+        {**sample_from_row(row), "gold_titles": loads(row["gold_titles_json"], [])}
+        for row in rows
+    ]
 
 
 def get_sample(connection: sqlite3.Connection, sample_id: str) -> dict[str, Any] | None:

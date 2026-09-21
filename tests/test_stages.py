@@ -129,6 +129,31 @@ def test_subset_negatives_ratio_zero_keeps_only_gold(normalized):
     assert all(d["is_gold"] for d in compile_store.compile_docs(normalized, compile_id))
 
 
+def test_subset_can_select_one_exact_sample(normalized):
+    compile_id = compile_store.create_compile_run(
+        normalized, run_id="exact", datasets=["hotpotqa"], seed=1, qa_limit=1,
+        negatives_ratio=1.0,
+    )
+    target = data_store.samples_of(normalized, "hotpotqa")[1]
+
+    stats = compile.build_subset(
+        normalized,
+        compile_id,
+        "hotpotqa",
+        seed=1,
+        qa_limit=1,
+        negatives_ratio=1.0,
+        sample_ids=[target["sample_id"]],
+    )
+
+    assert stats["samples"] == 1
+    assert [row["sample_id"] for row in compile_store.compile_samples(normalized, compile_id)] == [
+        target["sample_id"]
+    ]
+    docs = {row["doc_id"] for row in compile_store.compile_docs(normalized, compile_id)}
+    assert set(target["gold_doc_ids"]) <= docs
+
+
 def test_full_corpus_keeps_every_document(normalized):
     compile_id = compile_store.create_compile_run(
         normalized, run_id="r", datasets=["hotpotqa"], seed=1, qa_limit=1, negatives_ratio=1.0
@@ -294,45 +319,42 @@ def test_evaluate_rejects_rebuilt_subset(normalized):
         )
 
 
-def test_attribution_can_use_judge_metric(normalized):
-    """归因依据必须使用本次评测实际产出的指标，而不是固定 recall@5。"""
+def test_attribution_processes_all_eval_samples_without_metric_selection(normalized):
+    """归因样本来自 sample_eval 全集，不依赖是否产出某个指标。"""
     compile_id, _, eval_id = _fixture_chain(
         normalized, {"answerMode": "knowledge", "answer": "Rita Moreno"}
     )
-    sample_id = compile_store.compile_samples(normalized, compile_id)[0]["sample_id"]
-    eval_store.record_judge_verdict(
-        normalized,
-        eval_id,
-        sample_id=sample_id,
-        metric="faithfulness",
-        score=0.25,
-        failure_kind=None,
-        detail={"raw_response": '{"claims": []}'},
-    )
-    sample = compile_store.compile_samples(normalized, compile_id)[0]
-    eval_store.record_sample_eval(
-        normalized,
-        eval_id,
-        sample_id=sample_id,
-        dataset=sample["dataset"],
-        answer_mode="knowledge",
-        http_status=200,
-        answer="Rita Moreno",
-        detail={"question": sample["question"], "gold_doc_ids": sample["gold_doc_ids"]},
-        metrics={},
-    )
-    eval_store.restore_judge_metrics(normalized, eval_id, "faithfulness")
+    samples = compile_store.compile_samples(normalized, compile_id)
+    for sample in samples:
+        eval_store.record_sample_eval(
+            normalized,
+            eval_id,
+            sample_id=sample["sample_id"],
+            dataset=sample["dataset"],
+            answer_mode="knowledge",
+            http_status=200,
+            answer="Rita Moreno",
+            detail={"question": sample["question"], "gold_doc_ids": sample["gold_doc_ids"]},
+            metrics={},
+        )
     normalized.commit()
-
-    normalized.execute(
-        "UPDATE eval_run SET metrics_json = ? WHERE id = ?", ('["faithfulness"]', eval_id)
-    )
     _task_row(normalized)
-    attribute.run(context(normalized, {"eval_id": eval_id, "use_model": False}))
+    attribute.run(
+        context(
+            normalized,
+            {
+                "eval_id": eval_id,
+                "metric": "missing_metric",
+                "sample_limit": 1,
+                "use_model": False,
+            },
+        )
+    )
 
     run = attribution_store.list_attribution_runs(normalized, eval_id)[0]
-    assert run["metric"] == "faithfulness"
-    assert attribution_store.attribution_results(normalized, int(run["id"]))
+    assert "metric" not in run
+    assert "sample_limit" not in run
+    assert len(attribution_store.attribution_results(normalized, int(run["id"]))) == len(samples)
 
 
 def test_omitted_metrics_are_not_faked_as_zero():
@@ -371,6 +393,18 @@ def test_clean_params_rejects_wrong_types():
 
 def test_clean_params_coerces_ks_to_int():
     assert clean_params("evaluate", {"ks": ["2", "5"]}) == {"ks": [2, 5]}
+
+
+def test_attribution_params_do_not_accept_metric_or_sample_limit():
+    assert clean_params(
+        "attribute",
+        {"eval_id": 3, "metric": "em", "sample_limit": 1, "use_model": False},
+    ) == {"eval_id": 3, "use_model": False}
+
+
+def test_model_layer_params_accept_concurrency():
+    assert clean_params("evaluate", {"concurrency": "4"}) == {"concurrency": 4}
+    assert clean_params("attribute", {"concurrency": "3"}) == {"concurrency": 3}
 
 
 def test_evaluate_resume_restores_judge_scores_and_summary(normalized, monkeypatch):
@@ -463,7 +497,7 @@ def test_judge_runs_all_metrics_for_each_sample_before_next(normalized, monkeypa
 
     monkeypatch.setattr(evaluate, "_judge_task", fake_task)
     monkeypatch.setattr(evaluate, "complete_many", fake_complete_many)
-    provider = JudgeProvider("https://x", "m", "k", concurrency=4)
+    provider = JudgeProvider("https://x", "m", "k")
 
     evaluate._judge(
         ctx,
@@ -471,6 +505,7 @@ def test_judge_runs_all_metrics_for_each_sample_before_next(normalized, monkeypa
         query_id,
         provider,
         ["faithfulness", "answer_relevancy"],
+        4,
     )
 
     rows = eval_store.sample_evals(normalized, eval_id)
@@ -522,7 +557,8 @@ def test_judge_resume_retries_failed_verdicts(normalized, monkeypatch):
     monkeypatch.setattr(evaluate, "_judge_task", fake_task)
     monkeypatch.setattr(evaluate, "complete_many", fake_complete_many)
     evaluate._judge(
-        ctx, eval_id, query_id, JudgeProvider("https://x", "m", "k"), ["answer_relevancy"]
+        ctx, eval_id, query_id, JudgeProvider("https://x", "m", "k"),
+        ["answer_relevancy"], 1
     )
 
     assert calls == len(rows)

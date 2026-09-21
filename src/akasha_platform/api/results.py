@@ -9,9 +9,14 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from akasha_benchmark import attribution, textdiff
 from akasha_benchmark.config import load_config
 from akasha_benchmark.lineage import BadPageId, LineageReader, LineageUnavailable
+from akasha_benchmark.metrics.interpretation import (
+    build_metric_evidence,
+    interpret_sample_metrics,
+)
 from akasha_benchmark.store import (
     attribution_store,
     compile_store,
+    data_store,
     eval_store,
     loads,
     query_store,
@@ -114,27 +119,56 @@ def sample_detail(request: Request, eval_id: int, sample_id: str) -> dict[str, A
         query_run = query_store.get_query_run(connection, query_id) or {}
         compile_id = int(query_run.get("compile_id") or 0)
         response = query_store.response_of(connection, query_id, sample_id)
+        response_body = (response or {}).get("response") or {}
         page_to_doc = compile_store.page_to_doc(connection, compile_id, row["dataset"])
         doc_to_page = {doc: page for page, doc in page_to_doc.items()}
+        documents = {
+            doc["doc_id"]: doc
+            for doc in data_store.corpus_of(connection, row["dataset"])
+        }
+        metrics = eval_store.sample_metrics_of(connection, eval_id, sample_id)
         # 一个样本可以有多条 judge 结论。
         verdicts = [
             v for v in eval_store.judge_verdicts(connection, eval_id) if v["sample_id"] == sample_id
         ]
+        dataset_eval = next(
+            (entry for entry in eval_store.dataset_evals(connection, eval_id) if entry["dataset"] == row["dataset"]),
+            None,
+        )
+        configured_metrics = loads(eval_run["metrics_json"], [])
+        ks = loads(eval_run["ks_json"], [])
+        metric_evidence = build_metric_evidence(
+            configured_metrics,
+            ks,
+            metrics,
+            row["detail"],
+            response_body,
+            page_to_doc,
+            documents,
+            verdicts,
+        )
         return {
             **row,
-            "metrics": eval_store.sample_metrics_of(connection, eval_id, sample_id),
+            "metrics": metrics,
+            "metric_interpretations": interpret_sample_metrics(
+                configured_metrics,
+                ks,
+                metrics,
+                row["detail"],
+                verdicts,
+                (dataset_eval or {}).get("omitted_metrics", []),
+                metric_evidence,
+            ),
             "eval_id": eval_id,
             "query_id": query_id,
             "compile_id": compile_id,
-            "response": (response or {}).get("response"),
+            "response": response_body,
             # doc_id -> page_id，链路视图的入口。
             "gold_pages": {
                 doc: doc_to_page.get(doc) for doc in row["detail"].get("gold_doc_ids") or []
             },
             "judge_verdicts": verdicts,
         }
-
-
 @router.delete("/evals/{eval_id}")
 def delete_eval(request: Request, eval_id: int) -> dict[str, Any]:
     """清理一次评测及其下游的归因。"""

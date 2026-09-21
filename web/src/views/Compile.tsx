@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { CompileRun, DatasetEntry } from '../types'
+import type { AkashaFeature, AkashaModelProvider, CompileRun, DatasetEntry } from '../types'
 import {
   CleanupButton,
   ConfigPanel,
@@ -10,12 +10,14 @@ import {
   Loading,
   Pager,
   Pass,
+  RecordNav,
   RecordSearch,
   StatusTag,
   Timing,
   num,
   useAction,
   useAsync,
+  usePagedRecordNavigation,
   usePoll,
 } from '../ui'
 
@@ -78,7 +80,7 @@ export function Compile({
             <tr>
               <th>run_id</th>
               <th>数据集</th>
-              <th>配置组</th>
+              <th>编译模型</th>
               <th>状态</th>
               <th>质量闸门</th>
               <th className="num">语料</th>
@@ -167,6 +169,7 @@ function NewCompile({
   datasets: DatasetEntry[]
   onStarted: () => void
 }) {
+  const models = useAsync(() => api.akashaModels(), [])
   const [selected, setSelected] = useState<string[]>([])
   const [runId, setRunId] = useState('')
   const [fullQa, setFullQa] = useState(true)
@@ -175,12 +178,31 @@ function NewCompile({
   const [fullCorpus, setFullCorpus] = useState(true)
   const [ratio, setRatio] = useState(1)
   const [importConcurrency, setImportConcurrency] = useState(10)
+  const [modelIds, setModelIds] = useState<Partial<Record<AkashaFeature, number>>>({})
   const start = useAction<unknown>()
   const selectedQaMax = Math.max(
     0,
     ...selected.map((name) => datasets.find((dataset) => dataset.name === name)?.qa_rows ?? 0),
   )
   const effectiveQaLimit = fullQa ? selectedQaMax : qaLimit
+  const compileFeatures: AkashaFeature[] = ['compiler', 'embedding', 'image']
+  const byFeature = (feature: AkashaFeature) =>
+    (models.data?.models ?? []).filter((entry) => entry.feature === feature)
+  const modelsReady = compileFeatures.every((feature) => modelIds[feature])
+
+  useEffect(() => {
+    if (!models.data) return
+    setModelIds((current) => {
+      const next = { ...current }
+      for (const feature of compileFeatures) {
+        if (!next[feature]) next[feature] = byFeature(feature)[0]?.id
+      }
+      return next
+    })
+  }, [models.data])
+
+  if (models.loading) return <Loading what="编译模型配置" />
+  if (models.error) return <Failed error={models.error} />
 
   return (
     <ConfigPanel storageKey="compile" title="新建编译">
@@ -194,6 +216,18 @@ function NewCompile({
         selected={selected}
         onChange={setSelected}
       />
+
+      <div className="row" style={{ marginTop: 10 }}>
+        {compileFeatures.map((feature) => (
+          <ModelSelect
+            key={feature}
+            feature={feature}
+            models={byFeature(feature)}
+            value={modelIds[feature] ?? ''}
+            onChange={(id) => setModelIds((current) => ({ ...current, [feature]: id }))}
+          />
+        ))}
+      </div>
 
       <div className="row" style={{ marginTop: 10 }}>
         <Field label="run_id" hint="留空自动生成；填已有的则续跑">
@@ -260,7 +294,8 @@ function NewCompile({
             selected.length === 0 ||
             effectiveQaLimit < 1 ||
             importConcurrency < 1 ||
-            importConcurrency > 16
+            importConcurrency > 16 ||
+            !modelsReady
           }
           onClick={() =>
             start.run(async () => {
@@ -270,6 +305,9 @@ function NewCompile({
                 seed,
                 full_corpus: fullCorpus,
                 import_concurrency: importConcurrency,
+                compiler_model_id: modelIds.compiler,
+                embedding_model_id: modelIds.embedding,
+                image_model_id: modelIds.image,
                 ...(fullCorpus ? {} : { negatives_ratio: ratio }),
                 ...(runId.trim() ? { run_id: runId.trim() } : {}),
               })
@@ -278,7 +316,7 @@ function NewCompile({
             })
           }
         >
-          {start.busy ? '启动中…' : '开始编译'}
+          {start.busy ? '应用配置并启动中…' : '应用配置并开始编译'}
         </button>
       </div>
     </ConfigPanel>
@@ -289,7 +327,7 @@ function CompileDetail({ run }: { run: CompileRun }) {
   const [dataset, setDataset] = useState<string>('')
   const [goldOnly, setGoldOnly] = useState(false)
   const [offset, setOffset] = useState(0)
-  const [openDoc, setOpenDoc] = useState<{ pageId: string; title: string } | null>(null)
+  const [openDoc, setOpenDoc] = useState<{ key: string; pageId: string | null; title: string } | null>(null)
   const [term, setTerm] = useState('')
   const [q, setQ] = useState('')
   const limit = 5
@@ -305,17 +343,46 @@ function CompileDetail({ run }: { run: CompileRun }) {
       }),
     [run.id, dataset, goldOnly, q, limit, offset],
   )
+  const selectDoc = (doc: NonNullable<typeof docs.data>['docs'][number]) =>
+    setOpenDoc({
+      key: `${doc.dataset}/${doc.doc_id}`,
+      pageId: doc.page_id,
+      title: doc.title || doc.doc_id,
+    })
+  const nav = usePagedRecordNavigation({
+    items: docs.data?.docs ?? [],
+    total: docs.data?.total ?? 0,
+    responseOffset: docs.data?.offset ?? offset,
+    offset,
+    limit,
+    selectedKey: openDoc?.key ?? null,
+    itemKey: (doc) => `${doc.dataset}/${doc.doc_id}`,
+    onSelect: selectDoc,
+    onOffsetChange: setOffset,
+  })
 
   if (openDoc) {
     return (
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="spread">
           <h3 style={{ margin: 0 }}>编译变化</h3>
-          <button className="action small" onClick={() => setOpenDoc(null)}>
-            ← 返回文档列表
-          </button>
+          <RecordNav
+            hasPrevious={nav.hasPrevious}
+            hasNext={nav.hasNext}
+            onPrevious={nav.previous}
+            onNext={nav.next}
+            onBack={() => setOpenDoc(null)}
+            backLabel="返回文档列表"
+            position={nav.position}
+            total={docs.data?.total ?? 0}
+            busy={docs.loading || nav.navigating}
+          />
         </div>
-        <LineageView pageId={openDoc.pageId} title={openDoc.title} />
+        {openDoc.pageId ? (
+          <LineageView pageId={openDoc.pageId} title={openDoc.title} />
+        ) : (
+          <div className="note warn">这篇文档尚未导入，没有可查看的编译变化。</div>
+        )}
       </div>
     )
   }
@@ -411,12 +478,7 @@ function CompileDetail({ run }: { run: CompileRun }) {
                     {doc.page_id && (
                       <button
                         className="action small"
-                        onClick={() =>
-                          setOpenDoc({
-                            pageId: doc.page_id!,
-                            title: doc.title || doc.doc_id,
-                          })
-                        }
+                        onClick={() => selectDoc(doc)}
                       >
                         编译变化
                       </button>
@@ -436,6 +498,31 @@ function CompileDetail({ run }: { run: CompileRun }) {
       )}
 
     </div>
+  )
+}
+
+function ModelSelect({
+  feature,
+  models,
+  value,
+  onChange,
+}: {
+  feature: AkashaFeature
+  models: AkashaModelProvider[]
+  value: number | ''
+  onChange: (id: number) => void
+}) {
+  return (
+    <Field label={`${feature} 模型`}>
+      <select value={value} onChange={(event) => onChange(Number(event.target.value))}>
+        <option value="">请选择</option>
+        {models.map((entry) => (
+          <option key={entry.id} value={entry.id}>
+            {entry.label} · {entry.model}
+          </option>
+        ))}
+      </select>
+    </Field>
   )
 }
 

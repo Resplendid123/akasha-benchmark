@@ -165,6 +165,16 @@ def query_response(request: Request, query_id: int, sample_id: str) -> dict[str,
         return row
 
 
+@router.post("/queries/{query_id}/retry-failed")
+def retry_failed_query(request: Request, query_id: int) -> dict[str, Any]:
+    from ..tasks import TaskRejected
+
+    try:
+        return request.app.state.runner.retry_failed_query(query_id)
+    except TaskRejected as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @router.delete("/queries/{query_id}")
 def delete_query(request: Request, query_id: int) -> dict[str, Any]:
     """清理一次查询及其下游的评测、归因。"""

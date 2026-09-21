@@ -1,5 +1,6 @@
 import type {
   AkashaConfigsView,
+  AkashaModelsView,
   AttributionDetail,
   CompileDoc,
   CompileRun,
@@ -23,6 +24,7 @@ import type {
   Stage,
   Task,
   TaskDetail,
+  TaskList,
 } from './types'
 
 // 后端配置了令牌时，请求须携带它。sessionStorage 在标签页关闭后清除。
@@ -112,9 +114,15 @@ export const api = {
     post<{ applied: string[]; requires_new_compile: boolean; impact: string }>(
       `/api/akasha-configs/${id}/apply`,
     ),
+  akashaModels: (feature?: string) =>
+    request<AkashaModelsView>(`/api/akasha-models${query({ feature })}`),
+  saveAkashaModel: (payload: Record<string, unknown>) =>
+    put<{ id: number; feature: string; label: string }>('/api/akasha-models', payload),
+  deleteAkashaModel: (id: number) => del<{ deleted: number }>(`/api/akasha-models/${id}`),
+  applyAkashaModel: (id: number) => post<{ applied: string }>(`/api/akasha-models/${id}/apply`),
   exportConfig: () => request<Record<string, unknown>>('/api/config/export'),
   importConfig: (data: Record<string, unknown>) =>
-    post<{ connection: string[]; providers: number; akasha_configs: number }>(
+    post<{ connection: string[]; providers: number; akasha_configs: number; akasha_models: number }>(
       '/api/config/import',
       data,
     ),
@@ -163,6 +171,7 @@ export const api = {
     request<Record<string, unknown>>(
       `/api/queries/${id}/responses/${encodeURIComponent(sampleId)}`,
     ),
+  retryFailedQuery: (id: number) => post<Task>(`/api/queries/${id}/retry-failed`),
   deleteQuery: (id: number) => del<{ deleted: number }>(`/api/queries/${id}`),
 
   // --- 评测层 ---
@@ -184,7 +193,8 @@ export const api = {
 
   // --- 任务层 ---
   stages: () => request<Stage[]>('/api/stages'),
-  tasks: (status?: string) => request<Task[]>(`/api/tasks${query({ status })}`),
+  tasks: (params: { status?: string; limit?: number; offset?: number } = {}) =>
+    request<TaskList>(`/api/tasks${query(params)}`),
   task: (id: number, afterId = 0) =>
     request<TaskDetail>(`/api/tasks/${id}${query({ after_id: afterId })}`),
   startTask: (stage: string, args: Record<string, unknown>) =>

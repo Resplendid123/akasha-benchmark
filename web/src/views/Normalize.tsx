@@ -6,10 +6,12 @@ import {
   Failed,
   Loading,
   Pager,
+  RecordNav,
   RecordSearch,
   num,
   useAction,
   useAsync,
+  usePagedRecordNavigation,
 } from '../ui'
 
 /** 归一化层：入 SQLite，不入 Akasha 库。 */
@@ -189,15 +191,34 @@ function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' 
     [dataset, tab, q, offset],
   )
   const active = tab === 'samples' ? samples : corpus
+  const nav = usePagedRecordNavigation({
+    items: samples.data?.samples ?? [],
+    total: samples.data?.total ?? 0,
+    responseOffset: samples.data?.offset ?? offset,
+    offset,
+    limit,
+    selectedKey: sampleId,
+    itemKey: (sample) => sample.sample_id,
+    onSelect: (sample) => setSampleId(sample.sample_id),
+    onOffsetChange: setOffset,
+  })
 
   if (sampleId) {
     return (
       <div className="panel" style={{ marginTop: 14 }}>
         <div className="spread">
           <h3 style={{ margin: 0 }}>{dataset} 样本详情</h3>
-          <button className="action small" onClick={() => setSampleId(null)}>
-            ← 返回列表
-          </button>
+          <RecordNav
+            hasPrevious={nav.hasPrevious}
+            hasNext={nav.hasNext}
+            onPrevious={nav.previous}
+            onNext={nav.next}
+            onBack={() => setSampleId(null)}
+            backLabel="返回列表"
+            position={nav.position}
+            total={samples.data?.total ?? 0}
+            busy={samples.loading || nav.navigating}
+          />
         </div>
         <SampleDetail dataset={dataset} sampleId={sampleId} />
       </div>
@@ -273,7 +294,13 @@ function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' 
             </div>
           ))}
           {corpus.data.docs.length === 0 && <p className="small muted">没有内容。</p>}
-          <Pager total={corpus.data.total} offset={offset} limit={limit} onChange={setOffset} />
+          <Pager
+            total={corpus.data.total}
+            offset={offset}
+            limit={limit}
+            onChange={setOffset}
+            itemLabels
+          />
         </>
       )}
     </div>

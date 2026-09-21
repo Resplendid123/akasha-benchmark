@@ -17,12 +17,13 @@ def create_eval_run(
     ks: list[int],
     metrics: list[str],
     judge_provider_id: int | None,
+    concurrency: int = 1,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO eval_run
-            (name, query_id, ks_json, metrics_json, judge_provider_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (name, query_id, ks_json, metrics_json, judge_provider_id, concurrency, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             name,
@@ -30,6 +31,7 @@ def create_eval_run(
             dumps(ks),
             dumps(metrics),
             judge_provider_id,
+            concurrency,
             STATUS_RUNNING,
             utc_now(),
         ),
@@ -346,7 +348,7 @@ def samples_ranked_by(
     ascending: bool = True,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """按某个指标排序的样本，即归因层的「最差 N 条」。"""
+    """按某个指标排序并截取样本。"""
     sql = """
         SELECT sm.sample_id, se.dataset, sm.value, se.answer_mode, se.answer
         FROM sample_metric sm

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { Provider } from '../types'
+import type { MetricsView, Provider, Sample } from '../types'
 import { Failed, Field, Loading, useAction, useAsync } from '../ui'
 
 const DATASETS = ['hotpotqa', '2wikimultihopqa', 'musique']
@@ -9,8 +9,9 @@ const DATASETS = ['hotpotqa', '2wikimultihopqa', 'musique']
 export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
   const datasets = useAsync(() => api.datasets(), [])
   const judges = useAsync<Provider[]>(() => api.providers('judge'), [])
+  const metrics = useAsync<MetricsView>(() => api.metrics(DATASETS), [])
   const [dataset, setDataset] = useState(DATASETS[0]!)
-  const [samples, setSamples] = useState(2)
+  const [selected, setSelected] = useState<Sample | null>(null)
   const [withJudge, setWithJudge] = useState(false)
   const [useModel, setUseModel] = useState(false)
   const start = useAction<unknown>()
@@ -21,6 +22,12 @@ export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
   const normalized = (datasets.data?.datasets ?? [])
     .filter((d) => d.normalized && DATASETS.includes(d.name))
     .map((d) => d.name)
+  const activeDataset = normalized.includes(dataset) ? dataset : normalized[0] ?? ''
+  const computable = new Set(metrics.data?.per_dataset[activeDataset] ?? [])
+  const metricCount = (metrics.data?.definitions ?? []).filter(
+    (definition) =>
+      computable.has(definition.name) && (withJudge || definition.kind === 'deterministic'),
+  ).length
 
   return (
     <>
@@ -36,7 +43,13 @@ export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
         <div className="panel">
           <div className="row">
             <Field label="数据集" hint="只用有 gold 标注的三组">
-              <select value={dataset} onChange={(e) => setDataset(e.target.value)}>
+              <select
+                value={activeDataset}
+                onChange={(e) => {
+                  setDataset(e.target.value)
+                  setSelected(null)
+                }}
+              >
                 {normalized.map((name) => (
                   <option key={name} value={name}>
                     {name}
@@ -44,16 +57,13 @@ export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
                 ))}
               </select>
             </Field>
-            <Field label="样本数" hint="1–3">
-              <input
-                type="number"
-                min={1}
-                max={3}
-                value={samples}
-                onChange={(e) => setSamples(Number(e.target.value))}
-              />
-            </Field>
           </div>
+
+          <SamplePicker
+            dataset={activeDataset}
+            selected={selected}
+            onSelect={setSelected}
+          />
 
           <div className="row tight" style={{ marginTop: 8 }}>
             <label className="check">
@@ -74,16 +84,14 @@ export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
           <div className="panel-actions">
             <button
               className="action primary"
-              disabled={start.busy}
+              disabled={start.busy || !selected}
               onClick={() =>
                 start.run(async () => {
                   const task = await api.startChain({
-                    dataset,
-                    samples,
+                    dataset: activeDataset,
+                    sample_id: selected!.sample_id,
                     use_model: useModel,
-                    metrics: withJudge
-                      ? ['recall', 'hit', 'em', 'f1', 'citation_recall', 'faithfulness']
-                      : ['recall', 'hit', 'em', 'f1', 'citation_recall'],
+                    with_judge: withJudge,
                   })
                   onOpenTasks()
                   return task
@@ -93,12 +101,83 @@ export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
               {start.busy ? '启动中…' : '开始链路测试'}
             </button>
             <span className="small muted">
-              编译 → 查询 → 评测 → 归因，四条任务依次跑
+              仅对所选样本执行编译 → 查询 → 评测 → 归因；自动全选 {metricCount} 个
+              {withJudge ? '可计算指标（含 Judge）' : '确定性指标'}
             </span>
           </div>
         </div>
       )}
 
     </>
+  )
+}
+
+function SamplePicker({
+  dataset,
+  selected,
+  onSelect,
+}: {
+  dataset: string
+  selected: Sample | null
+  onSelect: (sample: Sample) => void
+}) {
+  const [term, setTerm] = useState('')
+  const [q, setQ] = useState('')
+  const results = useAsync(
+    () => api.samples(dataset, { q: q || undefined, limit: 20 }),
+    [dataset, q],
+  )
+
+  return (
+    <div className="sample-picker">
+      <div className="row">
+        <Field label="搜索样本" hint="匹配问题、答案、gold 内容标题或正文">
+          <div className="row tight">
+            <input
+              value={term}
+              onChange={(event) => setTerm(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') setQ(term.trim())
+              }}
+              placeholder="输入内容标题或关键词"
+            />
+            <button className="action" onClick={() => setQ(term.trim())}>搜索</button>
+          </div>
+        </Field>
+      </div>
+
+      {selected && (
+        <div className="note ok small">
+          已选择 <strong>{selected.gold_titles?.join(' / ') || selected.question}</strong>
+          <span className="mono" style={{ marginLeft: 8 }}>{selected.sample_id}</span>
+        </div>
+      )}
+
+      {results.loading && <Loading what="测试样本" />}
+      {results.error && <Failed error={results.error} />}
+      {results.data && (
+        <div className="sample-picker-results">
+          <div className="small muted">
+            匹配 {results.data.total} 条，显示前 {results.data.samples.length} 条
+          </div>
+          {results.data.samples.map((sample) => (
+            <button
+              key={sample.sample_id}
+              type="button"
+              className={`sample-picker-item ${selected?.sample_id === sample.sample_id ? 'selected' : ''}`}
+              onClick={() => onSelect(sample)}
+            >
+              <span className="sample-picker-title">
+                {sample.gold_titles?.join(' / ') || '（无内容标题）'}
+              </span>
+              <span>{sample.question}</span>
+              <span className="small muted">参考答案：{sample.answers.join(' / ')}</span>
+              <span className="mono small muted">{sample.sample_id}</span>
+            </button>
+          ))}
+          {results.data.total === 0 && <div className="note plain">没有匹配样本。</div>}
+        </div>
+      )}
+    </div>
   )
 }

@@ -38,6 +38,11 @@ export interface TaskDetail extends Task {
   logs: AuditEntry[]
 }
 
+export interface TaskList extends Paged {
+  inactive_total: number
+  tasks: Task[]
+}
+
 // --- 配置 ---
 
 export interface Connection {
@@ -47,8 +52,6 @@ export interface Connection {
   database_url: string
   timeout_seconds: number
   request_interval_seconds: number
-  poll_interval_seconds: number
-  poll_timeout_seconds: number
   updated_at: string
   compiles: { id: number; run_id: string; workspace_id: string | null; space_id: string }[]
 }
@@ -61,7 +64,6 @@ export interface ConnectionTest {
   blocked_compiles: { id: number; run_id: string; reason: string }[]
   owner_warning: string | null
   model_configs: unknown
-  group_drift: { id: number; label: string; drift: Record<string, boolean> } | null
 }
 
 export interface ModelConfig {
@@ -85,7 +87,6 @@ export interface Provider {
   base_url: string
   model: string
   api_key_set: boolean
-  concurrency: number
   updated_at: string
 }
 
@@ -107,6 +108,24 @@ export interface AkashaConfigGroup {
 export interface AkashaConfigsView {
   features: string[]
   groups: AkashaConfigGroup[]
+}
+
+export type AkashaFeature = 'compiler' | 'embedding' | 'answer' | 'image'
+
+export interface AkashaModelProvider {
+  id: number
+  feature: AkashaFeature
+  label: string
+  base_url: string
+  model: string
+  parameters: Record<string, unknown>
+  api_key_set: boolean
+  updated_at: string
+}
+
+export interface AkashaModelsView {
+  features: AkashaFeature[]
+  models: AkashaModelProvider[]
 }
 
 /** 探测结果。ok 为假时 failure 是失败类别，detail 是 provider 回的原文。 */
@@ -155,6 +174,7 @@ export interface Sample {
   answers: string[]
   gold_doc_ids: string[]
   metadata: Record<string, unknown>
+  gold_titles?: string[]
 }
 
 export interface SampleDetail extends Sample {
@@ -210,9 +230,8 @@ export interface AttributionRun {
   id: number
   name: string
   eval_id: number
-  metric: string
-  sample_limit: number
   provider_id: number | null
+  concurrency: number
   status: RunStatus
   config_group: string | null
   sample_count: number
@@ -228,6 +247,7 @@ export interface EvalRun {
   ks: number[]
   metrics: string[]
   judge_provider_id: number | null
+  concurrency: number
   status: RunStatus
   config_group: string | null
   sample_count: number
@@ -253,6 +273,8 @@ export interface QueryRun {
   concurrency: number
   status: RunStatus
   config_group: string | null
+  answer_model_id: number | null
+  model_selection?: Record<string, { id: number; label: string; model: string; baseUrl: string }>
   sample_count: number
   success_count: number
   created_at: string
@@ -286,6 +308,10 @@ export interface CompileRun {
   space_name: string | null
   workspace_id: string | null
   config_group: string | null
+  compiler_model_id: number | null
+  embedding_model_id: number | null
+  image_model_id: number | null
+  model_selection?: Record<string, { id: number; label: string; model: string; baseUrl: string }>
   status: RunStatus
   created_at: string
   finished_at: string | null
@@ -376,6 +402,7 @@ export interface EvalSampleDetail {
   answer: string | null
   detail: Record<string, unknown>
   metrics: Metrics
+  metric_interpretations: MetricInterpretation[]
   eval_id: number
   query_id: number
   compile_id: number
@@ -399,6 +426,84 @@ export interface EvalSampleList extends Paged {
   eval_id: number
   count_by_answer_mode: Record<string, number>
   samples: EvalSampleRow[]
+}
+
+export interface MetricInterpretation {
+  name: string
+  family: string
+  family_label: string
+  kind: 'deterministic' | 'judge'
+  value: number | null
+  higher_is_better: boolean
+  description: string
+  reason: string
+  evidence: MetricEvidence | null
+  status: 'good' | 'warning' | 'bad' | 'neutral' | 'unavailable'
+}
+
+export interface MetricEvidence {
+  formula?: string | null
+  documents?: MetricEvidenceDocument[]
+  retrieved_documents?: MetricEvidenceDocument[]
+  gold_documents?: Array<{
+    doc_id: string
+    page_id: string | null
+    title: string
+    retrieved: boolean
+    cited: boolean
+  }>
+  difference_documents?: MetricEvidenceDocument[]
+  snippets?: MetricEvidenceSnippet[]
+  citation_excerpts?: Array<{
+    doc_id: string | null
+    page_id: string | null
+    title: string
+    is_gold: boolean
+    excerpts: string[]
+  }>
+  contributions?: Array<{ rank: number; doc_id: string | null; gain: number }>
+  exclusive_gold_doc_ids?: string[]
+  answer_comparison?: {
+    answer: string
+    normalized_answer?: string
+    references: Array<string | MetricAnswerReference>
+  }
+  judge_detail?: Record<string, unknown>
+}
+
+export interface MetricEvidenceDocument {
+  rank: number
+  doc_id: string | null
+  page_id: string
+  title: string
+  is_gold: boolean
+  mapped: boolean
+}
+
+export interface MetricEvidenceSnippet {
+  rank: number
+  id?: string | null
+  title: string
+  text: string
+  retrieval_reasons: string[]
+  page_ids: string[]
+  doc_ids: string[]
+  gold_doc_ids: string[]
+  is_gold: boolean
+  is_graph: boolean
+}
+
+export interface MetricAnswerReference {
+  text: string
+  normalized: string
+  exact_match: number
+  answer_token_count: number
+  reference_token_count: number
+  shared_token_count: number
+  shared_tokens: string[]
+  precision: number
+  recall: number
+  f1: number
 }
 
 export interface JudgeVerdict {

@@ -68,7 +68,7 @@
       "dot": "amber",
       "title": "读指标时的两条边界",
       "items": [
-        "no_match 与 general 无条件返回空 retrievedSources，所以每张检索表都出全样本与 knowledge 两份。",
+        "no_match 没有可用检索证据；general 会保留模型未采用的 retrievedSources，检索表仍出全样本与 knowledge 两份。",
         "retrievalDiagnostics 不在 HTTP 响应里，三段损失只能走审计表，连接键带 sha256: 前缀。",
         "NarrativeQA 没有 gold，检索类指标一律省略并写明原因，不伪造 0 分污染汇总。"
       ]

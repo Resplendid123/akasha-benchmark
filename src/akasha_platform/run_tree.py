@@ -81,21 +81,25 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     attribution_counts = {
         int(row["attribution_id"]): dict(row)
         for row in connection.execute(
-            """
-            SELECT ar.id AS attribution_id,
-                   MIN(ar.sample_limit, COALESCE(metrics.samples, 0)) AS samples,
-                   COALESCE(results.succeeded, 0) AS succeeded
-            FROM attribution_run ar
-            LEFT JOIN (
-                SELECT eval_id, metric, COUNT(DISTINCT sample_id) AS samples
-                FROM sample_metric GROUP BY eval_id, metric
-            ) metrics ON metrics.eval_id = ar.eval_id AND metrics.metric = ar.metric
-            LEFT JOIN (
+                """
+                SELECT ar.id AS attribution_id,
+                       COALESCE(samples.samples, 0) AS samples,
+                       COALESCE(results.succeeded, 0) AS succeeded
+                FROM attribution_run ar
+                LEFT JOIN (
+                    SELECT eval_id, COUNT(*) AS samples
+                    FROM sample_eval GROUP BY eval_id
+                ) samples ON samples.eval_id = ar.eval_id
+                LEFT JOIN (
                 SELECT attribution_id, COUNT(*) AS succeeded
                 FROM attribution_result GROUP BY attribution_id
             ) results ON results.attribution_id = ar.id
             """
         )
+    }
+    provider_labels = {
+        int(row["id"]): row["label"]
+        for row in connection.execute("SELECT id, label FROM model_provider")
     }
 
     queries_by_compile = _grouped(query_rows, "compile_id")
@@ -114,6 +118,7 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             eval_samples=eval_samples,
             verdicts=verdicts,
             attribution_counts=attribution_counts,
+            provider_labels=provider_labels,
         )
         for row in compile_rows
     ]
@@ -132,6 +137,7 @@ def _compile_view(
     eval_samples: dict[int, list[dict[str, Any]]],
     verdicts: dict[tuple[int, str, str], str | None],
     attribution_counts: dict[int, dict[str, Any]],
+    provider_labels: dict[int, str],
 ) -> dict[str, Any]:
     compile_id = int(row["id"])
     stats = {
@@ -145,6 +151,10 @@ def _compile_view(
     missing = total - sum(int(item.get("imported") or 0) for item in stats.values())
     return {
         **_public_run(row),
+        "config_group": _selection_label(
+            loads(row.get("model_selection_json"), {}), row.get("config_group")
+        ),
+        "model_selection": loads(row.get("model_selection_json"), {}),
         "datasets": loads(row["datasets_json"], []),
         "stats": stats,
         "quality": loads(row["quality_json"]),
@@ -155,7 +165,6 @@ def _compile_view(
         "queries": [
             _query_view(
                 query,
-                config_group=row["config_group"],
                 evals=evals_by_query.get(int(query["id"]), []),
                 attributions_by_eval=attributions_by_eval,
                 query_stats=query_stats,
@@ -163,6 +172,7 @@ def _compile_view(
                 eval_samples=eval_samples,
                 verdicts=verdicts,
                 attribution_counts=attribution_counts,
+                provider_labels=provider_labels,
             )
             for query in queries
         ],
@@ -172,7 +182,6 @@ def _compile_view(
 def _query_view(
     row: dict[str, Any],
     *,
-    config_group: str | None,
     evals: list[dict[str, Any]],
     attributions_by_eval: dict[int, list[dict[str, Any]]],
     query_stats: dict[int, list[dict[str, Any]]],
@@ -180,6 +189,7 @@ def _query_view(
     eval_samples: dict[int, list[dict[str, Any]]],
     verdicts: dict[tuple[int, str, str], str | None],
     attribution_counts: dict[int, dict[str, Any]],
+    provider_labels: dict[int, str],
 ) -> dict[str, Any]:
     query_id = int(row["id"])
     stats = {
@@ -189,7 +199,10 @@ def _query_view(
     response_count = sum(int(item["responses"] or 0) for item in stats.values())
     return {
         **_public_run(row),
-        "config_group": config_group,
+        "config_group": _selection_label(
+            loads(row.get("model_selection_json"), {}), row.get("config_group")
+        ),
+        "model_selection": loads(row.get("model_selection_json"), {}),
         "sample_count": query_sample_counts.get(query_id, 0) or response_count,
         "success_count": sum(
             int(item["responses"] or 0) - int(item["failures"] or 0)
@@ -199,11 +212,11 @@ def _query_view(
         "evals": [
             _eval_view(
                 evaluation,
-                config_group=config_group,
                 samples=eval_samples.get(int(evaluation["id"]), []),
                 attributions=attributions_by_eval.get(int(evaluation["id"]), []),
                 verdicts=verdicts,
                 attribution_counts=attribution_counts,
+                provider_labels=provider_labels,
             )
             for evaluation in evals
         ],
@@ -213,14 +226,16 @@ def _query_view(
 def _eval_view(
     row: dict[str, Any],
     *,
-    config_group: str | None,
     samples: list[dict[str, Any]],
     attributions: list[dict[str, Any]],
     verdicts: dict[tuple[int, str, str], str | None],
     attribution_counts: dict[int, dict[str, Any]],
+    provider_labels: dict[int, str],
 ) -> dict[str, Any]:
     eval_id = int(row["id"])
-    metrics = loads(row["metrics_json"], [])
+    metrics = [
+        name for name in loads(row["metrics_json"], []) if name in registry.METRIC_REGISTRY
+    ]
     judge_metrics = {
         name for name in metrics if registry.get_metric(name).kind == registry.KIND_JUDGE
     }
@@ -235,7 +250,11 @@ def _eval_view(
     )
     return {
         **_public_run(row),
-        "config_group": config_group,
+        "config_group": (
+            provider_labels.get(int(row["judge_provider_id"]))
+            if row.get("judge_provider_id") is not None
+            else "确定性指标"
+        ),
         "sample_count": len(samples),
         "success_count": succeeded,
         "ks": loads(row["ks_json"], []),
@@ -243,7 +262,11 @@ def _eval_view(
         "attributions": [
             {
                 **_public_run(attribution),
-                "config_group": config_group,
+                "config_group": (
+                    provider_labels.get(int(attribution["provider_id"]))
+                    if attribution.get("provider_id") is not None
+                    else "规则归因"
+                ),
                 "sample_count": int(
                     attribution_counts.get(int(attribution["id"]), {}).get("samples") or 0
                 ),
@@ -275,3 +298,14 @@ def _compiled_pages(run: dict[str, Any], stats: dict[str, Any]) -> int | None:
 
 def _public_run(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if not key.endswith("_json")}
+
+
+def _selection_label(selection: dict[str, Any] | None, fallback: str | None) -> str | None:
+    selection = selection or {}
+    labels = [
+        str(item.get("label") or item.get("model") or "")
+        for item in selection.values()
+        if isinstance(item, dict)
+    ]
+    labels = [label for label in labels if label]
+    return " + ".join(labels) if labels else fallback

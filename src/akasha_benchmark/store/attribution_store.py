@@ -14,17 +14,16 @@ def create_attribution_run(
     *,
     name: str,
     eval_id: int,
-    metric: str,
-    sample_limit: int,
     provider_id: int | None,
+    concurrency: int = 1,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO attribution_run
-            (name, eval_id, metric, sample_limit, provider_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (name, eval_id, provider_id, concurrency, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (name, eval_id, metric, sample_limit, provider_id, STATUS_RUNNING, utc_now()),
+        (name, eval_id, provider_id, concurrency, STATUS_RUNNING, utc_now()),
     )
     return int(cursor.lastrowid or 0)
 

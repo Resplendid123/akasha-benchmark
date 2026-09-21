@@ -7,6 +7,10 @@ import pytest
 from akasha_benchmark import attribution
 from akasha_benchmark.datasets import DataDependency, DependencyError
 from akasha_benchmark.metrics import attribution as citation
+from akasha_benchmark.metrics.interpretation import (
+    build_metric_evidence,
+    interpret_sample_metrics,
+)
 from akasha_benchmark.metrics import multihop, qa, registry, retrieval
 
 
@@ -65,7 +69,14 @@ def test_truncation_loss_separates_retrieval_from_citation():
     assert result["truncation_loss"] == pytest.approx(1.0)
     assert result["truncated_gold"] == pytest.approx(1.0)
     assert result["citation_recall"] == pytest.approx(0.0)
-    assert result["evidence_verifiable_rate"] == pytest.approx(1.0)
+    assert "evidence_verifiable_rate" not in result
+    assert "evidence_verifiable_rate" not in registry.METRIC_REGISTRY
+    assert "citation_count" not in result
+    assert "citation_count" not in registry.METRIC_REGISTRY
+    assert "retrieved_count" not in result
+    assert "retrieved_count" not in registry.METRIC_REGISTRY
+    assert "evidence_entries" not in result
+    assert "evidence_entries" not in registry.METRIC_REGISTRY
 
 
 def test_graph_exclusive_gold_is_net_contribution():
@@ -76,9 +87,39 @@ def test_graph_exclusive_gold_is_net_contribution():
         {"retrievalReasons": ["graph-neighbor"], "sourceWindows": [{"sourcePageId": "p2"}]},
     ]
     result = multihop.evaluate_sample(snippets, ["g1", "g2"], page_to_doc)
-    assert result["graph_exclusive_gold_count"] == 1
-    assert result["graph_neighbor_share"] == pytest.approx(0.5)
+    assert result["graph_exclusive_gold_share"] == pytest.approx(0.5)
+    assert "graph_exclusive_gold_count" not in result
+    assert "graph_exclusive_gold_count" not in registry.METRIC_REGISTRY
+    assert "graph_neighbor_share" not in result
+    assert "graph_neighbor_share" not in registry.METRIC_REGISTRY
+    assert "snippet_count" not in result
+    assert "snippet_count" not in registry.METRIC_REGISTRY
+    assert "graph_neighbor_snippets" not in result
+    assert "graph_neighbor_snippets" not in registry.METRIC_REGISTRY
     assert result["graph_neighbor_precision"] == pytest.approx(1.0)
+    assert "graph_neighbor_precision" in registry.METRIC_REGISTRY
+
+
+def test_graph_neighbor_precision_deduplicates_documents():
+    page_to_doc = {"gold-page": "gold", "other-page": "other"}
+    snippets = [
+        {
+            "retrievalReasons": ["graph-neighbor"],
+            "sourceWindows": [{"sourcePageId": "gold-page"}],
+        },
+        *[
+            {
+                "retrievalReasons": ["graph-neighbor"],
+                "sourceWindows": [{"sourcePageId": "other-page"}],
+            }
+            for _ in range(3)
+        ],
+    ]
+
+    result = multihop.evaluate_sample(snippets, ["gold"], page_to_doc)
+
+    assert result["graph_neighbor_precision"] == pytest.approx(0.5)
+    assert result["reason_doc_counts"]["graph-neighbor"] == 2
 
 
 def test_answer_scoring_takes_max_over_references():
@@ -96,6 +137,85 @@ def test_answer_mode_distribution():
     }
 
 
+def test_sample_metric_interpretations_explain_values_with_sample_counts():
+    rows = interpret_sample_metrics(
+        ["recall", "mrr", "truncated_gold", "faithfulness"],
+        [5],
+        {"recall@5": 0.5, "mrr": 0.5, "truncated_gold": 1.0, "faithfulness": 2 / 3},
+        {"gold_doc_ids": ["g1", "g2"]},
+        [
+            {
+                "metric": "faithfulness",
+                "score": 2 / 3,
+                "failure_kind": None,
+                "detail": {"claim_count": 3, "supported": 2},
+            }
+        ],
+        [],
+    )
+    by_name = {row["name"]: row for row in rows}
+    assert by_name["recall@5"]["reason"] == "前 5 条检索结果命中 1/2 篇 gold 文档。"
+    assert by_name["mrr"]["reason"] == "首个 gold 文档约位于第 2 名。"
+    assert by_name["truncated_gold"]["status"] == "bad"
+    assert by_name["faithfulness"]["reason"] == "2/3 条事实陈述有检索证据支持。"
+
+
+def test_sample_metric_interpretations_explain_missing_and_failed_values():
+    rows = interpret_sample_metrics(
+        ["recall", "answer_relevancy", "answer_correctness"],
+        [2],
+        {},
+        {},
+        [
+            {"metric": "answer_relevancy", "score": None, "failure_kind": None},
+            {"metric": "answer_correctness", "score": None, "failure_kind": "timeout"},
+        ],
+        ["recall"],
+    )
+    by_name = {row["name"]: row for row in rows}
+    assert "缺少" in by_name["recall@2"]["reason"]
+    assert "无定义" in by_name["answer_relevancy"]["reason"]
+    assert "timeout" in by_name["answer_correctness"]["reason"]
+    assert all(row["status"] == "unavailable" for row in rows)
+
+
+def test_every_registered_metric_has_structured_evidence_and_formula():
+    configured = sorted(registry.METRIC_REGISTRY)
+    actual_names = [f"{name}@2" if registry.get_metric(name).per_k else name for name in configured]
+    values = {name: 0.5 for name in actual_names}
+    evidence = build_metric_evidence(
+        configured,
+        [2],
+        values,
+        {"gold_doc_ids": ["g1"], "reference_answers": ["reference answer"]},
+        {
+            "answer": "answer",
+            "retrievedSources": [{"sourcePageId": "p1"}],
+            "citations": [{"sourcePageId": "p1"}],
+            "citationEvidence": [{"sourcePageId": "p1", "excerpts": ["quote"]}],
+            "snippets": [
+                {
+                    "id": "s1",
+                    "title": "Gold",
+                    "text": "evidence",
+                    "retrievalReasons": ["semantic", "graph-neighbor"],
+                    "sourceWindows": [{"sourcePageId": "p1"}],
+                }
+            ],
+        },
+        {"p1": "g1"},
+        {"g1": {"doc_id": "g1", "title": "Gold"}},
+        [
+            {"metric": name, "detail": {}}
+            for name in configured
+            if registry.get_metric(name).kind == registry.KIND_JUDGE
+        ],
+    )
+
+    assert set(evidence) == set(actual_names)
+    assert all(row.get("formula") for row in evidence.values())
+
+
 # ------------------------------------------------------------ 归因判据
 
 
@@ -109,7 +229,7 @@ def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
 
 
 def test_correct_answer_is_not_a_failure():
-    """最差 N 条可能包含正确答案，应排除这些样本的失败归因。"""
+    """全量归因包含正确答案，应排除这些样本的失败归因。"""
     # 检索一条 gold 都没命中，但答案 EM 命中：系统没依赖那篇 gold。
     ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 1.0}), [])
     assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
@@ -191,7 +311,7 @@ def test_citation_dropped_outranks_retrieval_miss():
 
 def test_graph_edge_missing_when_coverage_incomplete():
     ruling = attribution.classify(
-        _sample({"hit@5": 1.0, "full_coverage@5": 0.0, "graph_exclusive_gold_count": 0.0}), []
+        _sample({"hit@5": 1.0, "full_coverage@5": 0.0, "graph_exclusive_gold_share": 0.0}), []
     )
     assert ruling["root_cause"] == attribution.CAUSE_GRAPH_EDGE_MISSING
 

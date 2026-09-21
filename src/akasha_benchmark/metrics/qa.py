@@ -62,8 +62,8 @@ def score_answer(prediction: str, references: Sequence[str]) -> dict[str, float]
 def answer_mode_distribution(modes: Sequence[str | None]) -> dict[str, float]:
     """各 ``answerMode`` 的占比。
 
-    ``no_match`` 率与 ``general`` 兜底率是「检索没喂够料」的直接信号：
-    这两条路径返回的 citations 和 retrievedSources 都是空的。
+    ``no_match`` 率与 ``general`` 兜底率反映生成路径选择。新版响应会为检索后
+    转入 ``general`` 的样本保留 retrievedSources，便于区分检索不足与模型未采用证据。
     """
     total = len(modes)
     if not total:

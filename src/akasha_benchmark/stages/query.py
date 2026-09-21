@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from ..akasha_client import AkashaClient, AkashaError
+from ..akasha_configs import apply_models, selection_snapshot
 from ..config import load_config
 from ..model_configs import drift
 from ..store import compile_store, loads, query_store
@@ -88,6 +89,13 @@ def run(ctx: TaskContext) -> None:
     config = load_config(ctx.db)
     config.require_credentials()
     concurrency = max(1, int(params.get("concurrency") or 3))
+    answer_model_id = params.get("answer_model_id")
+    answer_model_id = int(answer_model_id) if answer_model_id else None
+    query_id = ctx.target("query")
+    if answer_model_id is None and query_id is not None:
+        existing_query = query_store.get_query_run(ctx.db, query_id) or {}
+        stored_answer_model_id = existing_query.get("answer_model_id")
+        answer_model_id = int(stored_answer_model_id) if stored_answer_model_id else None
 
     with AkashaClient(config) as client:
         client.login()
@@ -100,29 +108,35 @@ def run(ctx: TaskContext) -> None:
         if mismatch:
             raise RuntimeError(mismatch)
 
+        selected_models = (
+            apply_models(ctx.db, client, {"answer": answer_model_id})
+            if answer_model_id is not None
+            else {}
+        )
+        if selected_models:
+            ctx.log(f"已应用查询 Answer 模型「{selected_models['answer']['label']}」")
+
         current = client.get_model_configs()
         snapshot = loads(compile_run["model_configs_json"])
         changed = drift(current, snapshot)
-        if changed["embedding"]:
-            # 阻止使用与当前 embedding 配置不匹配的编译产物。
-            raise RuntimeError(
-                "embedding 配置与编译时不一致，无法保证已有编译产物可用于查询。请重新编译。"
-            )
-        for feature in ("compiler", "answer", "image"):
+        for feature in ("compiler", "embedding", "answer", "image"):
             if changed[feature]:
-                ctx.log(f"{feature} 模型与编译时不同，两次运行不可比", "warn")
+                ctx.log(
+                    f"{feature} 配置与编译时不同；允许查询，两次运行不可完全对比",
+                    "warn",
+                )
 
         name = (
             str(params.get("name") or "").strip()
             or f"{compile_run['run_id']}-q-{uuid.uuid4().hex[:6]}"
         )
-        query_id = ctx.target("query")
         ctx.freeze(
             name=name,
             datasets=datasets,
             concurrency=concurrency,
             score_threshold=score_threshold,
             sample_limit=limit,
+            answer_model_id=answer_model_id,
         )
         if query_id is None:
             if query_store.query_run_by_name(ctx.db, name):
@@ -134,6 +148,8 @@ def run(ctx: TaskContext) -> None:
                 score_threshold=score_threshold,
                 concurrency=concurrency,
                 model_configs=current,
+                answer_model_id=answer_model_id,
+                model_selection=selection_snapshot(selected_models),
             )
             ctx.bind("query", query_id)
 
@@ -149,6 +165,7 @@ def run(ctx: TaskContext) -> None:
             removed = query_store.delete_failed_responses(ctx.db, query_id)
             ctx.db.commit()
             ctx.log(f"已清除 {removed} 条失败响应以便重试")
+            ctx.freeze(retry_failed=False)
 
         _issue(ctx, client, query_id, compile_run["space_id"], score_threshold, concurrency)
 

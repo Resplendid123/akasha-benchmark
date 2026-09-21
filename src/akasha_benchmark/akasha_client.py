@@ -414,19 +414,11 @@ class AkashaClient:
         return list(failed)
 
     def retry_pages(self, page_ids: list[str]) -> dict[str, Any]:
-        """批量重试指定页面，并合并各批返回的新 Run ID。"""
+        """提交至多 100 个页面；更多页面由阶段串行分批。"""
         unique = list(dict.fromkeys(page_ids))
-        job_ids: dict[str, None] = {}
-        queued = 0
-        for start in range(0, len(unique), 100):
-            result = self.post(
-                "llm-wiki/admin/retry-pages",
-                {"pageIds": unique[start : start + 100]},
-            )
-            queued += int(result.get("queuedPageCount") or 0)
-            for job_id in result.get("jobIds") or []:
-                job_ids.setdefault(str(job_id), None)
-        return {"queuedPageCount": queued, "jobIds": list(job_ids)}
+        if len(unique) > 100:
+            raise ValueError("retry_pages 每次最多 100 篇；调用方必须串行分批")
+        return self.post("llm-wiki/admin/retry-pages", {"pageIds": unique})
 
     def cancel_compile_run(self, run_id: str, reason: str) -> dict[str, Any]:
         """取消一个精确的编译 Run；服务端同时清理对应 BullMQ job。"""

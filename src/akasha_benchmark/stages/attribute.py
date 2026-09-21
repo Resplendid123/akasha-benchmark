@@ -14,26 +14,10 @@ from ..config import load_config
 from ..judge.client import JudgeConfigError, complete_many, parse_json_object
 from ..judge.providers import resolve_provider
 from ..lineage import BadPageId, LineageReader, LineageUnavailable
-from ..metrics import registry
-from ..store import attribution_store, compile_store, eval_store, loads, query_store
+from ..store import attribution_store, compile_store, eval_store, query_store
 from ..task import TaskContext
 
-DEFAULT_LIMIT = 10
-MAX_LIMIT = 1000
-
-
-def _default_metric(eval_run: dict[str, Any]) -> str:
-    """选本次评测实际产出的第一个指标，避免依赖固定的 recall@5。"""
-    metrics = loads(eval_run.get("metrics_json"), [])
-    ks = loads(eval_run.get("ks_json"), [])
-    for name in metrics:
-        definition = registry.get_metric(name)
-        if definition.per_k:
-            if ks:
-                return f"{name}@{ks[0]}"
-        else:
-            return name
-    raise ValueError("这次评测没有可用于归因的指标")
+MAX_ATTRIBUTION_CONCURRENCY = 16
 
 
 def _lineage_of(
@@ -88,13 +72,10 @@ def run(ctx: TaskContext) -> None:
         raise ValueError("这次评测对应的查询记录已不存在")
     compile_id = int(query_run["compile_id"])
 
-    metric = str(params.get("metric") or _default_metric(eval_run))
-    try:
-        definition = registry.get_metric(metric)
-    except KeyError as exc:
-        raise ValueError(str(exc)) from exc
-    limit = min(int(params.get("sample_limit") or DEFAULT_LIMIT), MAX_LIMIT)
     use_model = bool(params.get("use_model", True))
+    concurrency = int(params.get("concurrency") or 1)
+    if not 1 <= concurrency <= MAX_ATTRIBUTION_CONCURRENCY:
+        raise ValueError(f"归因并发必须在 1 到 {MAX_ATTRIBUTION_CONCURRENCY} 之间")
 
     provider = None
     provider_id = params.get("provider_id")
@@ -116,7 +97,7 @@ def run(ctx: TaskContext) -> None:
     name = str(params.get("name") or "").strip() or f"{eval_run['name']}-a-{uuid.uuid4().hex[:6]}"
     attribution_id = ctx.target("attribution")
     ctx.freeze(
-        name=name, metric=metric, sample_limit=limit, use_model=use_model, provider_id=provider_id
+        name=name, use_model=use_model, provider_id=provider_id, concurrency=concurrency
     )
     if attribution_id is None:
         if attribution_store.attribution_run_by_name(ctx.db, name):
@@ -125,9 +106,8 @@ def run(ctx: TaskContext) -> None:
             ctx.db,
             name=name,
             eval_id=eval_id,
-            metric=metric,
-            sample_limit=limit,
             provider_id=provider_id if provider else None,
+            concurrency=concurrency if provider else 1,
         )
         ctx.bind("attribution", attribution_id)
 
@@ -136,11 +116,9 @@ def run(ctx: TaskContext) -> None:
         attribution_id,
         eval_id,
         compile_id,
-        metric,
-        definition.higher_is_better,
-        limit,
         provider,
         reader,
+        concurrency,
     )
 
     counts = attribution_store.cause_counts(ctx.db, attribution_id)
@@ -152,20 +130,16 @@ def _analyze(
     attribution_id: int,
     eval_id: int,
     compile_id: int,
-    metric: str,
-    higher_is_better: bool,
-    limit: int,
     provider: Any,
     reader: LineageReader | None,
+    concurrency: int,
 ) -> None:
-    ranked = eval_store.samples_ranked_by(
-        ctx.db, eval_id, metric, ascending=higher_is_better, limit=limit
-    )
-    if not ranked:
-        raise ValueError(f"这次评测没有 {metric} 的逐样本值")
+    samples = eval_store.sample_evals(ctx.db, eval_id)
+    if not samples:
+        raise ValueError("这次评测没有样本")
 
     already = attribution_store.attributed_sample_ids(ctx.db, attribution_id)
-    todo = [row for row in ranked if row["sample_id"] not in already]
+    todo = [row for row in samples if row["sample_id"] not in already]
     if already:
         ctx.log(f"续跑：已归因 {len(already)} 条，待归因 {len(todo)} 条")
 
@@ -174,9 +148,7 @@ def _analyze(
     def prepare(row: dict[str, Any]) -> dict[str, Any] | None:
         """主线程：读样本、算规则结论、拼 prompt。返回一条待落库的记录。"""
         dataset = row["dataset"]
-        sample = eval_store.sample_eval(ctx.db, eval_id, row["sample_id"])
-        if sample is None:
-            return None
+        sample = row
         sample["metrics"] = eval_store.sample_metrics_of(ctx.db, eval_id, row["sample_id"])
         if dataset not in page_maps:
             page_to_doc = compile_store.page_to_doc(ctx.db, compile_id, dataset)
@@ -191,7 +163,7 @@ def _analyze(
         prompt = attribution.build_prompt(sample, ruling, lineage) if provider is not None else None
         return {"row": row, "dataset": dataset, "ruling": ruling, "prompt": prompt}
 
-    concurrency = max(1, provider.concurrency) if provider is not None else 1
+    concurrency = concurrency if provider is not None else 1
     done = 0
     for start in range(0, len(todo), concurrency):
         ctx.checkpoint()

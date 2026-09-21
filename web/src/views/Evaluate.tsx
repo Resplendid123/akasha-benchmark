@@ -19,6 +19,7 @@ import {
   ModeTag,
   Pager,
   Pass,
+  RecordNav,
   RecordSearch,
   StatusTag,
   Timing,
@@ -27,6 +28,7 @@ import {
   percent,
   useAction,
   useAsync,
+  usePagedRecordNavigation,
   usePoll,
 } from '../ui'
 
@@ -39,12 +41,23 @@ const FAMILIES = [
   { key: 'judge', label: 'Judge 模型', hint: '逐条调模型' },
 ] as const
 
+type MetricFamily = (typeof FAMILIES)[number]['key']
+
+function metricBaseName(name: string): string {
+  return name.split('@', 1)[0]!
+}
+
+function metricFamily(name: string, definitions: MetricsView['definitions']): string | null {
+  return definitions.find((definition) => definition.name === metricBaseName(name))?.family ?? null
+}
+
 /** 评测层：针对某次查询结果配置评估参数并计算指标。 */
 export function Evaluate({
   activeQuery,
   activeEval,
   onSelectQuery,
   onSelectEval,
+  onOpenQuery,
   onAttribute,
   onOpenSettings,
   onOpenTasks,
@@ -53,6 +66,7 @@ export function Evaluate({
   activeEval: number | null
   onSelectQuery: (id: number) => void
   onSelectEval: (id: number | null) => void
+  onOpenQuery: (compileId: number, queryId: number) => void
   onAttribute: (evalId: number) => void
   onOpenSettings: () => void
   onOpenTasks: () => void
@@ -117,10 +131,11 @@ export function Evaluate({
             <thead>
               <tr>
                 <th>名称</th>
-                <th>配置组</th>
+                <th>评估模型</th>
                 <th>状态</th>
                 <th className="num">样本数</th>
                 <th className="num">成功</th>
+                <th className="num">并发</th>
                 <th>k</th>
                 <th className="num">指标数</th>
                 <th>耗时</th>
@@ -139,6 +154,7 @@ export function Evaluate({
                   </td>
                   <td className="num">{run.sample_count}</td>
                   <td className="num">{run.success_count}</td>
+                  <td className="num mono">{run.concurrency}</td>
                   <td className="small mono">{run.ks.join(', ')}</td>
                   <td className="num">{run.metrics.length}</td>
                   <td>
@@ -158,6 +174,12 @@ export function Evaluate({
                         onClick={() => onAttribute(run.id)}
                       >
                         去归因
+                      </button>
+                      <button
+                        className="action small"
+                        onClick={() => onOpenQuery(query.compile_id, run.query_id)}
+                      >
+                        回到查询
                       </button>
                       <CleanupButton
                         what={`评测 ${run.name}`}
@@ -200,8 +222,8 @@ function NewEval({
   const providers = useAsync<Provider[]>(() => api.providers('judge'), [])
   const [selected, setSelected] = useState<string[]>([])
   const [name, setName] = useState('')
-  const [ks, setKs] = useState('2,5,10')
   const [providerId, setProviderId] = useState<number | ''>('')
+  const [concurrency, setConcurrency] = useState(1)
   const start = useAction<unknown>()
 
   // 默认勾选每一组都算得出来的那些。judge 逐条调模型，不默认勾。
@@ -302,22 +324,24 @@ function NewEval({
         <Field label="评测名称" hint="留空自动生成">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="自动" />
         </Field>
-        <Field label="k 值" hint="逗号分隔">
-          <input value={ks} onChange={(e) => setKs(e.target.value)} />
-        </Field>
         {judgeSelected && (
-          <Field label="评估模型 Judge">
-            <select
-              value={providerId}
-              onChange={(e) => setProviderId(e.target.value === '' ? '' : Number(e.target.value))}
-            >
-              {(providers.data ?? []).map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.label} · {provider.model}
-                </option>
-              ))}
-            </select>
-          </Field>
+          <>
+            <Field label="评估模型 Judge">
+              <select
+                value={providerId}
+                onChange={(e) => setProviderId(e.target.value === '' ? '' : Number(e.target.value))}
+              >
+                {(providers.data ?? []).map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.label} · {provider.model}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="并发" hint="Judge 调用并发数">
+              <input type="number" min={1} max={16} value={concurrency} onChange={(e) => setConcurrency(Number(e.target.value))} />
+            </Field>
+          </>
         )}
       </div>
 
@@ -339,12 +363,9 @@ function NewEval({
               const task = await api.startTask('evaluate', {
                 query_id: query.id,
                 metrics: selected,
-                ks: ks
-                  .split(',')
-                  .map((k) => Number(k.trim()))
-                  .filter((k) => k > 0),
                 ...(name.trim() ? { name: name.trim() } : {}),
                 ...(providerId === '' ? {} : { judge_provider_id: providerId }),
+                ...(judgeSelected ? { concurrency } : {}),
               })
               onStarted()
               return task
@@ -361,13 +382,34 @@ function NewEval({
 
 function Results({ evalId }: { evalId: number }) {
   const detail = useAsync<EvalDetail>(() => api.evalRun(evalId), [evalId])
+  const registry = useAsync<MetricsView>(() => api.metrics(), [])
   const [dataset, setDataset] = useState<string>('')
+  const [family, setFamily] = useState<MetricFamily | null>(null)
+  const metricNames = Array.from(
+    new Set(
+      (detail.data?.datasets ?? []).flatMap((entry) =>
+        Object.values(entry.scopes).flatMap((scope) => Object.keys(scope)),
+      ),
+    ),
+  )
+  const availableFamilies = FAMILIES.filter(({ key }) =>
+    metricNames.some((name) => metricFamily(name, registry.data?.definitions ?? []) === key),
+  )
+
+  useEffect(() => {
+    const keys = availableFamilies.map(({ key }) => key)
+    if (keys.length > 0 && (!family || !keys.includes(family))) setFamily(keys[0]!)
+  }, [evalId, family, availableFamilies.map(({ key }) => key).join(',')])
 
   if (detail.loading) return <Loading what="评测结果" />
   if (detail.error) return <Failed error={detail.error} />
   if (!detail.data) return null
+  if (registry.loading) return <Loading what="指标分组" />
+  if (registry.error) return <Failed error={registry.error} />
+  if (!registry.data) return null
 
   const data = detail.data
+  const definitions = registry.data.definitions
   const shown = dataset ? data.datasets.filter((d) => d.dataset === dataset) : data.datasets
 
   return (
@@ -382,6 +424,28 @@ function Results({ evalId }: { evalId: number }) {
           ))}
         </select>
       </div>
+
+      {availableFamilies.length > 0 && (
+        <div className="metric-family-filter">
+          <span className="small muted">指标组</span>
+          {availableFamilies.map(({ key, label, hint }) => (
+            <button
+              key={key}
+              className={`action small${family === key ? ' primary' : ''}`}
+              title={hint}
+              onClick={() => setFamily(key)}
+            >
+              {label}
+              <span className="muted">
+                {' '}
+                {metricNames.filter(
+                  (name) => metricFamily(name, definitions) === key,
+                ).length}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {data.judge.total > 0 && (
         <div className={`note${data.judge.failure_rate > 0.1 ? ' bad' : ' plain'}`}>
@@ -409,16 +473,35 @@ function Results({ evalId }: { evalId: number }) {
             ))}
           </p>
 
-          <ScopeTable scopes={entry.scopes} />
+          <ScopeTable
+            scopes={entry.scopes}
+            family={family}
+            definitions={definitions}
+          />
         </div>
       ))}
 
-      <SampleResults evalId={evalId} dataset={dataset} />
+      <SampleResults
+        evalId={evalId}
+        dataset={dataset}
+        family={family}
+        definitions={definitions}
+      />
     </div>
   )
 }
 
-function SampleResults({ evalId, dataset }: { evalId: number; dataset: string }) {
+function SampleResults({
+  evalId,
+  dataset,
+  family,
+  definitions,
+}: {
+  evalId: number
+  dataset: string
+  family: MetricFamily | null
+  definitions: MetricsView['definitions']
+}) {
   const [offset, setOffset] = useState(0)
   const [openSample, setOpenSample] = useState<string | null>(null)
   const [term, setTerm] = useState('')
@@ -436,6 +519,17 @@ function SampleResults({ evalId, dataset }: { evalId: number; dataset: string })
       }),
     [evalId, dataset, mode, q, offset],
   )
+  const nav = usePagedRecordNavigation({
+    items: samples.data?.samples ?? [],
+    total: samples.data?.total ?? 0,
+    responseOffset: samples.data?.offset ?? offset,
+    offset,
+    limit,
+    selectedKey: openSample,
+    itemKey: (sample) => sample.sample_id,
+    onSelect: (sample) => setOpenSample(sample.sample_id),
+    onOffsetChange: setOffset,
+  })
 
   useEffect(() => {
     setOffset(0)
@@ -451,9 +545,17 @@ function SampleResults({ evalId, dataset }: { evalId: number; dataset: string })
       <div style={{ marginTop: 18 }}>
         <div className="spread">
           <h4 style={{ margin: 0 }}>样本 {openSample}</h4>
-          <button className="action small" onClick={() => setOpenSample(null)}>
-            ← 返回样本列表
-          </button>
+          <RecordNav
+            hasPrevious={nav.hasPrevious}
+            hasNext={nav.hasNext}
+            onPrevious={nav.previous}
+            onNext={nav.next}
+            onBack={() => setOpenSample(null)}
+            backLabel="返回样本列表"
+            position={nav.position}
+            total={samples.data?.total ?? 0}
+            busy={samples.loading || nav.navigating}
+          />
         </div>
         <EvalSampleView key={openSample} evalId={evalId} sampleId={openSample} />
       </div>
@@ -506,7 +608,7 @@ function SampleResults({ evalId, dataset }: { evalId: number; dataset: string })
               <td className="small">{sample.question}</td>
               <td><ModeTag mode={sample.answer_mode} /></td>
               <td>
-                <MetricTags metrics={sample.metrics} />
+                <MetricTags metrics={sample.metrics} family={family} definitions={definitions} />
               </td>
               <td>
                 <button className="action small" onClick={() => setOpenSample(sample.sample_id)}>
@@ -598,8 +700,18 @@ function text(value: unknown, fallback = '—'): string {
   return typeof value === 'string' && value.trim() ? value : fallback
 }
 
-function MetricTags({ metrics }: { metrics: Record<string, number> }) {
-  const entries = Object.entries(metrics)
+function MetricTags({
+  metrics,
+  family,
+  definitions = [],
+}: {
+  metrics: Record<string, number>
+  family?: MetricFamily | null
+  definitions?: MetricsView['definitions']
+}) {
+  const entries = Object.entries(metrics).filter(
+    ([name]) => !family || metricFamily(name, definitions) === family,
+  )
   if (entries.length === 0) return <span className="small muted">没有指标值。</span>
   return (
     <div className="metric-tags">
@@ -763,10 +875,20 @@ function ReadableValue({ value }: { value: unknown }) {
 }
 
 /** 并排展示全样本与 knowledge 子集的指标均值。 */
-function ScopeTable({ scopes }: { scopes: Record<string, Record<string, number>> }) {
+function ScopeTable({
+  scopes,
+  family,
+  definitions,
+}: {
+  scopes: Record<string, Record<string, number>>
+  family: MetricFamily | null
+  definitions: MetricsView['definitions']
+}) {
   const names = Array.from(
     new Set(Object.values(scopes).flatMap((entry) => Object.keys(entry))),
-  ).sort()
+  )
+    .filter((name) => !family || metricFamily(name, definitions) === family)
+    .sort()
   if (names.length === 0) return <p className="small muted">没有指标值。</p>
 
   return (

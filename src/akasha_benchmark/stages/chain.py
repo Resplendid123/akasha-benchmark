@@ -11,7 +11,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ..datasets import DATASET_NAMES
+from ..datasets import DATASET_NAMES, get_adapter
+from ..metrics import registry
 from ..store import (
     attribution_store,
     compile_store,
@@ -23,10 +24,6 @@ from . import compile
 
 # 只用有 gold 标注的三组，否则检索族指标全省略，测不到指标计算那一段。
 DATASETS = ("hotpotqa", "2wikimultihopqa", "musique")
-MAX_SAMPLES = 3
-DEFAULT_METRICS = ("recall", "hit", "em", "f1", "citation_recall")
-
-
 def _check_query(connection, query_id: int) -> None:
     """查询响应要覆盖全部样本、都成功，且 knowledge 响应带着 retrievedSources。"""
     run = query_store.get_query_run(connection, query_id)
@@ -68,8 +65,16 @@ def _check_evaluate(connection, eval_id: int) -> None:
 
 
 def _check_attribute(connection, attribution_id: int) -> None:
-    if not attribution_store.attribution_results(connection, attribution_id):
-        raise RuntimeError("归因没有产出结论")
+    run = attribution_store.get_attribution_run(connection, attribution_id)
+    if run is None:
+        raise RuntimeError("归因记录不存在")
+    expected = {row["sample_id"] for row in eval_store.sample_evals(connection, int(run["eval_id"]))}
+    actual = {
+        row["sample_id"]
+        for row in attribution_store.attribution_results(connection, attribution_id)
+    }
+    if actual != expected:
+        raise RuntimeError("归因没有覆盖评测的全部样本")
 
 
 # 阶段名 -> 校验函数，签名是 (连接, 产物 id)。
@@ -87,14 +92,23 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
         raise ValueError(f"链路测试仅支持 {DATASETS}")
     if dataset not in DATASET_NAMES:
         raise ValueError(f"未知数据集：{dataset}")
-    samples = int(params.get("samples") or 2)
-    if not 1 <= samples <= MAX_SAMPLES:
-        raise ValueError(f"样本数必须在 1–{MAX_SAMPLES} 之间")
     if data_store.get_dataset(connection, dataset) is None:
         raise ValueError(f"请先归一化 {dataset}")
+    sample_id = str(params.get("sample_id") or "").strip()
+    if not sample_id:
+        raise ValueError("请选择一个测试样本")
+    sample = data_store.get_sample(connection, sample_id)
+    if sample is None or sample["dataset"] != dataset:
+        raise ValueError(f"{dataset} 里没有样本 {sample_id!r}")
 
     run_id = f"smoke{uuid.uuid4().hex[:8]}"
-    metrics = list(params.get("metrics") or DEFAULT_METRICS)
+    available_metrics = registry.available(get_adapter(dataset).provides)
+    with_judge = bool(params.get("with_judge", False))
+    metrics = [
+        definition.name
+        for definition in available_metrics
+        if with_judge or definition.kind == registry.KIND_DETERMINISTIC
+    ]
     evaluate_params: dict[str, Any] = {
         "name": f"{run_id}-e",
         "metrics": metrics,
@@ -109,7 +123,8 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
             "params": {
                 "run_id": run_id,
                 "datasets": [dataset],
-                "qa_limit": samples,
+                "qa_limit": 1,
+                "sample_ids": [sample_id],
                 "negatives_ratio": 1.0,
                 "seed": params.get("seed") or compile.default_seed(),
             },
@@ -121,8 +136,6 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
             "link": "eval_id",
             "params": {
                 "name": f"{run_id}-a",
-                "metric": "recall@5",
-                "sample_limit": samples,
                 "use_model": bool(params.get("use_model", False)),
                 "provider_id": params.get("provider_id"),
             },

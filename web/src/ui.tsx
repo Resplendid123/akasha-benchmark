@@ -228,7 +228,7 @@ export function StatusTag({ status }: { status: TaskStatus | RunStatus }) {
   return <span className={STATUS_CLASS[status] ?? 'tag'}>{STATUS_TEXT[status] ?? status}</span>
 }
 
-/** answerMode 的显示。非 knowledge 用警告色，它们的检索得分按定义为 0。 */
+/** answerMode 的显示。非 knowledge 用警告色；general 也可能保留未采用的检索结果。 */
 export function ModeTag({ mode }: { mode: string | null }) {
   const label = mode ?? 'missing'
   return <span className={`tag ${label === 'knowledge' ? 'ok' : 'warn'}`}>{label}</span>
@@ -334,11 +334,13 @@ export function Pager({
   offset,
   limit,
   onChange,
+  itemLabels = false,
 }: {
   total: number
   offset: number
   limit: number
   onChange: (offset: number) => void
+  itemLabels?: boolean
 }) {
   const pageCount = Math.max(1, Math.ceil(total / limit))
   const currentPage = Math.min(pageCount, Math.floor(offset / limit) + 1)
@@ -362,7 +364,7 @@ export function Pager({
         disabled={offset === 0}
         onClick={() => onChange(Math.max(0, offset - limit))}
       >
-        ← 上一页
+        ← {itemLabels ? '上一篇' : '上一页'}
       </button>
       <span>
         {currentPage} / {pageCount}（共 {total} 条）
@@ -372,7 +374,7 @@ export function Pager({
         disabled={offset + limit >= total}
         onClick={() => onChange(offset + limit)}
       >
-        下一页 →
+        {itemLabels ? '下一篇' : '下一页'} →
       </button>
       <span className="pager-jump">
         跳到
@@ -388,6 +390,111 @@ export function Pager({
         页
         <button className="action small" onClick={jump}>跳转</button>
       </span>
+    </div>
+  )
+}
+
+/** 分页记录详情导航。页内直接切换，到边界时先翻页再打开新页首/末项。 */
+export function usePagedRecordNavigation<T>({
+  items,
+  total,
+  responseOffset,
+  offset,
+  limit,
+  selectedKey,
+  itemKey,
+  onSelect,
+  onOffsetChange,
+}: {
+  items: T[]
+  total: number
+  responseOffset: number
+  offset: number
+  limit: number
+  selectedKey: string | null
+  itemKey: (item: T) => string
+  onSelect: (item: T) => void
+  onOffsetChange: (offset: number) => void
+}) {
+  const [pending, setPending] = useState<{ offset: number; edge: 'first' | 'last' } | null>(null)
+  const index = items.findIndex((item) => itemKey(item) === selectedKey)
+  const globalIndex = index < 0 ? -1 : responseOffset + index
+
+  useEffect(() => {
+    if (!selectedKey) {
+      setPending(null)
+      return
+    }
+    if (!pending || responseOffset !== pending.offset || items.length === 0) return
+    onSelect(pending.edge === 'first' ? items[0]! : items[items.length - 1]!)
+    setPending(null)
+  }, [items, onSelect, pending, responseOffset, selectedKey])
+
+  const previous = () => {
+    if (index > 0) {
+      onSelect(items[index - 1]!)
+      return
+    }
+    if (offset <= 0) return
+    const target = Math.max(0, offset - limit)
+    setPending({ offset: target, edge: 'last' })
+    onOffsetChange(target)
+  }
+
+  const next = () => {
+    if (index >= 0 && index < items.length - 1) {
+      onSelect(items[index + 1]!)
+      return
+    }
+    if (globalIndex < 0 || globalIndex + 1 >= total) return
+    const target = offset + limit
+    setPending({ offset: target, edge: 'first' })
+    onOffsetChange(target)
+  }
+
+  return {
+    previous,
+    next,
+    hasPrevious: globalIndex > 0,
+    hasNext: globalIndex >= 0 && globalIndex + 1 < total,
+    position: globalIndex >= 0 ? globalIndex + 1 : null,
+    navigating: pending !== null,
+  }
+}
+
+export function RecordNav({
+  hasPrevious,
+  hasNext,
+  onPrevious,
+  onNext,
+  onBack,
+  backLabel,
+  position,
+  total,
+  busy = false,
+}: {
+  hasPrevious: boolean
+  hasNext: boolean
+  onPrevious: () => void
+  onNext: () => void
+  onBack: () => void
+  backLabel: string
+  position?: number | null
+  total?: number
+  busy?: boolean
+}) {
+  return (
+    <div className="row tight">
+      {position && total ? <span className="small muted">{position} / {total}</span> : null}
+      <button className="action small" disabled={!hasPrevious || busy} onClick={onPrevious}>
+        ← 上一篇
+      </button>
+      <button className="action small" disabled={!hasNext || busy} onClick={onNext}>
+        下一篇 →
+      </button>
+      <button className="action small" onClick={onBack}>
+        ← {backLabel}
+      </button>
     </div>
   )
 }
