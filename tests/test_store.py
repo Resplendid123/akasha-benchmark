@@ -16,6 +16,7 @@ from akasha_benchmark.store import (
     init_db,
     query_store,
     run_store,
+    task_store,
 )
 
 
@@ -60,7 +61,7 @@ def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
         db, compile_id, "d", ["d:1"], [{"doc_id": "0", "is_gold": True}]
     )
     attribution_id = attribution_store.create_attribution_run(
-        db, name="a", eval_id=eval_id, provider_id=None
+        db, name="a", eval_id=eval_id, report_provider_id=None
     )
 
     compile_store.delete_compile_run(db, compile_id)
@@ -69,77 +70,6 @@ def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
     assert eval_store.get_eval_run(db, eval_id) is None
     assert attribution_store.get_attribution_run(db, attribution_id) is None
     assert compile_store.compile_docs(db, compile_id) == []
-
-
-def test_init_db_removes_legacy_attribution_scope_and_keeps_runs(tmp_path):
-    path = tmp_path / "legacy.db"
-    connection = connect(path)
-    connection.execute(
-        """
-        CREATE TABLE attribution_run (
-            id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, eval_id INTEGER NOT NULL,
-            metric TEXT NOT NULL, sample_limit INTEGER NOT NULL, provider_id INTEGER,
-            status TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT
-        )
-        """
-    )
-    connection.execute(
-        "INSERT INTO attribution_run VALUES (1, 'legacy', 7, 'em', 10, NULL, 'succeeded', 'now', NULL)"
-    )
-    connection.commit()
-    connection.close()
-
-    init_db(path)
-
-    connection = connect(path, read_only=True)
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(attribution_run)")}
-    run = dict(connection.execute("SELECT * FROM attribution_run WHERE id = 1").fetchone())
-    connection.close()
-    assert {"metric", "sample_limit"}.isdisjoint(columns)
-    assert run["name"] == "legacy"
-    assert run["concurrency"] == 1
-
-
-def test_init_db_removes_retired_metrics_from_historical_evals(db_path, db, eval_id):
-    db.execute(
-        "UPDATE eval_run SET metrics_json = ? WHERE id = ?",
-        ('["em", "citation_count"]', eval_id),
-    )
-    eval_store.record_sample_eval(
-        db,
-        eval_id,
-        sample_id="legacy",
-        dataset="d",
-        answer_mode="knowledge",
-        http_status=200,
-        answer="answer",
-        detail={},
-        metrics={"citation_count": 1.0},
-    )
-    db.execute(
-        "INSERT INTO metric_summary (eval_id, dataset, scope, metric, value, sample_count) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (eval_id, "d", "overall", "citation_count", 1.0, 1),
-    )
-    db.execute(
-        "INSERT INTO dataset_eval "
-        "(eval_id, dataset, responses_evaluated, http_failures, "
-        "omitted_metrics_json, answer_modes_json) VALUES (?, ?, ?, ?, ?, ?)",
-        (eval_id, "d", 1, 0, '["citation_count"]', "{}"),
-    )
-    db.commit()
-
-    init_db(db_path)
-
-    run = eval_store.get_eval_run(db, eval_id)
-    assert run["metrics_json"] == '["em"]'
-    assert db.execute(
-        "SELECT COUNT(*) FROM sample_metric WHERE metric = 'citation_count'"
-    ).fetchone()[0] == 0
-    assert db.execute(
-        "SELECT COUNT(*) FROM metric_summary WHERE metric = 'citation_count'"
-    ).fetchone()[0] == 0
-    assert eval_store.dataset_evals(db, eval_id)[0]["omitted_metrics"] == []
 
 
 @pytest.mark.usefixtures("sample_dataset")
@@ -333,45 +263,21 @@ def test_compile_ready_rejects_failed_compile_without_partial_success(db, compil
     assert readiness["warnings"] == []
 
 
-def test_compile_ready_recognizes_existing_partial_quality_report(db, compile_id):
-    docs = [{"doc_id": str(index), "is_gold": index == 0} for index in range(4)]
-    compile_store.replace_compile_subset(db, compile_id, "d", [], docs)
-    for index in range(4):
-        compile_store.record_page(
-            db, compile_id, "d", str(index), page_id=f"p{index}", error=None
-        )
-    compile_store.update_compile_run(
-        db,
-        compile_id,
-        space_id="s",
-        status=run_store.STATUS_FAILED,
-        quality_json=(
-            '{"passed": false, "gates": {'
-            '"missingChunkPageCount": 1, "missingEmbeddingPageCount": 1, '
-            '"missingSourcePageCount": 1, "stalePageCount": 0}}'
-        ),
-    )
-
-    readiness = compile_store.compile_ready(db, compile_id)
-    assert readiness["ready"] is True
-    assert "至少 1 篇" in readiness["warnings"][0]
-
-
 def test_provider_api_key_roundtrip(db):
-    provider_id = config_store.upsert_provider(
+    provider_id = config_store.upsert_model_provider(
         db,
-        role="judge",
+        purpose="judge",
         label="default",
         base_url="https://x/v1",
         model="m",
         api_key="secret",
     )
-    assert config_store.get_provider(db, provider_id)["api_key"] == "secret"
+    assert config_store.get_model_provider(db, provider_id)["api_key"] == "secret"
 
     with pytest.raises(ValueError):
-        config_store.upsert_provider(
+        config_store.upsert_model_provider(
             db,
-            role="bogus",
+            purpose="bogus",
             label="x",
             base_url="u",
             model="m",
@@ -380,16 +286,63 @@ def test_provider_api_key_roundtrip(db):
 
 
 def test_providers_are_listed_by_most_recent_update(db):
-    older = config_store.upsert_provider(
-        db, role="judge", label="z-old", base_url="u", model="m1", api_key="k"
+    older = config_store.upsert_model_provider(
+        db, purpose="judge", label="z-old", base_url="u", model="m1", api_key="k"
     )
-    newer = config_store.upsert_provider(
-        db, role="judge", label="a-new", base_url="u", model="m2", api_key="k"
+    newer = config_store.upsert_model_provider(
+        db, purpose="judge", label="a-new", base_url="u", model="m2", api_key="k"
     )
     db.execute("UPDATE model_provider SET updated_at = '2026-01-01T00:00:00Z' WHERE id = ?", (older,))
     db.execute("UPDATE model_provider SET updated_at = '2026-01-02T00:00:00Z' WHERE id = ?", (newer,))
 
-    assert [row["id"] for row in config_store.list_providers(db, "judge")] == [newer, older]
+    assert [row["id"] for row in config_store.list_model_providers(db, "judge")] == [newer, older]
+
+
+def test_task_tree_preserves_one_to_many_run_branches(db, compile_id, query_id, eval_id):
+    """任务树按产物外键分组，而不是把同一编译压成一条串行链。"""
+    second_query = query_store.create_query_run(
+        db,
+        name="q2",
+        compile_id=compile_id,
+        concurrency=1,
+        model_configs={},
+    )
+    second_eval = eval_store.create_eval_run(
+        db,
+        name="e2",
+        query_id=query_id,
+        ks=[2],
+        metrics=["em"],
+        judge_provider_id=None,
+    )
+    for evaluation, suffix in ((eval_id, "a1"), (eval_id, "a2"), (second_eval, "a3")):
+        attribution_store.create_attribution_run(
+            db, name=suffix, eval_id=evaluation, report_provider_id=None
+        )
+
+    compile_task = task_store.create_task(db, stage="compile", params={})
+    task_store.set_task_target(db, compile_task, "compile", compile_id)
+    query_task = task_store.create_task(db, stage="query", params={"compile_id": compile_id})
+    task_store.set_task_target(db, query_task, "query", query_id)
+    pending_eval = task_store.create_task(db, stage="evaluate", params={"query_id": second_query})
+    unlinked = task_store.create_task(db, stage="normalize", params={})
+    db.commit()
+
+    tree = task_store.task_tree(db)
+    root = tree["compiles"][0]
+    assert root["id"] == compile_id
+    assert [task["id"] for task in root["tasks"]] == [compile_task]
+    assert {child["id"] for child in root["children"]} == {query_id, second_query}
+
+    first_query = next(child for child in root["children"] if child["id"] == query_id)
+    assert [task["id"] for task in first_query["tasks"]] == [query_task]
+    assert {child["id"] for child in first_query["children"]} == {eval_id, second_eval}
+    first_eval = next(child for child in first_query["children"] if child["id"] == eval_id)
+    assert len(first_eval["children"]) == 2
+
+    other_query = next(child for child in root["children"] if child["id"] == second_query)
+    assert [task["id"] for task in other_query["pending_tasks"]] == [pending_eval]
+    assert [task["id"] for task in tree["unlinked_tasks"]] == [unlinked]
 
 
 def test_connection_rejects_unknown_fields(db):

@@ -1,11 +1,10 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { Task, TaskDetail } from '../types'
+import type { Task, TaskDetail, TaskTreeNode } from '../types'
 import {
   Bar,
   Failed,
   Loading,
-  Pager,
   STATUS_TEXT,
   StatusTag,
   formatDateTime,
@@ -14,37 +13,51 @@ import {
   usePoll,
 } from '../ui'
 
-/** 任务层：实时观测六层的任务，支持暂停、继续、清理。 */
+const STAGE_LABELS: Record<string, string> = {
+  compile: '编译',
+  query: '查询',
+  evaluate: '评测',
+  attribute: '归因',
+  download: '下载',
+  normalize: '归一化',
+}
+const RUN_LABELS: Record<string, string> = {
+  compile: '编译',
+  query: '查询',
+  eval: '评测',
+  attribution: '归因',
+}
+
+function tasksIn(nodes: TaskTreeNode[]): Task[] {
+  return nodes.flatMap((node) => [
+    ...node.tasks,
+    ...node.pending_tasks,
+    ...tasksIn(node.children),
+  ])
+}
+
+/** 任务层：按运行产物外键展示编译 → 查询 → 评测 → 归因分叉树。 */
 export function Tasks() {
-  const PAGE_SIZE = 10
-  const [offset, setOffset] = useState(0)
-  const tasks = useAsync(() => api.tasks({ limit: PAGE_SIZE, offset }), [offset])
-  const stages = useAsync(() => api.stages(), [])
+  const tasks = useAsync(() => api.taskTree(), [])
   const [open, setOpen] = useState<number | null>(null)
   const [showAudit, setShowAudit] = useState(false)
   const cleanup = useAction<{ deleted: number }>()
 
-  const list = tasks.data?.tasks ?? []
+  const linkedTasks = tasksIn(tasks.data?.compiles ?? [])
+  const allTasks = [...linkedTasks, ...(tasks.data?.unlinked_tasks ?? [])]
   usePoll(
-    list.some((t) => t.status === 'running' || t.status === 'queued'),
+    allTasks.some((t) => t.status === 'running' || t.status === 'queued'),
     tasks.reload,
   )
 
   const removableCount = tasks.data?.inactive_total ?? 0
-
-  useEffect(() => {
-    const total = tasks.data?.total
-    if (total !== undefined && total > 0 && offset >= total) {
-      setOffset(Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE)
-    }
-  }, [offset, tasks.data?.total])
 
   return (
     <>
       <h2>任务</h2>
 
       <div className="spread" style={{ marginBottom: 8 }}>
-        <h3 style={{ margin: 0 }}>任务列表</h3>
+        <h3 style={{ margin: 0 }}>运行链路</h3>
         <div className="row tight">
           <button className="action small" onClick={tasks.reload}>
             刷新
@@ -59,8 +72,7 @@ export function Tasks() {
               if (!window.confirm('清理所有已结束的任务记录？审计日志会保留。')) return
               cleanup.run(async () => {
                 const result = await api.cleanupTasks()
-                if (offset === 0) tasks.reload()
-                else setOffset(0)
+                tasks.reload()
                 return result
               })
             }}
@@ -72,46 +84,29 @@ export function Tasks() {
 
       {tasks.loading && <Loading what="任务" />}
       {tasks.error && <Failed error={tasks.error} />}
-      {tasks.data?.total === 0 && !tasks.loading && <p className="muted">还没有任务。</p>}
+      {tasks.data?.total_tasks === 0 && !tasks.loading && <p className="muted">还没有任务。</p>}
 
-      {list.length > 0 && (
-        <>
-          <table className="records-table tasks-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>阶段</th>
-                <th>状态</th>
-                <th>进度</th>
-                <th>参数</th>
-                <th>开始</th>
-                <th>结束</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {list.map((task) => (
-                <Row
-                  key={task.id}
-                  task={task}
-                  label={stages.data?.find((s) => s.stage === task.stage)?.label ?? task.stage}
-                  open={open === task.id}
-                  onToggle={() => setOpen(open === task.id ? null : task.id)}
-                  onChanged={tasks.reload}
-                />
-              ))}
-            </tbody>
-          </table>
-          <Pager
-            total={tasks.data?.total ?? 0}
-            offset={offset}
-            limit={PAGE_SIZE}
-            onChange={(next) => {
-              setOpen(null)
-              setOffset(next)
-            }}
+      {(tasks.data?.compiles ?? []).map((node) => (
+        <RunNode
+          key={`${node.kind}-${node.id}`}
+          node={node}
+          depth={0}
+          open={open}
+          onOpen={setOpen}
+          onChanged={tasks.reload}
+        />
+      ))}
+
+      {(tasks.data?.unlinked_tasks.length ?? 0) > 0 && (
+        <div className="panel">
+          <h3>未关联到运行产物的任务</h3>
+          <TaskTable
+            tasks={tasks.data!.unlinked_tasks}
+            open={open}
+            onOpen={setOpen}
+            onChanged={tasks.reload}
           />
-        </>
+        </div>
       )}
 
       {cleanup.error && <Failed error={cleanup.error} />}
@@ -119,6 +114,89 @@ export function Tasks() {
       {open !== null && <Logs key={open} taskId={open} onClose={() => setOpen(null)} />}
       {showAudit && <Audit />}
     </>
+  )
+}
+
+function RunNode({
+  node,
+  depth,
+  open,
+  onOpen,
+  onChanged,
+}: {
+  node: TaskTreeNode
+  depth: number
+  open: number | null
+  onOpen: (id: number | null) => void
+  onChanged: () => void
+}) {
+  return (
+    <section className={`task-tree-node depth-${Math.min(depth, 3)}`}>
+      <div className="task-tree-heading">
+        <strong>{RUN_LABELS[node.kind] ?? node.kind}</strong>
+        <span className="mono">{node.name} #{node.id}</span>
+        <StatusTag status={node.status} />
+        <span className="small muted">{node.children.length} 个下游分支</span>
+      </div>
+      {node.tasks.length > 0 && (
+        <TaskTable tasks={node.tasks} open={open} onOpen={onOpen} onChanged={onChanged} />
+      )}
+      {node.pending_tasks.length > 0 && (
+        <div className="task-tree-pending">
+          <div className="small muted">等待创建下游运行</div>
+          <TaskTable
+            tasks={node.pending_tasks}
+            open={open}
+            onOpen={onOpen}
+            onChanged={onChanged}
+          />
+        </div>
+      )}
+      {node.children.map((child) => (
+        <RunNode
+          key={`${child.kind}-${child.id}`}
+          node={child}
+          depth={depth + 1}
+          open={open}
+          onOpen={onOpen}
+          onChanged={onChanged}
+        />
+      ))}
+    </section>
+  )
+}
+
+function TaskTable({
+  tasks,
+  open,
+  onOpen,
+  onChanged,
+}: {
+  tasks: Task[]
+  open: number | null
+  onOpen: (id: number | null) => void
+  onChanged: () => void
+}) {
+  return (
+    <table className="records-table tasks-table">
+      <thead>
+        <tr>
+          <th>#</th><th>阶段</th><th>状态</th><th>进度</th><th>参数</th><th>开始</th><th>结束</th><th />
+        </tr>
+      </thead>
+      <tbody>
+        {tasks.map((task) => (
+          <Row
+            key={task.id}
+            task={task}
+            label={STAGE_LABELS[task.stage] ?? task.stage}
+            open={open === task.id}
+            onToggle={() => onOpen(open === task.id ? null : task.id)}
+            onChanged={onChanged}
+          />
+        ))}
+      </tbody>
+    </table>
   )
 }
 
@@ -188,7 +266,13 @@ function Row({
             <button
               className="action small"
               disabled={action.busy}
-              title="停在下一个可续跑的边界；已提交给 Akasha 的编译不会因此停止"
+              title={
+                task.stage === 'compile'
+                  ? '先调用 Akasha exact-run cancel，确认远端停止后在本地检查点暂停'
+                  : task.stage === 'query'
+                    ? '当前并发批次完成后暂停，继续前会校验远端模型配置'
+                    : '停在下一个可续跑的边界'
+              }
               onClick={() => act(() => api.pauseTask(task.id))}
             >
               暂停

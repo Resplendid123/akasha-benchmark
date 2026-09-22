@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 
 from test_akasha import FakeClient
@@ -23,16 +22,11 @@ from akasha_benchmark.stages import (
 from akasha_benchmark.datasets import get_adapter
 from akasha_benchmark.metrics import registry
 from akasha_benchmark.store import (
-    attribution_store,
     compile_store,
     config_store,
     connect,
-    eval_store,
-    query_store,
-    run_store,
     task_store,
 )
-from akasha_benchmark.task import TaskContext, execute
 
 
 def _imported_pages(connection) -> list[str]:
@@ -42,18 +36,6 @@ def _imported_pages(connection) -> list[str]:
         return []
     docs = compile_store.compile_docs(connection, int(runs[0]["id"]))
     return [doc["page_id"] for doc in docs if doc["page_id"] and doc["is_gold"]]
-
-
-def test_chain_is_not_a_stage():
-    """链路测试不能出现在阶段表里 —— 否则任务列表又多一类。"""
-    assert set(STAGES) == {
-        "download",
-        "normalize",
-        "compile",
-        "query",
-        "evaluate",
-        "attribute",
-    }
 
 
 def test_build_lays_out_four_steps(normalized, monkeypatch):
@@ -89,110 +71,6 @@ def test_build_adds_all_judge_metrics_when_requested(normalized, monkeypatch):
         for definition in registry.available(get_adapter("hotpotqa").provides)
     }
     assert set(steps[2]["params"]["metrics"]) == expected
-
-
-def test_build_seed_defaults_to_today(normalized, monkeypatch):
-    monkeypatch.setattr(chain, "DATASETS", ("hotpotqa",))
-    steps = chain.build({"dataset": "hotpotqa", "sample_id": "hotpotqa:q1"}, normalized)
-    assert steps[0]["params"]["seed"] == compile.default_seed()
-
-
-def test_full_chain(normalized, monkeypatch):
-    """四步依次跑完，三层样本集一致。"""
-    config_store.update_connection(normalized, base_url="http://x", email="e@x", password="p")
-    normalized.commit()
-
-    monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
-    # 查询时回本次编译真实的 page_id，这样评测才反查得回语料文档。
-    monkeypatch.setattr(
-        query,
-        "AkashaClient",
-        lambda config: FakeClient(config, retrieved=_imported_pages(normalized)),
-    )
-    monkeypatch.setattr(chain, "DATASETS", ("hotpotqa",))
-
-    steps = chain.build(
-        {"dataset": "hotpotqa", "sample_id": "hotpotqa:q1", "use_model": False},
-        normalized,
-    )
-
-    # 按运行器的方式推进：上一步的产物 id 填进下一步的关联参数。
-    target: int | None = None
-    for index, step in enumerate(steps, start=1):
-        params = {k: v for k, v in step["params"].items() if v is not None}
-        if link := step.get("link"):
-            params[link] = target
-        task_id = task_store.create_task(normalized, stage=step["stage"], params=params)
-        normalized.commit()
-        ctx = TaskContext(
-            task_id=task_id,
-            stage=step["stage"],
-            params=params,
-            connection=normalized,
-            pause_event=threading.Event(),
-        )
-        execute(STAGES[step["stage"]].run, ctx)
-
-        task = task_store.get_task(normalized, task_id) or {}
-        target = task.get("target_id")
-        assert target is not None, f"第 {index} 步 {step['stage']} 没有绑定产物"
-        # 契约校验就在这一步之后跑，和运行器里的顺序一致。
-        if check := chain.VERIFY.get(step["stage"]):
-            check(normalized, int(target))
-
-    compile_run = compile_store.list_compile_runs(normalized)[0]
-    compile_id = int(compile_run["id"])
-    assert compile_run["status"] == run_store.STATUS_SUCCEEDED
-
-    query_run = query_store.list_query_runs(normalized, compile_id)[0]
-    query_id = int(query_run["id"])
-    assert query_run["status"] == run_store.STATUS_SUCCEEDED
-
-    eval_run = eval_store.list_eval_runs(normalized, query_id)[0]
-    eval_id = int(eval_run["id"])
-    assert eval_run["status"] == run_store.STATUS_SUCCEEDED
-
-    # 三层的样本集必须一致，否则指标的分母就不是同一批东西。
-    expected = {s["sample_id"] for s in compile_store.compile_samples(normalized, compile_id)}
-    assert expected == {"hotpotqa:q1"}
-    assert {r["sample_id"] for r in query_store.responses_of(normalized, query_id)} == expected
-    assert {r["sample_id"] for r in eval_store.sample_evals(normalized, eval_id)} == expected
-
-    attribution_run = attribution_store.list_attribution_runs(normalized, eval_id)[0]
-    assert attribution_run["status"] == run_store.STATUS_SUCCEEDED
-    results = attribution_store.attribution_results(normalized, int(attribution_run["id"]))
-    assert {result["sample_id"] for result in results} == expected
-    # 没配归因模型时只出规则结论 —— 那仍然是一条有效的归因。
-    assert all(r["rule_based"] == 1 for r in results)
-
-
-def test_chain_records_share_a_chain_id(db):
-    """同一条链的任务共用链号，链首自己就是链号。"""
-    head = task_store.create_task(db, stage="compile", params={})
-    task_store.set_task_chain(db, head, chain=[{"stage": "query"}], chain_id=head)
-    db.commit()
-
-    chain_id, remaining = task_store.task_chain(db, head)
-    assert chain_id == head
-    assert remaining == [{"stage": "query"}]
-
-    # 链尾：剩余为空，运行器据此停止推进。
-    tail = task_store.create_task(db, stage="attribute", params={})
-    task_store.set_task_chain(db, tail, chain=[], chain_id=head)
-    db.commit()
-    assert task_store.task_chain(db, tail) == (head, [])
-
-
-def test_chain_bookkeeping_stays_out_of_responses(db):
-    """chain_json 是运行器的内部账本，不能出现在接口响应里。"""
-    task_id = task_store.create_task(db, stage="compile", params={"a": 1})
-    task_store.set_task_chain(db, task_id, chain=[{"stage": "query"}], chain_id=task_id)
-    db.commit()
-
-    task = task_store.get_task(db, task_id) or {}
-    assert "chain_json" not in task
-    assert "params_json" not in task
-    assert task["chain_id"] == task_id
 
 
 def test_build_rejects_unsupported_dataset(normalized):

@@ -107,7 +107,6 @@ export function App() {
               selectQuery(id)
               setView('evaluate')
             }}
-            onOpenSettings={() => setView('settings')}
             onOpenTasks={openTasks}
           />
         )}

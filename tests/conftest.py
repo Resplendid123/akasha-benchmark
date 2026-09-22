@@ -129,7 +129,7 @@ def compile_id(db):
 @pytest.fixture
 def query_id(db, compile_id):
     return query_store.create_query_run(
-        db, name="q", compile_id=compile_id, score_threshold=None, concurrency=1, model_configs={}
+        db, name="q", compile_id=compile_id, concurrency=1, model_configs={}
     )
 
 

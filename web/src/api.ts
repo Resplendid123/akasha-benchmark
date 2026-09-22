@@ -1,5 +1,4 @@
 import type {
-  AkashaConfigsView,
   AkashaModelsView,
   AttributionDetail,
   CompileDoc,
@@ -21,10 +20,9 @@ import type {
   ResponseList,
   SampleDetail,
   SampleList,
-  Stage,
   Task,
   TaskDetail,
-  TaskList,
+  TaskTree,
 } from './types'
 
 // 后端配置了令牌时，请求须携带它。sessionStorage 在标签页关闭后清除。
@@ -105,15 +103,7 @@ export const api = {
     put<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, payload),
   deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
   probeProvider: (id: number) => post<ProviderProbe>(`/api/providers/${id}/probe`),
-  // Akasha 模型配置组：本地多组，可整组应用到远端。
-  akashaConfigs: () => request<AkashaConfigsView>('/api/akasha-configs'),
-  saveAkashaConfig: (payload: Record<string, unknown>) =>
-    put<{ id: number; label: string }>('/api/akasha-configs', payload),
-  deleteAkashaConfig: (id: number) => del<{ deleted: number }>(`/api/akasha-configs/${id}`),
-  applyAkashaConfig: (id: number) =>
-    post<{ applied: string[]; requires_new_compile: boolean; impact: string }>(
-      `/api/akasha-configs/${id}/apply`,
-    ),
+  // Akasha 模型配置：按 feature 独立保存和应用。
   akashaModels: (feature?: string) =>
     request<AkashaModelsView>(`/api/akasha-models${query({ feature })}`),
   saveAkashaModel: (payload: Record<string, unknown>) =>
@@ -122,7 +112,7 @@ export const api = {
   applyAkashaModel: (id: number) => post<{ applied: string }>(`/api/akasha-models/${id}/apply`),
   exportConfig: () => request<Record<string, unknown>>('/api/config/export'),
   importConfig: (data: Record<string, unknown>) =>
-    post<{ connection: string[]; providers: number; akasha_configs: number; akasha_models: number }>(
+    post<{ connection: string[]; models: number }>(
       '/api/config/import',
       data,
     ),
@@ -192,9 +182,7 @@ export const api = {
     request<Lineage>(`/api/lineage/${encodeURIComponent(pageId)}${query({ question })}`),
 
   // --- 任务层 ---
-  stages: () => request<Stage[]>('/api/stages'),
-  tasks: (params: { status?: string; limit?: number; offset?: number } = {}) =>
-    request<TaskList>(`/api/tasks${query(params)}`),
+  taskTree: () => request<TaskTree>('/api/task-tree'),
   task: (id: number, afterId = 0) =>
     request<TaskDetail>(`/api/tasks/${id}${query({ after_id: afterId })}`),
   startTask: (stage: string, args: Record<string, unknown>) =>

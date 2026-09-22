@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 GRAPH_NEIGHBOR = "graph-neighbor"
+DIRECT_REASONS = frozenset({"semantic", "lexical", "exact-title"})
 
 
 def snippet_doc_ids(snippet: dict[str, Any], page_to_doc: dict[str, str]) -> set[str]:
@@ -54,8 +55,9 @@ def evaluate_sample(
             graph_docs |= docs
             if hits:
                 graph_gold_snippets += 1
-            gold_only_from_graph |= hits
-        else:
+            if not DIRECT_REASONS.intersection(reasons):
+                gold_only_from_graph |= hits
+        if DIRECT_REASONS.intersection(reasons) or GRAPH_NEIGHBOR not in reasons:
             gold_from_other |= hits
 
     # 只能靠图扩展才拿到的 gold，即图边的净增量。

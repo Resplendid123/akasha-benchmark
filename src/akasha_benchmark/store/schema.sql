@@ -1,17 +1,13 @@
--- 数据库最终结构；初始化可重复执行，不负责迁移旧数据库。
+-- 数据库最终结构。
 
 -- ------------------------------------------------------------ 配置层
-CREATE TABLE IF NOT EXISTS schema_migration (
-    name       TEXT PRIMARY KEY,
-    applied_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS akasha_connection (
     id                       INTEGER PRIMARY KEY CHECK (id = 1),
-    base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3001',
+    base_url                 TEXT NOT NULL DEFAULT 'http://127.0.0.1:3000',
     email                    TEXT NOT NULL DEFAULT 'test@example.com',
     password                 TEXT NOT NULL DEFAULT '12345678',
-    database_url             TEXT NOT NULL DEFAULT 'postgresql://akasha:STRONG_DB_PASSWORD@127.0.0.1:5433/akasha',  -- 只读 PG，归因链路用
+    database_url             TEXT NOT NULL DEFAULT 'postgresql://akasha:STRONG_DB_PASSWORD@127.0.0.1:5432/akasha',
     timeout_seconds          REAL NOT NULL DEFAULT 120.0,
     request_interval_seconds REAL NOT NULL DEFAULT 0.5,
     updated_at               TEXT NOT NULL
@@ -20,35 +16,17 @@ CREATE TABLE IF NOT EXISTS akasha_connection (
 INSERT OR IGNORE INTO akasha_connection (id, updated_at) VALUES (1, '1970-01-01T00:00:00Z');
 
 CREATE TABLE IF NOT EXISTS model_provider (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    role        TEXT NOT NULL CHECK (role IN ('judge', 'attribution')),
-    label       TEXT NOT NULL,
-    base_url    TEXT NOT NULL,
-    model       TEXT NOT NULL,
-    api_key     TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL,
-    UNIQUE (role, label)
-);
-
--- 本地保存的 Akasha 模型配置组，可整组应用到远端。
-CREATE TABLE IF NOT EXISTS akasha_config_group (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    label        TEXT NOT NULL UNIQUE,
-    configs_json TEXT NOT NULL,   -- {feature: {model, baseUrl, apiKey, parameters}}
-    selected     INTEGER NOT NULL DEFAULT 0,
-    updated_at   TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS akasha_model_provider (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    feature         TEXT NOT NULL CHECK (feature IN ('compiler', 'embedding', 'answer', 'image')),
+    purpose         TEXT NOT NULL CHECK (purpose IN (
+                        'judge', 'attribution', 'compiler', 'embedding', 'answer', 'image'
+                    )),
     label           TEXT NOT NULL,
     base_url        TEXT NOT NULL,
     model           TEXT NOT NULL,
     api_key         TEXT NOT NULL DEFAULT '',
     parameters_json TEXT NOT NULL DEFAULT '{}',
     updated_at      TEXT NOT NULL,
-    UNIQUE (feature, label)
+    UNIQUE (purpose, label)
 );
 
 -- --------------------------------------------- 数据集层 / 归一化层
@@ -85,19 +63,14 @@ CREATE TABLE IF NOT EXISTS corpus_doc (
 CREATE TABLE IF NOT EXISTS compile_run (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id             TEXT NOT NULL UNIQUE,
-    datasets_json      TEXT NOT NULL,    -- 当初勾了哪几组；与实际抽出的比对能看出哪组失败
+    datasets_json      TEXT NOT NULL,    -- 当初勾了哪几组
     seed               INTEGER NOT NULL,
-    qa_limit           INTEGER NOT NULL,  -- 每组各自的 QA 上限，不是总数
-    negatives_ratio    REAL NOT NULL,     -- 每篇 gold 配几篇负样本
-    space_id           TEXT,             -- 本次编译随机创建的空间；查询打在它上面
+    qa_limit           INTEGER NOT NULL, -- 每组各自的 QA 上限，不是总数
+    negatives_ratio    REAL NOT NULL,    -- 每篇 gold 配几篇负样本
+    space_id           TEXT,             -- 本次编译随机创建的空间
     space_name         TEXT,             -- 随机 slug，只做展示与人工核对
     workspace_id       TEXT,             -- 那个空间属于哪个 workspace
-    config_group       TEXT,             -- 旧版配置组标签，仅保留历史兼容
-    compiler_model_id  INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
-    embedding_model_id INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
-    image_model_id     INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
-    model_selection_json TEXT,           -- 本次编译选择的三项独立配置快照
-    model_configs_json TEXT,             -- 这一次编译跑在什么模型上
+    model_configs_json TEXT,             -- Akasha 实际生效的远端模型配置快照
     quality_json       TEXT,             -- missingChunk / missingEmbedding / missingSource / stalePageCount
     pace_json          TEXT,             -- 每篇编译耗时的估算，见 _compile_pace
     status             TEXT NOT NULL,     -- running / paused / succeeded / failed
@@ -128,12 +101,8 @@ CREATE TABLE IF NOT EXISTS query_run (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     name               TEXT NOT NULL UNIQUE,
     compile_id         INTEGER NOT NULL REFERENCES compile_run(id) ON DELETE CASCADE,
-    score_threshold    REAL,             -- 空表示用服务端默认值
     concurrency        INTEGER NOT NULL, -- 并发调用数
-    config_group       TEXT,             -- 旧版配置组标签，仅保留历史兼容
-    answer_model_id    INTEGER REFERENCES akasha_model_provider(id) ON DELETE SET NULL,
-    model_selection_json TEXT,           -- 本次查询选择的 answer 配置快照
-    model_configs_json TEXT,             -- 查询时的模型快照
+    model_configs_json TEXT,             -- 查询时 Akasha 实际生效的远端配置快照
     status             TEXT NOT NULL,    -- running / paused / succeeded / failed
     created_at         TEXT NOT NULL,
     finished_at        TEXT
@@ -186,7 +155,7 @@ CREATE TABLE IF NOT EXISTS sample_eval (
     answer_mode TEXT,
     http_status INTEGER NOT NULL,
     answer      TEXT,
-    detail_json TEXT NOT NULL,   -- 逐样本明细，归因读它
+    detail_json TEXT NOT NULL,
     PRIMARY KEY (eval_id, sample_id)
 );
 
@@ -239,8 +208,10 @@ CREATE TABLE IF NOT EXISTS attribution_run (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,
     eval_id     INTEGER NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
-    provider_id INTEGER REFERENCES model_provider(id) ON DELETE SET NULL,
-    concurrency INTEGER NOT NULL DEFAULT 1,
+    report_provider_id INTEGER REFERENCES model_provider(id) ON DELETE SET NULL,
+    report      TEXT,
+    report_error TEXT,
+    report_latency_ms INTEGER,
     status      TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     finished_at TEXT
@@ -251,12 +222,8 @@ CREATE INDEX IF NOT EXISTS attribution_run_eval_idx ON attribution_run(eval_id, 
 CREATE TABLE IF NOT EXISTS attribution_result (
     attribution_id INTEGER NOT NULL REFERENCES attribution_run(id) ON DELETE CASCADE,
     sample_id      TEXT NOT NULL,
-    dataset        TEXT NOT NULL,
     root_cause     TEXT NOT NULL,
     evidence_json  TEXT NOT NULL,
-    narrative      TEXT,
-    rule_based     INTEGER NOT NULL,
-    latency_ms     INTEGER,        -- 规则归因没有调用，为 NULL
     PRIMARY KEY (attribution_id, sample_id)
 );
 
@@ -284,7 +251,7 @@ CREATE TABLE IF NOT EXISTS task (
 CREATE INDEX IF NOT EXISTS task_status_idx ON task(status, id);
 CREATE INDEX IF NOT EXISTS task_chain_idx ON task(chain_id, id);
 
--- 只追加，清理任务不删它，所以 task_id 不设外键。
+-- 只追加
 CREATE TABLE IF NOT EXISTS audit_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER,

@@ -15,9 +15,8 @@ from typing import Any
 import httpx
 
 from ..akasha_client import AkashaClient, AkashaError
-from ..akasha_configs import apply_models, selection_snapshot
 from ..config import load_config
-from ..model_configs import drift
+from ..model_configs import drift, matches
 from ..store import compile_store, loads, query_store
 from ..task import TaskContext
 
@@ -26,11 +25,10 @@ def _query_one(
     client: AkashaClient,
     sample: dict[str, Any],
     space_id: str,
-    score_threshold: float | None,
 ) -> dict[str, Any]:
     """跑一条 query。失败也返回可落库的行。"""
     try:
-        response = client.query(sample["question"], [space_id], score_threshold=score_threshold)
+        response = client.query(sample["question"], [space_id])
         status, body, latency = response.status, response.body, response.latency_ms
         error = None
     except (AkashaError, httpx.RequestError, OSError) as exc:
@@ -83,19 +81,11 @@ def run(ctx: TaskContext) -> None:
 
     limit = params.get("sample_limit")
     limit = int(limit) if limit else None
-    score_threshold = params.get("score_threshold")
-    score_threshold = float(score_threshold) if score_threshold not in (None, "") else None
-
     config = load_config(ctx.db)
     config.require_credentials()
     concurrency = max(1, int(params.get("concurrency") or 3))
-    answer_model_id = params.get("answer_model_id")
-    answer_model_id = int(answer_model_id) if answer_model_id else None
     query_id = ctx.target("query")
-    if answer_model_id is None and query_id is not None:
-        existing_query = query_store.get_query_run(ctx.db, query_id) or {}
-        stored_answer_model_id = existing_query.get("answer_model_id")
-        answer_model_id = int(stored_answer_model_id) if stored_answer_model_id else None
+    resuming = query_id is not None
 
     with AkashaClient(config) as client:
         client.login()
@@ -108,19 +98,25 @@ def run(ctx: TaskContext) -> None:
         if mismatch:
             raise RuntimeError(mismatch)
 
-        selected_models = (
-            apply_models(ctx.db, client, {"answer": answer_model_id})
-            if answer_model_id is not None
-            else {}
-        )
-        if selected_models:
-            ctx.log(f"已应用查询 Answer 模型「{selected_models['answer']['label']}」")
-
         current = client.get_model_configs()
         snapshot = loads(compile_run["model_configs_json"])
         changed = drift(current, snapshot)
+        if changed["embedding"]:
+            raise RuntimeError("远端 embedding 配置与编译时不同，必须重新编译")
+        if resuming:
+            existing_query = query_store.get_query_run(ctx.db, query_id) or {}
+            query_snapshot = loads(existing_query.get("model_configs_json"))
+            resume_changed = [
+                feature
+                for feature in ("embedding", "answer")
+                if query_snapshot and not matches(current, query_snapshot, feature)
+            ]
+            if resume_changed:
+                raise RuntimeError(
+                    "远端模型配置已变化，不能继续原查询：" + ", ".join(resume_changed)
+                )
         for feature in ("compiler", "embedding", "answer", "image"):
-            if changed[feature]:
+            if changed[feature] and feature != "embedding":
                 ctx.log(
                     f"{feature} 配置与编译时不同；允许查询，两次运行不可完全对比",
                     "warn",
@@ -134,9 +130,7 @@ def run(ctx: TaskContext) -> None:
             name=name,
             datasets=datasets,
             concurrency=concurrency,
-            score_threshold=score_threshold,
             sample_limit=limit,
-            answer_model_id=answer_model_id,
         )
         if query_id is None:
             if query_store.query_run_by_name(ctx.db, name):
@@ -145,11 +139,8 @@ def run(ctx: TaskContext) -> None:
                 ctx.db,
                 name=name,
                 compile_id=compile_id,
-                score_threshold=score_threshold,
                 concurrency=concurrency,
                 model_configs=current,
-                answer_model_id=answer_model_id,
-                model_selection=selection_snapshot(selected_models),
             )
             ctx.bind("query", query_id)
 
@@ -167,7 +158,18 @@ def run(ctx: TaskContext) -> None:
             ctx.log(f"已清除 {removed} 条失败响应以便重试")
             ctx.freeze(retry_failed=False)
 
-        _issue(ctx, client, query_id, compile_run["space_id"], score_threshold, concurrency)
+        _issue(ctx, client, query_id, compile_run["space_id"], concurrency)
+        final_configs = client.get_model_configs()
+        changed_during_run = [
+            feature
+            for feature in ("embedding", "answer")
+            if not matches(final_configs, current, feature)
+        ]
+        if changed_during_run:
+            raise RuntimeError(
+                "查询期间远端模型配置发生变化，结果可能混合："
+                + ", ".join(changed_during_run)
+            )
 
     stats = query_store.query_stats(ctx.db, query_id)
     for dataset, row in stats.items():
@@ -182,7 +184,6 @@ def _issue(
     client: AkashaClient,
     query_id: int,
     space_id: str,
-    score_threshold: float | None,
     concurrency: int,
 ) -> None:
     """发请求并逐条落库。已有响应的样本跳过，所以暂停后继续即续跑。"""
@@ -216,7 +217,7 @@ def _issue(
     if concurrency <= 1:
         for sample in todo:
             ctx.checkpoint()
-            emit(_query_one(client, sample, space_id, score_threshold))
+            emit(_query_one(client, sample, space_id))
         return
 
     # 每个 worker 一个独立客户端：限流器用实例上的 _last_request_at，
@@ -232,7 +233,7 @@ def _issue(
         def task(sample: dict[str, Any]) -> dict[str, Any]:
             borrowed = pool.get()
             try:
-                return _query_one(borrowed, sample, space_id, score_threshold)
+                return _query_one(borrowed, sample, space_id)
             finally:
                 pool.put(borrowed)
 

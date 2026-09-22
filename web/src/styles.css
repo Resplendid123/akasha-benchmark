@@ -473,3 +473,22 @@ button.sample-picker-item.selected { border-color: var(--accent); background: va
 .secret-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .secret-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
 .secret-toggle svg { display: block; }
+
+/* 任务按运行产物组成分叉树；颜色与缩进共同表达 compile → query → eval → attribution。 */
+.task-tree-node {
+  margin: 10px 0; padding: 10px 10px 4px; border: 1px solid var(--border);
+  border-left: 4px solid var(--accent); border-radius: 7px; background: var(--panel);
+}
+.task-tree-node .task-tree-node { margin-left: 18px; background: var(--panel-2); }
+.task-tree-node.depth-2 { border-left-color: var(--warn); }
+.task-tree-node.depth-3 { border-left-color: var(--ok); }
+.task-tree-heading {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 7px 10px; margin-bottom: 8px;
+}
+.task-tree-pending {
+  margin: 8px 0; padding: 8px; border: 1px dashed var(--border-strong); border-radius: 6px;
+}
+@media (max-width: 720px) {
+  .task-tree-node .task-tree-node { margin-left: 8px; }
+  .task-tree-node .tasks-table { display: block; overflow-x: auto; }
+}

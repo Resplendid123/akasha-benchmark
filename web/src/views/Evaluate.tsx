@@ -148,7 +148,7 @@ export function Evaluate({
                   <td className="mono small">
                     {run.name} <span className="muted">#{run.id}</span>
                   </td>
-                  <td className="small">{run.config_group ?? '—'}</td>
+                  <td className="small">{run.model_label ?? '—'}</td>
                   <td>
                     <StatusTag status={run.status} />
                   </td>

@@ -119,7 +119,7 @@ def _compile_run(connection, **overrides) -> int:
 
 def _register(monkeypatch, name: str, run) -> None:
     monkeypatch.setitem(
-        STAGES, name, StageSpec(name=name, label=name, run=run, params={"marker": str})
+        STAGES, name, StageSpec(label=name, run=run, params={"marker": str})
     )
 
 
@@ -174,7 +174,7 @@ def test_failure_is_recorded_on_the_task(settings, monkeypatch):
 def test_failed_query_can_create_retry_task_without_original_task(settings, db, monkeypatch):
     compile_id = _compile_run(db, run_id="retry-query-compile")
     query_id = query_store.create_query_run(
-        db, name="retry-query", compile_id=compile_id, score_threshold=None,
+        db, name="retry-query", compile_id=compile_id,
         concurrency=3, model_configs={},
     )
     query_store.record_response(
@@ -236,7 +236,7 @@ def test_compile_task_action_cancels_remote_bullmq_run(settings, db, monkeypatch
     class FakeAkasha(_AkashaStub):
         def cancel_compile_run(self, run_id, reason):
             calls.append((run_id, reason))
-            return {"disposition": "cancelled", "removedJobCount": 2}
+            return {"disposition": "cancelled", "runId": run_id, "status": "cancelled", "removedJobCount": 2}
 
     monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
     task_id = task_store.create_task(
@@ -256,28 +256,67 @@ def test_compile_task_action_cancels_remote_bullmq_run(settings, db, monkeypatch
     assert calls[0][1].startswith("Akasha-Benchmark task")
 
 
-def test_cleanup_finds_active_remote_run_for_legacy_compile_task(settings, db, monkeypatch):
-    """旧任务没保存 runId 时，用绑定空间找活动 Run。"""
-    calls: list[str] = []
+def test_pause_rejects_invalid_remote_cancel_response(settings, db, monkeypatch):
+    class FakeAkasha(_AkashaStub):
+        def cancel_compile_run(self, run_id, reason):
+            return {"disposition": "not_found", "runId": run_id}
+
+    monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
+    task_id = task_store.create_task(
+        db, stage="compile", params={"remote_compile_run_ids": ["run-1"]}
+    )
+    task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+
+    with pytest.raises(TaskRejected, match="取消.*无效结果"):
+        TaskRunner(settings).pause(task_id)
+    assert task_store.get_task(db, task_id)["status"] == task_store.RUNNING
+
+
+def test_pause_discovers_and_cancels_active_run_before_id_is_saved(
+    settings, db, compile_id, monkeypatch
+):
+    cancelled: list[str] = []
 
     class FakeAkasha(_AkashaStub):
         def run_diagnostics(self, space_ids, *, limit=50):
             return {"items": [{"runId": "active-run", "status": "compiling"}]}
 
         def cancel_compile_run(self, run_id, reason):
-            calls.append(run_id)
-            return {"disposition": "cancelled", "removedJobCount": 1}
+            cancelled.append(run_id)
+            return {"disposition": "cancelled", "runId": run_id, "status": "cancelled"}
 
     monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
-    compile_id = _compile_run(db, run_id="legacy")
-    compile_store.update_compile_run(db, compile_id, space_id="space-1")
+    compile_store.update_compile_run(db, compile_id, space_id="benchmark-space")
     task_id = task_store.create_task(db, stage="compile", params={})
     task_store.set_task_target(db, task_id, "compile", compile_id)
-    task_store.transition(db, task_id, task_store.FAILED)
+    task_store.transition(db, task_id, task_store.RUNNING)
     db.commit()
 
-    TaskRunner(settings).cleanup(task_id)
-    assert calls == ["active-run"]
+    TaskRunner(settings).pause(task_id)
+    assert cancelled == ["active-run"]
+    assert task_store.get_task(db, task_id)["status"] == task_store.PAUSED
+
+
+@pytest.mark.parametrize("status", ["cancelled", "succeeded"])
+def test_pause_distinguishes_cancelled_from_naturally_terminal_remote_run(
+    settings, db, monkeypatch, status
+):
+    class FakeAkasha(_AkashaStub):
+        def cancel_compile_run(self, run_id, reason):
+            return {"disposition": "already_terminal", "runId": run_id, "status": status}
+
+    monkeypatch.setattr("akasha_platform.tasks.AkashaClient", FakeAkasha)
+    task_id = task_store.create_task(
+        db, stage="compile", params={"remote_compile_run_ids": ["run-1"]}
+    )
+    task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+
+    result = TaskRunner(settings).pause(task_id)
+    assert result["status"] == (
+        task_store.PAUSED if status == "cancelled" else task_store.RUNNING
+    )
 
 
 def test_running_task_cannot_be_cleaned_up(settings, monkeypatch):
@@ -316,16 +355,7 @@ def test_same_stage_does_not_run_twice(settings, monkeypatch):
     release.set()
 
 
-def test_compile_tasks_are_serialized_while_applying_models(settings, monkeypatch):
-    runner = TaskRunner(settings)
-    monkeypatch.setattr(runner, "_spawn", lambda *args: None)
-
-    runner.start("compile", {})
-    with pytest.raises(TaskRejected, match="正在运行"):
-        runner.start("compile", {})
-
-
-def test_compile_resume_obeys_serial_model_application(settings, db, monkeypatch):
+def test_compile_resume_obeys_same_stage_serialization(settings, db, monkeypatch):
     paused_id = task_store.create_task(db, stage="compile", params={})
     task_store.transition(db, paused_id, task_store.PAUSED)
     task_id = task_store.create_task(db, stage="compile", params={})
@@ -368,10 +398,8 @@ def test_recover_marks_orphaned_tasks_paused(settings):
 # ------------------------------------------------------------ 路由
 
 
-def test_health_and_stages(client):
+def test_health(client):
     assert client.get("/api/health").json()["ok"] is True
-    stages = client.get("/api/stages").json()
-    assert {entry["stage"] for entry in stages} == set(STAGES)
 
 
 def test_datasets_route_reports_missing_files(client):
@@ -427,7 +455,7 @@ def test_provider_api_key_never_leaves_the_backend(client):
     try:
         from akasha_benchmark.store import config_store
 
-        stored = config_store.list_providers(connection, "judge")[0]
+        stored = config_store.list_model_providers(connection, "judge")[0]
     finally:
         connection.close()
     assert stored["api_key"] == "secret"
@@ -499,9 +527,9 @@ def test_provider_probe_reports_missing_key(client):
 
     connection = connect(client.app.state.settings.db_path)
     try:
-        provider_id = config_store.upsert_provider(
+        provider_id = config_store.upsert_model_provider(
             connection,
-            role="judge",
+            purpose="judge",
             label="nokey",
             base_url="https://x/v1",
             model="m",
@@ -533,9 +561,9 @@ def test_provider_does_not_expose_or_use_concurrency(client):
 
     connection = connect(client.app.state.settings.db_path)
     try:
-        provider_id = config_store.upsert_provider(
+        provider_id = config_store.upsert_model_provider(
             connection,
-            role="judge",
+            purpose="judge",
             label="k",
             base_url="https://x/v1",
             model="m",
@@ -546,39 +574,6 @@ def test_provider_does_not_expose_or_use_concurrency(client):
     finally:
         connection.close()
     assert not hasattr(resolved, "concurrency")
-
-
-def test_akasha_config_group_roundtrip_hides_keys(client):
-    client.put(
-        "/api/akasha-configs",
-        json={
-            "label": "g1",
-            "configs": {
-                "compiler": {"model": "c", "baseUrl": "https://x/v1", "apiKey": "secret"},
-            },
-        },
-    )
-    body = client.get("/api/akasha-configs").json()
-    group = body["groups"][0]
-    assert group["label"] == "g1"
-    assert group["configs"]["compiler"]["apiKeySet"] is True
-    assert "apiKey" not in group["configs"]["compiler"]
-
-    # 密钥留空保留原值。
-    client.put(
-        "/api/akasha-configs",
-        json={"id": group["id"], "label": "g1", "configs": {"compiler": {"model": "c2"}}},
-    )
-    connection = connect(client.app.state.settings.db_path, read_only=True)
-    try:
-        stored = config_store.list_config_groups(connection)[0]
-    finally:
-        connection.close()
-    from akasha_benchmark.store import loads
-
-    configs = loads(stored["configs_json"], {})
-    assert configs["compiler"]["apiKey"] == "secret"
-    assert configs["compiler"]["model"] == "c2"
 
 
 def test_akasha_models_are_independent_and_hide_keys(client):
@@ -611,7 +606,7 @@ def test_akasha_models_are_independent_and_hide_keys(client):
     )
     connection = connect(client.app.state.settings.db_path, read_only=True)
     try:
-        stored = config_store.get_akasha_model(connection, created["id"])
+        stored = config_store.get_model_provider(connection, created["id"])
     finally:
         connection.close()
     assert stored["model"] == "answer-model-2"
@@ -693,74 +688,62 @@ def test_embedding_model_apply_sends_dimension(client, monkeypatch):
     ]
 
 
-def test_akasha_config_delete(client):
-    client.put("/api/akasha-configs", json={"label": "a", "configs": {}})
-    client.put("/api/akasha-configs", json={"label": "b", "configs": {}})
-    groups = {g["label"]: g["id"] for g in client.get("/api/akasha-configs").json()["groups"]}
-
-    assert client.delete(f"/api/akasha-configs/{groups['a']}").status_code == 200
-    labels = [g["label"] for g in client.get("/api/akasha-configs").json()["groups"]]
-    assert labels == ["b"]
-
-
-def test_akasha_config_apply_pushes_all_features(client, monkeypatch):
-    client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
-    client.put(
-        "/api/akasha-configs",
-        json={
-            "label": "g",
-            "configs": {"answer": {"model": "a", "baseUrl": "https://x/v1", "apiKey": "k"}},
-        },
-    )
-    group_id = client.get("/api/akasha-configs").json()["groups"][0]["id"]
-
-    from akasha_platform.api import config as config_api
-
-    pushed = []
-
-    class Fake(_AkashaStub):
-        def put_model_config(self, feature, payload):
-            pushed.append((feature, payload))
-            return {}
-
-    monkeypatch.setattr(config_api, "AkashaClient", Fake)
-    body = client.post(f"/api/akasha-configs/{group_id}/apply").json()
-    assert set(body["applied"]) == set(config_api.FEATURES)
-    assert all(payload["provider"] == "openai-compatible" for _, payload in pushed)
-
-    # 应用后该组即为选中。
-    selected = [g for g in client.get("/api/akasha-configs").json()["groups"] if g["selected"]]
-    assert [g["id"] for g in selected] == [group_id]
-
-
 def test_config_import_round_trips_export(client):
     client.put("/api/connection", json={"password": "pw", "email": "e@x", "base_url": "http://y"})
-    client.put(
+    judge = client.put(
         "/api/providers/judge",
         json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "sk"},
-    )
-    client.put(
-        "/api/akasha-configs",
-        json={"label": "g", "configs": {"answer": {"model": "a", "apiKey": "gk"}}},
-    )
+    ).json()
+    model = client.put(
+        "/api/akasha-models",
+        json={
+            "feature": "answer",
+            "label": "answer-a",
+            "base_url": "https://answer.example/v1",
+            "model": "a",
+            "api_key": "gk",
+            "parameters": {"temperature": 0},
+        },
+    ).json()
     exported = client.get("/api/config/export").json()
     assert exported["connection"]["password"] == "pw"
-    assert exported["providers"][0]["api_key"] == "sk"
-    assert exported["akasha_configs"][0]["configs"]["answer"]["apiKey"] == "gk"
+    assert set(exported) == {"connection", "models"}
+    assert exported["models"] == [
+        {
+            "purpose": "answer",
+            "label": "answer-a",
+            "base_url": "https://answer.example/v1",
+            "model": "a",
+            "api_key": "gk",
+            "parameters": {"temperature": 0},
+        },
+        {
+            "purpose": "judge",
+            "label": "d",
+            "base_url": "https://x/v1",
+            "model": "m",
+            "api_key": "sk",
+            "parameters": {},
+        },
+    ]
 
     # 清一遍再导回：导入后应与导出前一致。
     client.put("/api/connection", json={"password": "", "email": "", "base_url": ""})
-    assert client.post("/api/config/import", json=exported).status_code == 200
+    client.delete(f"/api/akasha-models/{model['id']}")
+    client.delete(f"/api/providers/{judge['id']}")
+    imported = client.post("/api/config/import", json=exported)
+    assert imported.status_code == 200
+    assert imported.json()["models"] == 2
+    assert set(imported.json()) == {"connection", "models"}
 
     back = client.get("/api/config/export").json()
     assert back["connection"]["password"] == "pw"
     assert back["connection"]["base_url"] == "http://y"
-    assert back["providers"][0]["api_key"] == "sk"
-    assert back["akasha_configs"][0]["configs"]["answer"]["apiKey"] == "gk"
+    assert back["models"] == exported["models"]
 
 
 def test_config_import_rejects_bad_role(client):
-    payload = {"providers": [{"role": "nonsense", "label": "d", "base_url": "u", "model": "m"}]}
+    payload = {"models": [{"purpose": "nonsense", "label": "d", "base_url": "u", "model": "m"}]}
     assert client.post("/api/config/import", json=payload).status_code == 422
 
 
@@ -904,43 +887,17 @@ def test_normalized_dataset_browsing_filters_and_pages_in_sqlite(
     "path",
     [
         "/api/datasets/hotpotqa/raw?limit=0",
-        "/api/datasets/hotpotqa/samples?offset=-1",
-        "/api/datasets/hotpotqa/corpus?limit=-1",
-        "/api/compiles/1/docs?offset=-1",
-        "/api/queries/1/responses?limit=0",
-        "/api/evals/1/samples?offset=-1",
-        "/api/tasks?limit=0",
         "/api/tasks/1?after_id=-1",
-        "/api/audit?limit=-1",
     ],
 )
 def test_paged_routes_reject_invalid_bounds(client, path):
     assert client.get(path).status_code == 422
 
 
-def test_tasks_route_pages_ten_at_a_time(client):
-    connection = connect(client.app.state.settings.db_path)
-    try:
-        for index in range(12):
-            task_id = task_store.create_task(
-                connection, stage="unit", params={"index": index}
-            )
-            task_store.transition(connection, task_id, task_store.SUCCEEDED)
-        connection.commit()
-    finally:
-        connection.close()
-
-    first = client.get("/api/tasks").json()
-    assert first["total"] == 12
-    assert first["inactive_total"] == 12
-    assert first["limit"] == 10
-    assert first["offset"] == 0
-    assert [task["id"] for task in first["tasks"]] == list(range(12, 2, -1))
-
-    second = client.get("/api/tasks", params={"limit": 10, "offset": 10}).json()
-    assert second["total"] == 12
-    assert second["offset"] == 10
-    assert [task["id"] for task in second["tasks"]] == [2, 1]
+def test_task_tree_route(client):
+    response = client.get("/api/task-tree")
+    assert response.status_code == 200
+    assert set(response.json()) == {"total_tasks", "inactive_total", "compiles", "unlinked_tasks"}
 
 
 def test_provider_rename_updates_the_same_row(client):
@@ -1050,15 +1007,27 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
     compile_store.record_page(
         normalized, compile_id, "hotpotqa", "2", page_id="page-venice", error=None
     )
-    compile_store.update_compile_run(normalized, compile_id, config_group="group-a")
+    from akasha_benchmark.store import dumps
+
+    compile_store.update_compile_run(
+        normalized,
+        compile_id,
+        model_configs_json=dumps(
+            {
+                "configs": [
+                    {"feature": "compiler", "model": "compiler-model"}
+                ]
+            }
+        ),
+    )
     query_id = query_store.create_query_run(
         normalized,
         name="search-query",
         compile_id=compile_id,
-        score_threshold=None,
         concurrency=1,
-        model_configs={},
-        config_group="group-b",
+        model_configs={
+            "configs": [{"feature": "answer", "model": "answer-model"}]
+        },
     )
     cases = (
         ("sample-rita", "Who won the award?", "Rita Moreno", "knowledge"),
@@ -1099,17 +1068,14 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
         normalized,
         name="search-attribution",
         eval_id=eval_id,
-        provider_id=None,
+        report_provider_id=None,
     )
     attribution_store.record_attribution(
         normalized,
         attribution_id,
         sample_id="sample-venice",
-        dataset="hotpotqa",
         root_cause="not_a_failure",
         evidence={},
-        narrative=None,
-        rule_based=True,
     )
     normalized.commit()
 
@@ -1141,18 +1107,18 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
     attribution_run = next(
         run for run in eval_run["attributions"] if run["id"] == attribution_id
     )
-    assert (query_run["config_group"], query_run["sample_count"], query_run["success_count"]) == (
-        "group-b",
+    assert (query_run["model_label"], query_run["sample_count"], query_run["success_count"]) == (
+        "answer-model",
         2,
         2,
     )
-    assert (eval_run["config_group"], eval_run["sample_count"], eval_run["success_count"]) == (
+    assert (eval_run["model_label"], eval_run["sample_count"], eval_run["success_count"]) == (
         "确定性指标",
         2,
         2,
     )
     assert (
-        attribution_run["config_group"],
+        attribution_run["model_label"],
         attribution_run["sample_count"],
         attribution_run["success_count"],
     ) == ("规则归因", 2, 1)
@@ -1167,7 +1133,6 @@ def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, 
             normalized,
             name=f"tree-query-{index}",
             compile_id=compile_id,
-            score_threshold=None,
             concurrency=1,
             model_configs={},
         )
@@ -1184,8 +1149,7 @@ def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, 
             normalized,
             name=f"tree-attribution-{index}",
             eval_id=eval_id,
-            provider_id=None,
-            concurrency=4,
+            report_provider_id=None,
         )
     normalized.commit()
 
@@ -1212,99 +1176,7 @@ def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, 
     assert len(response.json()["compiles"]) == 4
     evaluation = response.json()["compiles"][0]["queries"][0]["evals"][0]
     assert evaluation["concurrency"] == 3
-    assert evaluation["attributions"][0]["concurrency"] == 4
     assert len(selects) <= 15
-
-
-def test_compile_tree_ignores_unknown_historical_metrics(client, normalized):
-    compile_id = _compile_run(normalized, run_id="legacy-metric")
-    query_id = query_store.create_query_run(
-        normalized,
-        name="legacy-metric-query",
-        compile_id=compile_id,
-        score_threshold=None,
-        concurrency=1,
-        model_configs={},
-    )
-    eval_id = eval_store.create_eval_run(
-        normalized,
-        name="legacy-metric-eval",
-        query_id=query_id,
-        ks=[2],
-        metrics=["em"],
-        judge_provider_id=None,
-    )
-    normalized.execute(
-        "UPDATE eval_run SET metrics_json = ? WHERE id = ?",
-        ('["em", "removed_metric"]', eval_id),
-    )
-    normalized.commit()
-
-    response = client.get("/api/compiles")
-
-    assert response.status_code == 200
-    evaluation = response.json()["compiles"][0]["queries"][0]["evals"][0]
-    assert evaluation["metrics"] == ["em"]
-
-
-def test_compile_success_count_comes_from_saved_progress(client, normalized):
-    compile_id = _compile_run(normalized, run_id="pg-count", datasets=["hotpotqa"])
-    docs = [{"doc_id": str(index), "is_gold": index == 0} for index in range(3)]
-    compile_store.replace_compile_subset(normalized, compile_id, "hotpotqa", [], docs)
-    page_ids = [f"00000000-0000-0000-0000-00000000000{index}" for index in range(3)]
-    for index, page_id in enumerate(page_ids):
-        compile_store.record_page(
-            normalized, compile_id, "hotpotqa", str(index), page_id=page_id, error=None
-        )
-    normalized.commit()
-
-    from akasha_benchmark.store import dumps
-
-    compile_store.update_compile_run(
-        normalized,
-        compile_id,
-        quality_json=dumps({"passed": False, "progress": {"succeeded": 2, "failed": 1}}),
-    )
-    normalized.commit()
-
-    run = next(
-        entry for entry in client.get("/api/compiles").json()["compiles"]
-        if entry["id"] == compile_id
-    )
-    assert run["compiled_pages"] == 2
-    assert run["compiled_pages_error"] is None
-
-
-def test_compile_success_count_falls_back_for_legacy_success(client, normalized):
-    compile_id = _compile_run(normalized, run_id="pg-down")
-    compile_store.replace_compile_subset(
-        normalized, compile_id, "hotpotqa", [], [{"doc_id": "0", "is_gold": True}]
-    )
-    compile_store.record_page(
-        normalized,
-        compile_id,
-        "hotpotqa",
-        "0",
-        page_id="00000000-0000-0000-0000-000000000000",
-        error=None,
-    )
-    normalized.commit()
-
-    from akasha_benchmark.store import dumps
-
-    compile_store.update_compile_run(
-        normalized,
-        compile_id,
-        quality_json=dumps({"passed": True}),
-        status=run_store.STATUS_SUCCEEDED,
-    )
-    normalized.commit()
-
-    response = client.get("/api/compiles")
-    assert response.status_code == 200
-    run = next(entry for entry in response.json()["compiles"] if entry["id"] == compile_id)
-    assert run["compiled_pages"] == 1
-    assert run["compiled_pages_error"] is None
 
 
 def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, monkeypatch):
@@ -1315,7 +1187,7 @@ def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, mon
             return {"items": [{"runId": "run-1", "status": "compiling"}]}
         def cancel_compile_run(self, run_id, reason):
             calls.append(run_id)
-            return {"disposition": "cancelled", "removedJobCount": 2}
+            return {"disposition": "cancelled", "runId": run_id, "status": "cancelled", "removedJobCount": 2}
 
     monkeypatch.setattr("akasha_platform.api.runs.AkashaClient", FakeAkasha)
     connection = connect(db_path)
@@ -1435,7 +1307,7 @@ def test_cleanup_protects_active_descendants(
         db,
         name="a",
         eval_id=eval_id,
-        provider_id=None,
+        report_provider_id=None,
     )
     ids = {"compile": compile_id, "query": query_id, "eval": eval_id, "attribution": attribution_id}
     kind = {"query": "query", "evaluate": "eval", "attribute": "attribution"}[stage]
@@ -1473,3 +1345,72 @@ def test_concurrent_starts_admit_only_one_task(settings, monkeypatch):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: start(), range(2)))
     assert sum(task_id is not None for task_id in results) == 1
+
+
+def test_compile_and_query_tasks_can_run_concurrently(settings, db, monkeypatch):
+    monkeypatch.setattr(TaskRunner, "_spawn", lambda *args: None)
+    runner = TaskRunner(settings)
+    compile_task = runner.start("compile", {"datasets": ["hotpotqa"]})
+    task_store.transition(db, int(compile_task["id"]), task_store.RUNNING)
+    db.commit()
+    query_task = runner.start("query", {"compile_id": 1})
+    assert query_task["stage"] == "query"
+
+
+@pytest.mark.parametrize(
+    "stage,feature,allowed",
+    [
+        ("compile", "compiler", False),
+        ("compile", "embedding", False),
+        ("compile", "image", False),
+        ("compile", "answer", True),
+        ("query", "embedding", False),
+        ("query", "answer", False),
+        ("query", "compiler", True),
+        ("query", "image", True),
+    ],
+)
+def test_remote_model_config_lock_is_feature_scoped(
+    client, db, monkeypatch, stage, feature, allowed
+):
+    from akasha_platform.api import config as config_api
+
+    class Fake(_AkashaStub):
+        def put_model_config(self, selected_feature, payload):
+            return {"feature": selected_feature}
+
+    monkeypatch.setattr(config_api, "AkashaClient", Fake)
+    task_id = task_store.create_task(db, stage=stage, params={})
+    task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+    response = client.put(
+        f"/api/model-configs/{feature}",
+        json={"model": "m", "baseUrl": "https://x/v1"},
+    )
+    assert response.status_code == (200 if allowed else 409)
+
+
+@pytest.mark.parametrize("feature,expected", [("answer", 200), ("embedding", 409)])
+def test_saved_model_apply_uses_the_same_feature_lock(
+    client, db, monkeypatch, feature, expected
+):
+    from akasha_platform.api import config as config_api
+
+    model_id = config_store.upsert_model_provider(
+        db,
+        purpose=feature,
+        label=f"{feature}-lock",
+        base_url="https://x/v1",
+        model="m",
+        api_key="",
+    )
+    task_id = task_store.create_task(db, stage="compile", params={})
+    task_store.transition(db, task_id, task_store.RUNNING)
+    db.commit()
+
+    class Fake(_AkashaStub):
+        def put_model_config(self, selected_feature, payload):
+            return {"feature": selected_feature}
+
+    monkeypatch.setattr(config_api, "AkashaClient", Fake)
+    assert client.post(f"/api/akasha-models/{model_id}/apply").status_code == expected

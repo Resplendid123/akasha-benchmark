@@ -1,9 +1,4 @@
-"""任务层：起、暂停、继续、清理，以及增量日志。
-
-暂停是协作式的，停下的位置总是已落库的；继续用同一条任务记录重跑。
-暂停编译会取消当前 Akasha Run；继续时通过 Akasha 的页面批量重试接口只重跑
-失败或因暂停而跳过的页面。若 Run 在生成逐页记录前就被取消，才重新提交首次编译。
-"""
+"""任务启动、运行树、暂停/继续、清理与增量日志接口。"""
 
 from __future__ import annotations
 
@@ -11,7 +6,6 @@ from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 
-from akasha_benchmark.stages import describe
 from akasha_benchmark.store import task_store
 
 from ..tasks import TaskRejected
@@ -20,29 +14,11 @@ from ._common import db, runner_of
 router = APIRouter(prefix="/api")
 
 
-@router.get("/stages")
-def stages() -> list[dict[str, Any]]:
-    """各阶段接受哪些参数，以及它的代价。前端的任务表单据此生成。"""
-    return describe()
-
-
-@router.get("/tasks")
-def list_tasks(
-    request: Request,
-    status: str | None = None,
-    limit: int = Query(10, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-) -> dict[str, Any]:
+@router.get("/task-tree")
+def task_tree(request: Request) -> dict[str, Any]:
+    """按运行产物外键返回编译、查询、评测、归因的分叉树。"""
     with db(request) as connection:
-        return {
-            "total": task_store.count_tasks(connection, status=status),
-            "inactive_total": task_store.count_inactive_tasks(connection),
-            "limit": limit,
-            "offset": offset,
-            "tasks": task_store.list_tasks(
-                connection, status=status, limit=limit, offset=offset
-            ),
-        }
+        return task_store.task_tree(connection)
 
 
 @router.get("/tasks/{task_id}")

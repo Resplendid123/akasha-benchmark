@@ -107,30 +107,12 @@ def get_task(connection: sqlite3.Connection, task_id: int) -> dict[str, Any] | N
 def list_tasks(
     connection: sqlite3.Connection,
     *,
-    status: str | None = None,
     limit: int = 100,
-    offset: int = 0,
 ) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM task"
-    params: list[Any] = []
-    if status:
-        sql += " WHERE status = ?"
-        params.append(status)
-    params.extend((limit, offset))
     return [
         _task(row)
-        for row in connection.execute(sql + " ORDER BY id DESC LIMIT ? OFFSET ?", params)
+        for row in connection.execute("SELECT * FROM task ORDER BY id DESC LIMIT ?", (limit,))
     ]
-
-
-def count_tasks(connection: sqlite3.Connection, *, status: str | None = None) -> int:
-    sql = "SELECT COUNT(*) AS n FROM task"
-    params: list[Any] = []
-    if status:
-        sql += " WHERE status = ?"
-        params.append(status)
-    row = connection.execute(sql, params).fetchone()
-    return int(row["n"] if row else 0)
 
 
 def count_inactive_tasks(connection: sqlite3.Connection) -> int:
@@ -139,6 +121,80 @@ def count_inactive_tasks(connection: sqlite3.Connection) -> int:
         f"SELECT COUNT(*) AS n FROM task WHERE status NOT IN ({marks})", ACTIVE
     ).fetchone()
     return int(row["n"] if row else 0)
+
+
+def task_tree(connection: sqlite3.Connection) -> dict[str, Any]:
+    """按运行外键构建编译 → 查询 → 评测 → 归因任务树。
+
+    已绑定产物的任务挂到对应运行节点；尚未创建产物的下游任务根据输入参数
+    挂到父运行节点。下载、归一化和无法关联到现存运行的任务单独返回。
+    """
+    from .run_store import STAGE_INPUTS
+
+    specs = (
+        ("compile", "compile_run", "run_id", None, None),
+        ("query", "query_run", "name", "compile", "compile_id"),
+        ("eval", "eval_run", "name", "query", "query_id"),
+        ("attribution", "attribution_run", "name", "eval", "eval_id"),
+    )
+    nodes: dict[tuple[str, int], dict[str, Any]] = {}
+    roots: list[dict[str, Any]] = []
+    for kind, table, name_column, parent_kind, parent_column in specs:
+        for row in connection.execute(f"SELECT * FROM {table} ORDER BY id DESC"):
+            record = dict(row)
+            node = {
+                "kind": kind,
+                "id": int(record["id"]),
+                "name": record[name_column],
+                "status": record["status"],
+                "created_at": record["created_at"],
+                "finished_at": record["finished_at"],
+                "tasks": [],
+                "pending_tasks": [],
+                "children": [],
+            }
+            nodes[(kind, node["id"])] = node
+            if parent_kind is None:
+                roots.append(node)
+            else:
+                parent = nodes.get((parent_kind, int(record[parent_column])))
+                if parent is not None:
+                    parent["children"].append(node)
+
+    unlinked: list[dict[str, Any]] = []
+    tasks = list_tasks(connection, limit=1_000_000)
+    for task in tasks:
+        target_kind = task.get("target_kind")
+        target_id = task.get("target_id")
+        target = (
+            nodes.get((str(target_kind), int(target_id)))
+            if target_kind is not None and target_id is not None
+            else None
+        )
+        if target is not None:
+            target["tasks"].append(task)
+            continue
+
+        input_spec = STAGE_INPUTS.get(str(task["stage"]))
+        parent = None
+        if target_kind is None and input_spec is not None:
+            parent_kind, parameter = input_spec
+            parent_id = (task.get("params") or {}).get(parameter)
+            try:
+                parent = nodes.get((parent_kind, int(parent_id)))
+            except (TypeError, ValueError):
+                parent = None
+        if parent is not None:
+            parent["pending_tasks"].append(task)
+        else:
+            unlinked.append(task)
+
+    return {
+        "total_tasks": len(tasks),
+        "inactive_total": count_inactive_tasks(connection),
+        "compiles": roots,
+        "unlinked_tasks": unlinked,
+    }
 
 
 def active_tasks(connection: sqlite3.Connection) -> list[dict[str, Any]]:

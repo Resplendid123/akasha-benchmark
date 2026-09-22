@@ -44,12 +44,3 @@ def matches(left: Any, right: Any, feature: str) -> bool:
 def drift(current: Any, snapshot: Any) -> dict[str, bool]:
     """哪些项与快照不一致；差异用于告警，不阻断查询。"""
     return {feature: not matches(current, snapshot, feature) for feature in FEATURES}
-
-
-def group_to_live(configs: dict[str, Any]) -> list[dict[str, Any]]:
-    """把本地组的 ``{feature: {model, baseUrl, ...}}`` 整成 :func:`normalize` 可比的形状。
-
-    apiKey 不在 :data:`_FIELDS` 里，天然被排除，所以本地组与远端的比对不含密钥。
-    """
-    entries = [{"feature": feature, **(configs.get(feature) or {})} for feature in FEATURES]
-    return normalize(entries)

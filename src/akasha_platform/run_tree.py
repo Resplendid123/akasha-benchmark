@@ -6,6 +6,7 @@ import sqlite3
 from typing import Any
 
 from akasha_benchmark.metrics import registry
+from akasha_benchmark.model_configs import feature_of
 from akasha_benchmark.store import (
     attribution_store,
     compile_store,
@@ -151,10 +152,10 @@ def _compile_view(
     missing = total - sum(int(item.get("imported") or 0) for item in stats.values())
     return {
         **_public_run(row),
-        "config_group": _selection_label(
-            loads(row.get("model_selection_json"), {}), row.get("config_group")
+        "model_label": _remote_model_labels(
+            loads(row.get("model_configs_json"), {}),
+            ("compiler", "embedding", "image"),
         ),
-        "model_selection": loads(row.get("model_selection_json"), {}),
         "datasets": loads(row["datasets_json"], []),
         "stats": stats,
         "quality": loads(row["quality_json"]),
@@ -199,10 +200,9 @@ def _query_view(
     response_count = sum(int(item["responses"] or 0) for item in stats.values())
     return {
         **_public_run(row),
-        "config_group": _selection_label(
-            loads(row.get("model_selection_json"), {}), row.get("config_group")
+        "model_label": _remote_model_labels(
+            loads(row.get("model_configs_json"), {}), ("answer",)
         ),
-        "model_selection": loads(row.get("model_selection_json"), {}),
         "sample_count": query_sample_counts.get(query_id, 0) or response_count,
         "success_count": sum(
             int(item["responses"] or 0) - int(item["failures"] or 0)
@@ -250,7 +250,7 @@ def _eval_view(
     )
     return {
         **_public_run(row),
-        "config_group": (
+        "model_label": (
             provider_labels.get(int(row["judge_provider_id"]))
             if row.get("judge_provider_id") is not None
             else "确定性指标"
@@ -262,9 +262,9 @@ def _eval_view(
         "attributions": [
             {
                 **_public_run(attribution),
-                "config_group": (
-                    provider_labels.get(int(attribution["provider_id"]))
-                    if attribution.get("provider_id") is not None
+                "model_label": (
+                    provider_labels.get(int(attribution["report_provider_id"]))
+                    if attribution.get("report_provider_id") is not None
                     else "规则归因"
                 ),
                 "sample_count": int(
@@ -300,12 +300,10 @@ def _public_run(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if not key.endswith("_json")}
 
 
-def _selection_label(selection: dict[str, Any] | None, fallback: str | None) -> str | None:
-    selection = selection or {}
+def _remote_model_labels(configs: Any, features: tuple[str, ...]) -> str | None:
     labels = [
-        str(item.get("label") or item.get("model") or "")
-        for item in selection.values()
-        if isinstance(item, dict)
+        str(config["model"])
+        for feature in features
+        if (config := feature_of(configs, feature)) and config.get("model")
     ]
-    labels = [label for label in labels if label]
-    return " + ".join(labels) if labels else fallback
+    return " + ".join(labels) if labels else None

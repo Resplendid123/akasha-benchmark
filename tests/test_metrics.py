@@ -96,6 +96,20 @@ def test_graph_exclusive_gold_is_net_contribution():
     assert "snippet_count" not in registry.METRIC_REGISTRY
     assert "graph_neighbor_snippets" not in result
     assert "graph_neighbor_snippets" not in registry.METRIC_REGISTRY
+
+
+def test_direct_and_graph_hit_is_not_graph_exclusive():
+    result = multihop.evaluate_sample(
+        [
+            {
+                "retrievalReasons": ["semantic", "graph-neighbor"],
+                "sourceWindows": [{"sourcePageId": "p1"}],
+            }
+        ],
+        ["g1"],
+        {"p1": "g1"},
+    )
+    assert result["graph_exclusive_gold_share"] == 0.0
     assert result["graph_neighbor_precision"] == pytest.approx(1.0)
     assert "graph_neighbor_precision" in registry.METRIC_REGISTRY
 
@@ -234,13 +248,27 @@ def test_correct_answer_is_not_a_failure():
     ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 1.0}), [])
     assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
 
-    # judge 判事实一致，同样算对。
-    ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 0.0, "answer_correctness": 1.0}), [])
-    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+
+def test_rule_attribution_ignores_judge_metrics():
+    """规则归因不能因评测是否配置 Judge 而改变。"""
+    ruling = attribution.classify(
+        _sample(
+            {
+                "hit@5": 0.0,
+                "answer_correctness": 1.0,
+                "faithfulness": 1.0,
+                "answer_relevancy": 1.0,
+                "context_relevancy": 1.0,
+            }
+        ),
+        [],
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_RETRIEVAL_MISS
+    assert "faithfulness" not in ruling["evidence"]
 
 
 def test_not_a_failure_outranks_every_failure_cause():
-    """答案正确的判据优先于其他失败判据。"""
+    """答案明确正确时，不再追究回答模式、检索或引用信号。"""
     for metrics, lineage, mode in (
         ({"hit@5": 0.0, "em": 1.0}, [{"question_terms_lost": ["grammy"]}], "knowledge"),
         ({"hit@5": 0.0, "em": 1.0, "truncated_gold": 1.0}, [], "knowledge"),
@@ -248,6 +276,20 @@ def test_not_a_failure_outranks_every_failure_cause():
     ):
         ruling = attribution.classify(_sample(metrics, mode=mode), lineage)
         assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+
+
+def test_correct_general_answer_is_not_a_failure():
+    """general 回答明确正确时，同样优先归入正常样本。"""
+    em_hit = attribution.classify(
+        _sample({"hit@5": 1.0, "em": 1.0}, mode="general"), None
+    )
+    assert em_hit["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+
+    contained = _sample({"hit@5": 1.0, "em": 0.0}, mode="general")
+    contained["answer"] = "The answer is Rita Moreno."
+    contained["detail"]["reference_answers"] = ["Rita Moreno"]
+    ruling = attribution.classify(contained, None)
+    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
 
 
 def test_fully_supported_answer_is_not_a_failure_even_with_long_context():
@@ -272,22 +314,22 @@ def test_fully_supported_answer_is_not_a_failure_even_with_long_context():
     assert ruling["evidence"]["reference_answer_contained"] is True
 
 
-def test_faithfulness_alone_does_not_prove_answer_correctness():
-    ruling = attribution.classify(
-        _sample({"faithfulness": 1.0, "hit@5": 1.0, "full_coverage@5": 1.0}),
-        [],
-    )
-    assert ruling["root_cause"] != attribution.CAUSE_NOT_A_FAILURE
-
-
-def test_high_f1_alone_does_not_clear_a_sample():
-    """高词汇重叠率不足以判定答案正确。"""
-    ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 0.0, "f1": 0.9}), [])
-    assert ruling["root_cause"] != attribution.CAUSE_NOT_A_FAILURE
+@pytest.mark.parametrize(
+    "metrics,expected",
+    [
+        ({"faithfulness": 1.0, "hit@5": 1.0, "full_coverage@5": 1.0}, attribution.CAUSE_UNKNOWN),
+        ({"hit@5": 0.0, "em": 0.0, "f1": 0.9}, attribution.CAUSE_RETRIEVAL_MISS),
+        ({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}, attribution.CAUSE_UNKNOWN),
+    ],
+)
+def test_weak_answer_metrics_do_not_drive_rule_attribution(metrics, expected):
+    ruling = attribution.classify(_sample(metrics), [])
+    assert ruling["root_cause"] == expected
+    assert "f1" not in ruling["evidence"]
 
 
 def test_fallback_is_judged_before_retrieval():
-    """生成端拒答必须最先判，否则它那 0 分会被解释成检索失败。"""
+    """生成端兜底必须最先判，否则它的检索信号会被解释成检索失败。"""
     ruling = attribution.classify(_sample({"hit@5": 0.0}, mode="general"), None)
     assert ruling["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
 
@@ -304,6 +346,34 @@ def test_compiled_away_needs_lineage():
     assert ruling["evidence"]["lineage_available"] is False
 
 
+def test_compiled_away_requires_a_complete_retrieval_miss():
+    lineage = [{"question_terms_lost": ["access"]}]
+
+    fully_retrieved = attribution.classify(
+        _sample({"hit@10": 1.0, "full_coverage@10": 1.0}), lineage
+    )
+    assert fully_retrieved["root_cause"] == attribution.CAUSE_UNKNOWN
+
+    partially_retrieved = attribution.classify(
+        _sample({"hit@10": 1.0, "full_coverage@10": 0.0}), lineage
+    )
+    assert partially_retrieved["root_cause"] != attribution.CAUSE_COMPILED_AWAY
+
+
+def test_citation_drop_outranks_lost_question_terms():
+    ruling = attribution.classify(
+        _sample(
+            {
+                "hit@10": 1.0,
+                "full_coverage@10": 1.0,
+                "truncated_gold": 1.0,
+            }
+        ),
+        [{"question_terms_lost": ["access"]}],
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_CITATION_DROPPED
+
+
 def test_citation_dropped_outranks_retrieval_miss():
     ruling = attribution.classify(_sample({"hit@5": 0.0, "truncated_gold": 1.0}), [])
     assert ruling["root_cause"] == attribution.CAUSE_CITATION_DROPPED
@@ -316,16 +386,15 @@ def test_graph_edge_missing_when_coverage_incomplete():
     assert ruling["root_cause"] == attribution.CAUSE_GRAPH_EDGE_MISSING
 
 
-def test_gold_suspect_when_everything_retrieved_but_answer_wrong():
-    ruling = attribution.classify(_sample({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}), [])
-    assert ruling["root_cause"] == attribution.CAUSE_GOLD_SUSPECT
+def test_general_with_retrieval_is_not_classified_as_no_evidence_fallback():
+    ruling = attribution.classify(
+        _sample({"hit@5": 1.0, "full_coverage@5": 1.0}, mode="general"), []
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_IGNORED_RETRIEVAL
 
 
-def test_every_cause_has_a_remedy():
-    """「这条能不能靠调参救」是归因结论里最有用的一句，不能缺。"""
-    causes = {
-        value
-        for name, value in vars(attribution).items()
-        if name.startswith("CAUSE_") and isinstance(value, str)
-    }
-    assert causes == set(attribution.REMEDIES)
+def test_general_retrieval_uses_full_detail_when_hit_metric_was_not_selected():
+    sample = _sample({}, mode="general")
+    sample["detail"]["retrieval"] = {"hit@5": 1.0, "full_coverage@5": 1.0}
+    ruling = attribution.classify(sample, [])
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_IGNORED_RETRIEVAL

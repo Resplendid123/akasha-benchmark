@@ -15,6 +15,7 @@ from akasha_benchmark.akasha_client import (
     ACTIVE_RUN_STATUSES,
     AkashaClient,
     AkashaError,
+    validate_cancel_result,
 )
 from akasha_benchmark.config import load_config
 from akasha_benchmark.store import (
@@ -100,7 +101,8 @@ def delete_compile(request: Request, compile_id: int) -> dict[str, Any]:
                             result = client.cancel_compile_run(
                                 str(run["runId"]), "Akasha-Benchmark compile cleaned up"
                             )
-                            cancelled += result.get("disposition") == "cancelled"
+                            remote = validate_cancel_result(str(run["runId"]), result)
+                            cancelled += remote["disposition"] == "cancelled"
                             removed_jobs += int(result.get("removedJobCount") or 0)
             except (AkashaError, ValueError) as exc:
                 raise HTTPException(502, f"远端编译取消失败，本地记录未删除：{exc}") from exc

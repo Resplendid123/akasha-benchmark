@@ -14,16 +14,15 @@ def create_attribution_run(
     *,
     name: str,
     eval_id: int,
-    provider_id: int | None,
-    concurrency: int = 1,
+    report_provider_id: int | None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO attribution_run
-            (name, eval_id, provider_id, concurrency, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (name, eval_id, report_provider_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (name, eval_id, provider_id, concurrency, STATUS_RUNNING, utc_now()),
+        (name, eval_id, report_provider_id, STATUS_RUNNING, utc_now()),
     )
     return int(cursor.lastrowid or 0)
 
@@ -56,40 +55,44 @@ def delete_attribution_run(connection: sqlite3.Connection, attribution_id: int) 
     ).rowcount
 
 
+def record_report(
+    connection: sqlite3.Connection,
+    attribution_id: int,
+    *,
+    report: str | None,
+    error: str | None,
+    latency_ms: int | None,
+) -> None:
+    """保存整轮评测的模型分析；它属于运行，不属于任何单条样本。"""
+    connection.execute(
+        "UPDATE attribution_run SET report = ?, report_error = ?, report_latency_ms = ? "
+        "WHERE id = ?",
+        (report, error, latency_ms, attribution_id),
+    )
+
+
 def record_attribution(
     connection: sqlite3.Connection,
     attribution_id: int,
     *,
     sample_id: str,
-    dataset: str,
     root_cause: str,
     evidence: dict[str, Any],
-    narrative: str | None,
-    rule_based: bool,
-    latency_ms: int | None = None,
 ) -> None:
     connection.execute(
         """
         INSERT INTO attribution_result
-            (attribution_id, sample_id, dataset, root_cause, evidence_json,
-             narrative, rule_based, latency_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (attribution_id, sample_id, root_cause, evidence_json)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(attribution_id, sample_id) DO UPDATE SET
             root_cause = excluded.root_cause,
-            evidence_json = excluded.evidence_json,
-            narrative = excluded.narrative,
-            rule_based = excluded.rule_based,
-            latency_ms = excluded.latency_ms
+            evidence_json = excluded.evidence_json
         """,
         (
             attribution_id,
             sample_id,
-            dataset,
             root_cause,
             dumps(evidence),
-            narrative,
-            int(rule_based),
-            latency_ms,
         ),
     )
 
@@ -103,7 +106,15 @@ def attribution_results(
             "evidence": loads(row["evidence_json"], {}),
         }
         for row in connection.execute(
-            "SELECT * FROM attribution_result WHERE attribution_id = ? ORDER BY sample_id",
+            """
+            SELECT result.*, sample.dataset
+            FROM attribution_result result
+            JOIN attribution_run run ON run.id = result.attribution_id
+            JOIN sample_eval sample
+              ON sample.eval_id = run.eval_id AND sample.sample_id = result.sample_id
+            WHERE result.attribution_id = ?
+            ORDER BY result.sample_id
+            """,
             (attribution_id,),
         )
     ]

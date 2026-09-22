@@ -1,14 +1,6 @@
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'succeeded' | 'failed'
 export type RunStatus = 'running' | 'paused' | 'succeeded' | 'failed'
 
-export interface Stage {
-  stage: string
-  label: string
-  params: string[]
-  cost: string
-  needs_akasha: boolean
-}
-
 export interface Task {
   id: number
   stage: string
@@ -38,9 +30,25 @@ export interface TaskDetail extends Task {
   logs: AuditEntry[]
 }
 
-export interface TaskList extends Paged {
-  inactive_total: number
+export type RunTaskKind = 'compile' | 'query' | 'eval' | 'attribution'
+
+export interface TaskTreeNode {
+  kind: RunTaskKind
+  id: number
+  name: string
+  status: RunStatus
+  created_at: string
+  finished_at: string | null
   tasks: Task[]
+  pending_tasks: Task[]
+  children: TaskTreeNode[]
+}
+
+export interface TaskTree {
+  total_tasks: number
+  inactive_total: number
+  compiles: TaskTreeNode[]
+  unlinked_tasks: Task[]
 }
 
 // --- 配置 ---
@@ -88,26 +96,6 @@ export interface Provider {
   model: string
   api_key_set: boolean
   updated_at: string
-}
-
-export interface AkashaConfigFeature {
-  model?: string
-  baseUrl?: string
-  apiKeySet?: boolean
-  parameters?: Record<string, unknown>
-}
-
-export interface AkashaConfigGroup {
-  id: number
-  label: string
-  selected: boolean
-  configs: Record<string, AkashaConfigFeature>
-  updated_at: string
-}
-
-export interface AkashaConfigsView {
-  features: string[]
-  groups: AkashaConfigGroup[]
 }
 
 export type AkashaFeature = 'compiler' | 'embedding' | 'answer' | 'image'
@@ -230,10 +218,12 @@ export interface AttributionRun {
   id: number
   name: string
   eval_id: number
-  provider_id: number | null
-  concurrency: number
+  report_provider_id: number | null
+  report: string | null
+  report_error: string | null
+  report_latency_ms: number | null
   status: RunStatus
-  config_group: string | null
+  model_label: string | null
   sample_count: number
   success_count: number
   created_at: string
@@ -249,7 +239,7 @@ export interface EvalRun {
   judge_provider_id: number | null
   concurrency: number
   status: RunStatus
-  config_group: string | null
+  model_label: string | null
   sample_count: number
   success_count: number
   created_at: string
@@ -269,12 +259,9 @@ export interface QueryRun {
   id: number
   name: string
   compile_id: number
-  score_threshold: number | null
   concurrency: number
   status: RunStatus
-  config_group: string | null
-  answer_model_id: number | null
-  model_selection?: Record<string, { id: number; label: string; model: string; baseUrl: string }>
+  model_label: string | null
   sample_count: number
   success_count: number
   created_at: string
@@ -307,11 +294,7 @@ export interface CompileRun {
   space_id: string | null
   space_name: string | null
   workspace_id: string | null
-  config_group: string | null
-  compiler_model_id: number | null
-  embedding_model_id: number | null
-  image_model_id: number | null
-  model_selection?: Record<string, { id: number; label: string; model: string; baseUrl: string }>
+  model_label: string | null
   status: RunStatus
   created_at: string
   finished_at: string | null
@@ -526,12 +509,12 @@ export interface Snippet {
 
 export type RootCause =
   | 'not_a_failure'
+  | 'generation_ignored_retrieval'
   | 'generation_fallback'
   | 'compiled_away'
   | 'citation_dropped'
   | 'retrieval_miss'
   | 'graph_edge_missing'
-  | 'gold_annotation_suspect'
   | 'unknown'
 
 export interface AttributionResult {
@@ -539,17 +522,11 @@ export interface AttributionResult {
   dataset: string
   root_cause: RootCause
   evidence: Record<string, unknown>
-  narrative: string | null
-  rule_based: number
-  remedy: string | null
 }
 
 export interface AttributionDetail extends AttributionRun {
   count_by_root_cause: Record<string, number>
-  /** 模型归因的每条平均延迟。规则归因的条目不进均值。 */
-  latency_mean: number | null
   results: AttributionResult[]
-  remedies: Record<string, string>
 }
 
 export interface Lineage {

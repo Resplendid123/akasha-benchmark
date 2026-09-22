@@ -1,4 +1,4 @@
-"""归因层：针对某次 编译->查询->评测 链路，逐条推出根因。
+"""归因层：逐样本规则分类，并可选生成一次整轮评测分析报告。
 
 规则判据在 :mod:`..attribution`。链路证据（原文 vs 编译产物的 diff）走只读
 PostgreSQL，没配 database_url 时跳过那一段判据。
@@ -11,13 +11,11 @@ from typing import Any
 
 from .. import attribution, textdiff
 from ..config import load_config
-from ..judge.client import JudgeConfigError, complete_many, parse_json_object
+from ..judge.client import REPORT_MAX_TOKENS, JudgeConfigError, complete_many, parse_json_object
 from ..judge.providers import resolve_provider
 from ..lineage import BadPageId, LineageReader, LineageUnavailable
 from ..store import attribution_store, compile_store, eval_store, query_store
 from ..task import TaskContext
-
-MAX_ATTRIBUTION_CONCURRENCY = 16
 
 
 def _lineage_of(
@@ -73,9 +71,6 @@ def run(ctx: TaskContext) -> None:
     compile_id = int(query_run["compile_id"])
 
     use_model = bool(params.get("use_model", True))
-    concurrency = int(params.get("concurrency") or 1)
-    if not 1 <= concurrency <= MAX_ATTRIBUTION_CONCURRENCY:
-        raise ValueError(f"归因并发必须在 1 到 {MAX_ATTRIBUTION_CONCURRENCY} 之间")
 
     provider = None
     provider_id = params.get("provider_id")
@@ -96,9 +91,7 @@ def run(ctx: TaskContext) -> None:
 
     name = str(params.get("name") or "").strip() or f"{eval_run['name']}-a-{uuid.uuid4().hex[:6]}"
     attribution_id = ctx.target("attribution")
-    ctx.freeze(
-        name=name, use_model=use_model, provider_id=provider_id, concurrency=concurrency
-    )
+    ctx.freeze(name=name, use_model=use_model, provider_id=provider_id)
     if attribution_id is None:
         if attribution_store.attribution_run_by_name(ctx.db, name):
             raise ValueError(f"归因名称 {name!r} 已存在，请换个名称或继续原任务")
@@ -106,8 +99,7 @@ def run(ctx: TaskContext) -> None:
             ctx.db,
             name=name,
             eval_id=eval_id,
-            provider_id=provider_id if provider else None,
-            concurrency=concurrency if provider else 1,
+            report_provider_id=provider_id if provider else None,
         )
         ctx.bind("attribution", attribution_id)
 
@@ -116,13 +108,13 @@ def run(ctx: TaskContext) -> None:
         attribution_id,
         eval_id,
         compile_id,
-        provider,
         reader,
-        concurrency,
     )
 
     counts = attribution_store.cause_counts(ctx.db, attribution_id)
     ctx.log(f"根因分布：{counts}")
+    if provider is not None:
+        _write_report(ctx, attribution_id, eval_run, provider)
 
 
 def _analyze(
@@ -130,9 +122,7 @@ def _analyze(
     attribution_id: int,
     eval_id: int,
     compile_id: int,
-    provider: Any,
     reader: LineageReader | None,
-    concurrency: int,
 ) -> None:
     samples = eval_store.sample_evals(ctx.db, eval_id)
     if not samples:
@@ -145,8 +135,8 @@ def _analyze(
 
     page_maps: dict[str, dict[str, str]] = {}
 
-    def prepare(row: dict[str, Any]) -> dict[str, Any] | None:
-        """主线程：读样本、算规则结论、拼 prompt。返回一条待落库的记录。"""
+    def prepare(row: dict[str, Any]) -> dict[str, Any]:
+        """读取样本、链路和非 Judge 指标，生成逐样本规则结论。"""
         dataset = row["dataset"]
         sample = row
         sample["metrics"] = eval_store.sample_metrics_of(ctx.db, eval_id, row["sample_id"])
@@ -160,53 +150,82 @@ def _analyze(
             sample["detail"].get("question") or "",
         )
         ruling = attribution.classify(sample, lineage)
-        prompt = attribution.build_prompt(sample, ruling, lineage) if provider is not None else None
-        return {"row": row, "dataset": dataset, "ruling": ruling, "prompt": prompt}
+        return {"row": row, "ruling": ruling}
 
-    concurrency = concurrency if provider is not None else 1
     done = 0
-    for start in range(0, len(todo), concurrency):
+    for start in range(0, len(todo), 50):
         ctx.checkpoint()
-        batch = [p for p in (prepare(row) for row in todo[start : start + concurrency]) if p]
-        replies = (
-            complete_many(provider, [p["prompt"] for p in batch], concurrency)
-            if provider is not None
-            else [None] * len(batch)
-        )
-        for item, reply in zip(batch, replies):
+        batch = [prepare(row) for row in todo[start : start + 50]]
+        for item in batch:
             ruling = item["ruling"]
-            narrative: str | None = None
-            rule_based = True
-            latency_ms: int | None = None
-            if reply is not None:
-                latency_ms = reply.latency_ms
-                if reply.failure_kind:
-                    ruling["evidence"]["model_error"] = reply.failure_kind
-                else:
-                    try:
-                        payload = parse_json_object(reply.content or "")
-                    except ValueError as exc:
-                        # 模型没按 schema 输出，规则结论照样写。
-                        ruling["evidence"]["model_error"] = f"parse_error: {exc}"
-                    else:
-                        narrative = str(payload.get("narrative") or "").strip() or None
-                        ruling["evidence"]["model"] = {
-                            "contributing_factors": payload.get("contributing_factors"),
-                            "disagreement": payload.get("disagreement"),
-                            "confidence": payload.get("confidence"),
-                        }
-                        rule_based = False
             attribution_store.record_attribution(
                 ctx.db,
                 attribution_id,
                 sample_id=item["row"]["sample_id"],
-                dataset=item["dataset"],
                 root_cause=ruling["root_cause"],
                 evidence=ruling["evidence"],
-                narrative=narrative,
-                rule_based=rule_based,
-                latency_ms=latency_ms,
             )
         ctx.db.commit()
-        done += len(todo[start : start + concurrency])
+        done += len(batch)
         ctx.progress(done, len(todo), "归因")
+
+
+def _write_report(
+    ctx: TaskContext,
+    attribution_id: int,
+    eval_run: dict[str, Any],
+    provider: Any,
+) -> None:
+    """用一次模型调用分析整轮指标并保存报告；失败不影响规则归因。"""
+    current = attribution_store.get_attribution_run(ctx.db, attribution_id) or {}
+    if current.get("report"):
+        ctx.log("续跑：整体评测分析报告已存在，跳过模型调用")
+        return
+    ctx.checkpoint()
+    eval_id = int(eval_run["id"])
+    general_rows = eval_store.sample_evals(ctx.db, eval_id, answer_mode="general")[:10]
+    metrics_by_sample = eval_store.sample_metrics_for(
+        ctx.db, eval_id, [str(row["sample_id"]) for row in general_rows]
+    )
+    general_samples = [
+        {
+            "dataset": row["dataset"],
+            "question": str((row.get("detail") or {}).get("question") or "")[:1000],
+            "reference_answers": [
+                str(answer)[:500]
+                for answer in (row.get("detail") or {}).get("reference_answers") or []
+            ][:5],
+            "answer": str(row.get("answer") or "")[:1500],
+            "metrics": metrics_by_sample.get(str(row["sample_id"]), {}),
+        }
+        for row in general_rows
+    ]
+    prompt = attribution.build_report_prompt(
+        eval_run,
+        eval_store.metric_summaries(ctx.db, eval_id),
+        eval_store.dataset_evals(ctx.db, eval_id),
+        general_samples,
+    )
+    reply = complete_many(provider, [prompt], 1, max_tokens=REPORT_MAX_TOKENS)[0]
+    report: str | None = None
+    error = reply.failure_kind
+    if error is None:
+        try:
+            payload = parse_json_object(reply.content or "")
+            report = str(payload.get("report") or "").strip() or None
+            if report is None:
+                error = "parse_error: missing report"
+        except ValueError as exc:
+            error = f"parse_error: {exc}"
+    attribution_store.record_report(
+        ctx.db,
+        attribution_id,
+        report=report,
+        error=error,
+        latency_ms=reply.latency_ms,
+    )
+    ctx.db.commit()
+    if error:
+        ctx.log(f"整体评测分析报告生成失败：{error}", "warn")
+    else:
+        ctx.log("整体评测分析报告已生成")

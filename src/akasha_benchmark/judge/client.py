@@ -36,6 +36,7 @@ FAILURE_REFUSAL = "refusal"
 # 不做成配置项：judge 分数要在两次运行之间可比，温度必须是 0。
 TEMPERATURE = 0.0
 MAX_TOKENS = 1024
+REPORT_MAX_TOKENS = 4096
 
 
 class JudgeConfigError(RuntimeError):
@@ -114,17 +115,17 @@ class JudgeClient:
     def close(self) -> None:
         self._client.close()
 
-    def complete(self, system: str, user: str) -> JudgeReply:
+    def complete(self, system: str, user: str, *, max_tokens: int = MAX_TOKENS) -> JudgeReply:
         """发一次请求，返回文本或失败类别。不抛异常，失败也是数据。
 
         计时统一在这一层做，免得 ``_complete`` 的每个返回点各填一次。
         """
         started = time.monotonic()
-        reply = self._complete(system, user)
+        reply = self._complete(system, user, max_tokens=max_tokens)
         reply.latency_ms = int((time.monotonic() - started) * 1000)
         return reply
 
-    def _complete(self, system: str, user: str) -> JudgeReply:
+    def _complete(self, system: str, user: str, *, max_tokens: int = MAX_TOKENS) -> JudgeReply:
         url = f"{self.provider.base_url.rstrip('/')}/chat/completions"
         payload = {
             "model": self.provider.model,
@@ -133,7 +134,7 @@ class JudgeClient:
                 {"role": "user", "content": user},
             ],
             "temperature": TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": max_tokens,
             # 端点不支持时会忽略这一项，所以解析侧仍要容错。
             "response_format": {"type": "json_object"},
         }
@@ -189,7 +190,11 @@ class JudgeClient:
 
 
 def complete_many(
-    provider: JudgeProvider, prompts: list[tuple[str, str]], concurrency: int
+    provider: JudgeProvider,
+    prompts: list[tuple[str, str]],
+    concurrency: int,
+    *,
+    max_tokens: int = MAX_TOKENS,
 ) -> list[JudgeReply]:
     """并发跑一批 ``(system, user)``，按输入顺序返回结果。
 
@@ -198,7 +203,9 @@ def complete_many(
     """
     if concurrency <= 1 or len(prompts) <= 1:
         with JudgeClient(provider) as client:
-            return [client.complete(system, user) for system, user in prompts]
+            return [
+                client.complete(system, user, max_tokens=max_tokens) for system, user in prompts
+            ]
 
     workers = min(concurrency, len(prompts))
     clients = [JudgeClient(provider) for _ in range(workers)]
@@ -210,7 +217,7 @@ def complete_many(
         def task(prompt: tuple[str, str]) -> JudgeReply:
             borrowed = pool.get()
             try:
-                return borrowed.complete(*prompt)
+                return borrowed.complete(*prompt, max_tokens=max_tokens)
             finally:
                 pool.put(borrowed)
 

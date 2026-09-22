@@ -29,7 +29,6 @@ export function Query({
   onSelectCompile,
   onOpenCompile,
   onEvaluate,
-  onOpenSettings,
   onOpenTasks,
 }: {
   activeCompile: number | null
@@ -37,7 +36,6 @@ export function Query({
   onSelectCompile: (id: number) => void
   onOpenCompile: (compileId: number) => void
   onEvaluate: (queryId: number) => void
-  onOpenSettings: () => void
   onOpenTasks: () => void
 }) {
   const compiles = useAsync(() => api.compiles(), [])
@@ -90,7 +88,6 @@ export function Query({
           {compile && (
             <NewQuery
               compile={compile}
-              onOpenSettings={onOpenSettings}
               onStarted={() => {
                 compiles.reload()
                 onOpenTasks()
@@ -128,7 +125,7 @@ export function Query({
                   <td className="mono small">
                       {run.name} <span className="muted">#{run.id}</span>
                   </td>
-                  <td className="small">{run.config_group ?? '—'}</td>
+                  <td className="small">{run.model_label ?? '—'}</td>
                     <td>
                       <StatusTag status={run.status} />
                     </td>
@@ -208,36 +205,17 @@ export function Query({
 function NewQuery({
   compile,
   onStarted,
-  onOpenSettings,
 }: {
   compile: CompileRun
   onStarted: () => void
-  onOpenSettings: () => void
 }) {
-  const models = useAsync(() => api.akashaModels('answer'), [])
   const [selected, setSelected] = useState<string[]>(compile.datasets)
   const [name, setName] = useState('')
   const [limit, setLimit] = useState<number | ''>('')
-  const [threshold, setThreshold] = useState<number | ''>('')
   const [concurrency, setConcurrency] = useState(1)
-  const [answerModelId, setAnswerModelId] = useState<number | ''>('')
   const start = useAction<unknown>()
 
   const available = Object.keys(compile.stats)
-  const answerModels = models.data?.models ?? []
-
-  useEffect(() => {
-    if (answerModels.length === 0) {
-      setAnswerModelId('')
-      return
-    }
-    if (!answerModels.some((entry) => entry.id === answerModelId)) {
-      setAnswerModelId(answerModels[0]!.id)
-    }
-  }, [answerModels, answerModelId])
-
-  if (models.loading) return <Loading what="Answer 模型配置" />
-  if (models.error) return <Failed error={models.error} />
 
   return (
     <div style={{ marginTop: 12 }}>
@@ -256,21 +234,6 @@ function NewQuery({
         <Field label="查询名称" hint="留空自动生成">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="自动" />
         </Field>
-        <Field label="Answer 模型" hint="选择即在查询启动时应用到 Akasha">
-          <select
-            value={answerModelId}
-            onChange={(event) =>
-              setAnswerModelId(event.target.value === '' ? '' : Number(event.target.value))
-            }
-          >
-            <option value="">未选择</option>
-            {answerModels.map((entry) => (
-              <option key={entry.id} value={entry.id}>
-                {entry.label} · {entry.model}
-              </option>
-            ))}
-          </select>
-        </Field>
         <Field label="每组样本数" hint="留空则跑全部">
           <input
             type="number"
@@ -278,15 +241,6 @@ function NewQuery({
             value={limit}
             onChange={(e) => setLimit(e.target.value === '' ? '' : Number(e.target.value))}
             placeholder="全部"
-          />
-        </Field>
-        <Field label="分数阈值" hint="留空用服务端默认">
-          <input
-            type="number"
-            step={0.05}
-            value={threshold}
-            onChange={(e) => setThreshold(e.target.value === '' ? '' : Number(e.target.value))}
-            placeholder="默认"
           />
         </Field>
         <Field label="并发" hint="并发查询">
@@ -299,38 +253,31 @@ function NewQuery({
           />
         </Field>
       </div>
+      <div className="note small" style={{ marginTop: 10 }}>
+        查询使用 Akasha 当前远端生效的 embedding 和 answer 配置。
+      </div>
 
       <div className="panel-actions">
         <button
           className="action primary"
-          disabled={start.busy || selected.length === 0 || answerModelId === ''}
+          disabled={start.busy || selected.length === 0}
           onClick={() =>
             start.run(async () => {
               const task = await api.startTask('query', {
                 compile_id: compile.id,
                 datasets: selected,
                 concurrency,
-                answer_model_id: answerModelId,
                 ...(name.trim() ? { name: name.trim() } : {}),
                 ...(limit === '' ? {} : { sample_limit: limit }),
-                ...(threshold === '' ? {} : { score_threshold: threshold }),
               })
               onStarted()
               return task
             })
           }
         >
-          {start.busy ? '应用模型并启动中…' : '应用模型并开始查询'}
+          {start.busy ? '启动中…' : '开始查询'}
         </button>
       </div>
-      {answerModels.length === 0 && (
-        <div className="note warn">
-          还没有 Answer 模型配置。
-          <button className="action small" style={{ marginLeft: 8 }} onClick={onOpenSettings}>
-            去设置
-          </button>
-        </div>
-      )}
     </div>
   )
 }

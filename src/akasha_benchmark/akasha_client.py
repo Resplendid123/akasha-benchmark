@@ -7,7 +7,7 @@
 
 * ``POST /api/pages/import`` —— multipart，字段 ``file`` + ``spaceId``，
   返回创建的 page 对象（含 ``id``）
-* ``POST /api/llm-wiki/query`` —— ``{query, spaceIds[], type?, scoreThreshold?,
+* ``POST /api/llm-wiki/query`` —— ``{query, spaceIds[], type?,
   chatContext?}``
 * ``POST /api/llm-wiki/admin/diagnostics/quality`` ——
   ``{summary, spaces[], topIssues[]}``，计数字段是 camelCase
@@ -36,6 +36,27 @@ from .config import AkashaConfig
 ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "compiling", "aggregate_pending", "aggregating"}
 )
+TERMINAL_RUN_STATUSES = frozenset(
+    {"succeeded", "partial", "failed", "superseded", "cancelled"}
+)
+
+
+def validate_cancel_result(run_id: str, result: dict[str, Any]) -> dict[str, str]:
+    """确认 exact-run cancel 已把指定 Run 带到远端终态。"""
+    disposition = str(result.get("disposition") or "")
+    returned_run_id = str(result.get("runId") or "")
+    status = str(result.get("status") or "")
+    if (
+        returned_run_id != str(run_id)
+        or disposition not in {"cancelled", "already_terminal"}
+        or status not in TERMINAL_RUN_STATUSES
+        or (disposition == "cancelled" and status != "cancelled")
+    ):
+        raise ValueError(
+            f"取消 Run {run_id} 返回无效结果：runId={returned_run_id!r}, "
+            f"disposition={disposition!r}, status={status!r}"
+        )
+    return {"run_id": returned_run_id, "disposition": disposition, "status": status}
 
 # 只重试瞬时故障：5xx 是服务端重启或代理抖动，429 是限流。4xx 不重试。
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
@@ -388,8 +409,8 @@ class AkashaClient:
         )
 
     def retryable_run_page_ids(self, run_ids: list[str]) -> list[str]:
-        """收集失败或因主动取消而跳过的源页面，跨页并保序去重。"""
-        failed: dict[str, None] = {}
+        """按 Run 顺序取每页最新状态，只返回仍需重试的源页面。"""
+        latest: dict[str, dict[str, Any]] = {}
         for run_id in dict.fromkeys(run_ids):
             page = 1
             while True:
@@ -397,21 +418,23 @@ class AkashaClient:
                 items = result.get("items") or []
                 for item in items:
                     page_id = item.get("sourcePageId")
-                    if page_id and (
-                        item.get("status") == "failed"
-                        or item.get("mergeStatus") == "failed"
-                        or (
-                            item.get("status") == "skipped"
-                            and item.get("errorCode") == "manual_cancelled"
-                        )
-                    ):
-                        failed.setdefault(str(page_id), None)
+                    if page_id:
+                        latest[str(page_id)] = item
                 total = int(result.get("total") or 0)
                 limit = int(result.get("limit") or 100)
                 if page * limit >= total or not items:
                     break
                 page += 1
-        return list(failed)
+        return [
+            page_id
+            for page_id, item in latest.items()
+            if item.get("status") == "failed"
+            or item.get("mergeStatus") == "failed"
+            or (
+                item.get("status") == "skipped"
+                and item.get("errorCode") == "manual_cancelled"
+            )
+        ]
 
     def retry_pages(self, page_ids: list[str]) -> dict[str, Any]:
         """提交至多 100 个页面；更多页面由阶段串行分批。"""
@@ -426,9 +449,6 @@ class AkashaClient:
             f"llm-wiki/admin/compilation-runs/{run_id}/cancel",
             {"reason": reason},
         )
-
-    def run_diagnostics_summary(self, space_ids: list[str]) -> dict[str, Any]:
-        return self.post("llm-wiki/admin/diagnostics/summary", {"spaceIds": space_ids})
 
     def quality_diagnostics(self, space_ids: list[str]) -> dict[str, Any]:
         return self.post("llm-wiki/admin/diagnostics/quality", {"spaceIds": space_ids})
@@ -465,13 +485,10 @@ class AkashaClient:
         space_ids: list[str],
         *,
         query_type: str = "user",
-        score_threshold: float | None = None,
         chat_context: list[str] | None = None,
     ) -> Response:
         """跑一条知识查询。返回原始 Response，失败也落盘。"""
         payload: dict[str, Any] = {"query": query, "spaceIds": space_ids, "type": query_type}
-        if score_threshold is not None:
-            payload["scoreThreshold"] = score_threshold
         if chat_context:
             payload["chatContext"] = chat_context
         return self.request("POST", "llm-wiki/query", json_body=payload, raise_for_status=False)

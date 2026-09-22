@@ -1,54 +1,37 @@
 """归因判据：从指标 + 链路推出根因。
 
-两段式，规则在前：规则不需要模型配置就能出分类，模型在它之上补因果叙述。
+两段式：规则不需要模型配置，逐样本分类；模型可选地分析整轮汇总指标并生成报告。
 
 | 根因                    | 判据                                          |
 | ----------------------- | --------------------------------------------- |
-| not_a_failure           | 答案正确（EM 命中或 judge 判 correct）          |
-| generation_fallback     | answer_mode != knowledge                      |
-| compiled_away           | 问题实词落在编译丢掉的词里                     |
+| not_a_failure           | EM 命中或系统答案完整包含参考答案               |
+| generation_ignored_retrieval | general 且仍有检索结果                    |
+| generation_fallback     | general/no_match 且没有检索结果                 |
 | citation_dropped        | truncated_gold > 0（召回到了但引用被截断）      |
+| compiled_away           | hit@k == 0 且问题实词在编译时丢失               |
 | retrieval_miss          | hit@k == 0                                    |
 | graph_edge_missing      | gold 不全且图扩展没贡献独有 gold                |
-| gold_annotation_suspect | gold 全召回、引用完整，答案仍判错               |
+| unknown                 | 现有非 Judge 信号不足以定位                    |
 
-顺序即优先级。``not_a_failure`` 必须第一（归因覆盖全部样本，健康样本也会进入），
-``generation_fallback`` 第二（否则兜底回答可能被当成检索失败）。
+顺序即优先级。``not_a_failure`` 必须第一：答案明确正确时不再归为异常。
+其余 general / no_match 回答再归为 ``generation_fallback``。
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from .metrics import qa
+from .metrics import qa, registry
 
 CAUSE_NOT_A_FAILURE = "not_a_failure"
+CAUSE_GENERATION_IGNORED_RETRIEVAL = "generation_ignored_retrieval"
 CAUSE_GENERATION_FALLBACK = "generation_fallback"
 CAUSE_COMPILED_AWAY = "compiled_away"
 CAUSE_CITATION_DROPPED = "citation_dropped"
 CAUSE_RETRIEVAL_MISS = "retrieval_miss"
 CAUSE_GRAPH_EDGE_MISSING = "graph_edge_missing"
-CAUSE_GOLD_SUSPECT = "gold_annotation_suspect"
 CAUSE_UNKNOWN = "unknown"
-
-# 每个根因该怎么处置，含「这条能不能靠调参救」。
-REMEDIES = {
-    CAUSE_NOT_A_FAILURE: "答案是对的，不用查系统 —— 要么它没依赖被漏掉的那篇 "
-    "gold，要么 F1 被长答案稀释了。",
-    CAUSE_GENERATION_FALLBACK: "生成端转入兜底。不是检索问题；新版响应会保留"
-    "未采用的检索结果，应结合 answerMode 与 recall 判断。",
-    CAUSE_COMPILED_AWAY: "编译产物里缺少问题中的实词，三条召回路径同时断。"
-    "调参救不了 —— 词已经不在被索引的文本里。要改编译提示词或换 compiler。",
-    CAUSE_CITATION_DROPPED: "召回到了 gold 但引用被截断。检索没问题，"
-    "问题在引用预算或答案长度限制。",
-    CAUSE_RETRIEVAL_MISS: "原文里有问题的实词、编译产物也留着，但没召回到。"
-    "这是排序或阈值问题，属于可调范围。",
-    CAUSE_GRAPH_EDGE_MISSING: "多跳缺跳：图扩展没有贡献任何独有 gold。"
-    "跨文档实体没连起来。",
-    CAUSE_GOLD_SUSPECT: "gold 全召回、引用完整，答案仍判错。"
-    "先怀疑参考答案或评分口径，而不是系统。",
-    CAUSE_UNKNOWN: "现有信号不足以定位。看链路视图里的原文/编译 diff。",
-}
 
 
 def _contains_reference(answer: str, references: list[str]) -> bool:
@@ -66,15 +49,12 @@ def _contains_reference(answer: str, references: list[str]) -> bool:
 
 
 def _answered_correctly(sample: dict[str, Any]) -> bool:
-    """答案是否算对：Judge correctness、EM 或参考答案完整包含即成立。
+    """答案是否算对：只使用本地确定性信号，不依赖 Judge 指标。
 
-    不拿 faithfulness 当正确性判据，它只证明陈述有上下文支持，不能证明答到了问题。
-    F1 也分不开「答对了被散文稀释」与「答错了但词有重叠」。
+    EM 命中或参考答案完整包含即成立。低 EM/F1 不作为失败证据：它们分不开
+    「答对了被散文稀释」与「答错了但词有重叠」。
     """
     metrics: dict[str, float] = sample.get("metrics") or {}
-    correctness = metrics.get("answer_correctness")
-    if correctness is not None and correctness >= 1.0:
-        return True
     em = metrics.get("em")
     if em is not None and em >= 1.0:
         return True
@@ -98,18 +78,28 @@ def _at_max_k(metrics: dict[str, float], prefix: str) -> float | None:
 def classify(
     sample: dict[str, Any], lineage: list[dict[str, Any]] | None
 ) -> dict[str, Any]:
-    """规则归因，返回 ``{root_cause, evidence, remedy}``。
+    """规则归因，返回 ``{root_cause, evidence}``。
 
     ``lineage`` 是每篇 gold 的 diff 结果。为 None 时 ``compiled_away`` 判不了，
     退到 ``retrieval_miss`` 并在 evidence 里注明。
     """
-    metrics: dict[str, float] = sample.get("metrics") or {}
     detail = sample.get("detail") or {}
+    metrics: dict[str, float] = {}
+    for section in ("qa", "retrieval", "attribution", "multihop"):
+        metrics.update(
+            {
+                name: float(value)
+                for name, value in (detail.get(section) or {}).items()
+                if isinstance(value, (int, float, bool))
+            }
+        )
+    metrics.update(sample.get("metrics") or {})
     answer_mode = sample.get("answer_mode")
     hit = _at_max_k(metrics, "hit@")
     coverage = _at_max_k(metrics, "full_coverage@")
     truncated = float(metrics.get("truncated_gold", 0.0) or 0.0)
     graph_exclusive = float(metrics.get("graph_exclusive_gold_share", 0.0) or 0.0) > 0
+    has_retrieval = hit is not None and hit > 0
     reference_contained = _contains_reference(
         str(sample.get("answer") or ""),
         [str(value) for value in detail.get("reference_answers") or []],
@@ -122,93 +112,88 @@ def classify(
 
     evidence: dict[str, Any] = {
         "answer_mode": answer_mode,
+        "has_retrieval": has_retrieval,
         "hit": hit,
         "full_coverage": coverage,
         "truncated_gold": truncated,
         "question_terms_lost": lost_terms,
         "graph_exclusive_gold_share": metrics.get("graph_exclusive_gold_share"),
-        "f1": metrics.get("f1"),
-        "faithfulness": metrics.get("faithfulness"),
         "reference_answer_contained": reference_contained,
         "gold_count": len(detail.get("gold_doc_ids") or []),
         "lineage_available": lineage is not None,
     }
 
-    # 顺序即优先级，见模块开头。
+    # 顺序即优先级，见模块开头。答案明确正确时优先排除失败归因。
     if _answered_correctly(sample):
         cause = CAUSE_NOT_A_FAILURE
+    elif answer_mode == "general" and has_retrieval:
+        cause = CAUSE_GENERATION_IGNORED_RETRIEVAL
     elif answer_mode and answer_mode != "knowledge":
         cause = CAUSE_GENERATION_FALLBACK
-    elif lost_terms:
-        cause = CAUSE_COMPILED_AWAY
     elif truncated > 0:
         cause = CAUSE_CITATION_DROPPED
+    elif hit is not None and hit == 0 and lost_terms:
+        cause = CAUSE_COMPILED_AWAY
     elif hit is not None and hit == 0:
         cause = CAUSE_RETRIEVAL_MISS
     elif coverage is not None and coverage < 1.0 and not graph_exclusive:
         cause = CAUSE_GRAPH_EDGE_MISSING
     else:
-        # 检索与引用都没问题而答案不对：先怀疑标注与评分口径。
-        # 这里用 F1 而不是 EM，后者对长答案要求整串相等、误判率太高。
-        f1 = metrics.get("f1")
-        cause = (
-            CAUSE_GOLD_SUSPECT
-            if coverage == 1.0 and f1 is not None and f1 < 0.3
-            else CAUSE_UNKNOWN
-        )
+        cause = CAUSE_UNKNOWN
 
-    return {"root_cause": cause, "evidence": evidence, "remedy": REMEDIES[cause]}
+    return {"root_cause": cause, "evidence": evidence}
 
 
-SYSTEM_PROMPT = """你在分析一个检索增强问答系统的样本。
+SYSTEM_PROMPT = """你是一名 RAG 评测分析师。你分析的是一次完整评测，
+不是某个样本。输入包含本次实际产出的各项指标、数据集切片、回答模式分布、
+HTTP 失败、遗漏指标，以及最多 10 条 general 回答案例。案例直接从评测数据抽取，
+不包含任何规则归因结论。
 
-这套系统的向量与词法召回跑在**编译产物**上，不是原始文档：编译器会重写原文，
-重写时可能删掉原文里的修饰语与专有名词。被删掉的词不在被索引的文本里，
-所以查询命中它们时三条召回路径会同时断，且调参救不回来。
+请写一份可直接交付的中文分析报告，要求：
+1. 先总结整体表现，再逐项分析输入中实际存在的每个指标；没有的指标不要臆测。
+2. 明确区分“指标直接说明的事实”和“潜在原因”。潜在原因必须使用可能、疑似、
+   建议验证等审慎措辞，不能把相关性写成已证实因果。
+3. 对 overall、knowledge_only、judge 等不同 scope 分开解读；注意样本数和省略指标。
+4. EM/F1 受解释性长答案影响，只描述其表现，不能仅凭低分断言答案错误或归因根因。
+5. Judge 指标可以辅助观察，但要说明它们来自模型判定，存在模型与提示词偏差。
+6. 给出按优先级排序、可验证的下一步建议，并说明报告局限。
+7. general 可能仍保留 retrievedSources 和 graph-neighbor 证据。分析 general 案例时必须
+   结合检索、引用和图指标，不得把 general 自动解释为没有召回。不要逐条复述或外推整体。
+8. 不要声称看过未提供的原文、答案或日志。
 
-`no_match` 没有可用检索证据；`general` 可能保留模型未采用的 retrievedSources。
-两者都应先按生成分支解释，不能仅凭 answerMode 判成检索失败。
-
-**这条样本未必是失败的。** 归因覆盖这次评测的全部样本，健康样本也会进来；
-EM 与 F1 对解释性长答案本就失真，答案正确而得分低是常见的。规则分类为
-`not_a_failure` 时，narrative 要说明它为什么其实没问题，**不要编造失败原因**。
-
-已经有一个规则归因给出了分类。你的任务是**解释因果**，不是重新分类：
-如果你认为分类错了，在 disagreement 里说明理由，不要直接改 root_cause。
-
-只输出 JSON：
-{"narrative": "两三句话说明这条为什么失败（或为什么其实没问题），引用给你的具体证据",
- "contributing_factors": ["..."],
- "disagreement": null 或 "为什么规则分类可能不对",
- "confidence": 0.0 到 1.0}"""
+只输出 JSON，不要用代码围栏：
+{"report": "使用简短标题和分段组织的完整纯文本分析报告"}"""
 
 
-def build_prompt(
-    sample: dict[str, Any], ruling: dict[str, Any], lineage: list[dict[str, Any]] | None
+def build_report_prompt(
+    eval_run: dict[str, Any],
+    metric_summaries: list[dict[str, Any]],
+    dataset_summaries: list[dict[str, Any]],
+    general_samples: list[dict[str, Any]],
 ) -> tuple[str, str]:
-    """拼归因提示词。链路证据裁剪到可读长度。"""
-    detail = sample.get("detail") or {}
-    lines = [
-        f"问题：{detail.get('question')}",
-        f"参考答案：{detail.get('reference_answers')}",
-        f"系统答案：{(sample.get('answer') or '')[:1200]}",
-        f"answerMode：{sample.get('answer_mode')}",
-        "",
-        f"规则归因：{ruling['root_cause']}",
-        f"证据：{ruling['evidence']}",
-    ]
-    if lineage:
-        for entry in lineage[:3]:
-            diff = entry.get("diff") or {}
-            lines += [
-                "",
-                f"gold 文档 {entry.get('doc_id')}（page {entry.get('page_id')}）：",
-                f"  编译扩写比：{diff.get('expansion_ratio')}",
-                f"  编译丢掉的实词：{(diff.get('dropped') or [])[:30]}",
-                f"  问题实词里丢掉的：{entry.get('question_terms_lost')}",
-                f"  原文片段：{(entry.get('source_text') or '')[:600]}",
-                f"  编译片段：{(entry.get('compiled_text') or '')[:600]}",
-            ]
-    else:
-        lines += ["", "（血缘链路不可用：未配置只读数据库，拿不到原文/编译 diff。）"]
-    return SYSTEM_PROMPT, "\n".join(lines)
+    """拼整轮报告提示词：评测汇总加 general 案例，不提供规则归因数据。"""
+    definitions: dict[str, dict[str, Any]] = {}
+    for row in metric_summaries:
+        name = str(row["metric"])
+        try:
+            definition = registry.get_metric(name)
+        except KeyError:
+            continue
+        definitions[name] = {
+            "family": definition.family,
+            "kind": definition.kind,
+            "higher_is_better": definition.higher_is_better,
+            "description": definition.description,
+        }
+
+    payload = {
+        "evaluation": {
+            "id": eval_run.get("id"),
+            "name": eval_run.get("name"),
+        },
+        "metric_definitions": definitions,
+        "metric_summaries": metric_summaries,
+        "dataset_summaries": dataset_summaries,
+        "general_answer_examples": general_samples[:10],
+    }
+    return SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

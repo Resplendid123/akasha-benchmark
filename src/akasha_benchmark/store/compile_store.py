@@ -35,11 +35,6 @@ def update_compile_run(connection: sqlite3.Connection, compile_id: int, **fields
         "space_id",
         "space_name",
         "workspace_id",
-        "config_group",
-        "compiler_model_id",
-        "embedding_model_id",
-        "image_model_id",
-        "model_selection_json",
         "model_configs_json",
         "quality_json",
         "pace_json",
@@ -257,38 +252,12 @@ def compile_readiness(run: dict[str, Any], *, total: int, missing: int) -> dict[
         and succeeded > 0
         and unsuccessful > 0
     )
-    gates = quality.get("gates") or {}
-    gate_names = (
-        "missingChunkPageCount",
-        "missingEmbeddingPageCount",
-        "missingSourcePageCount",
-        "stalePageCount",
-    )
-    gate_counts = [gates.get(name) for name in gate_names]
-    gates_are_counts = all(
-        isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        for value in gate_counts
-    )
-    # 兼容升级前没有保存 progress 的失败记录。用并集上界做保守估计：即使
-    # 四类问题全落在不同页面，仍有剩余页面时，才能证明至少一篇产物完整。
-    complete_lower_bound = total - sum(gate_counts) if gates_are_counts else 0
-    quality_proves_partial = (
-        run["status"] == STATUS_FAILED
-        and quality.get("passed") is False
-        and any(gate_counts)
-        and complete_lower_bound > 0
-    )
-    partial = progress_proves_partial or quality_proves_partial
+    partial = progress_proves_partial
     if run["status"] != STATUS_SUCCEEDED and not partial:
         reasons.append(f"编译状态为 {run['status']}，未成功结束")
     elif progress_proves_partial:
         warnings.append(
             f"编译仅部分成功：{succeeded} 篇可用，{unsuccessful} 篇失败或跳过；"
-            "查询结果可能不完整"
-        )
-    elif quality_proves_partial:
-        warnings.append(
-            f"编译仅部分成功：可确认至少 {complete_lower_bound} 篇产物完整；"
             "查询结果可能不完整"
         )
     if not run["space_id"]:

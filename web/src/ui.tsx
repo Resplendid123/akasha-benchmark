@@ -314,12 +314,12 @@ export function Bar({ value, kind }: { value: number; kind?: 'ok' | 'bad' }) {
 /** 根因的中文名与色档。generation_fallback 用警告色，它不是检索问题。 */
 const ROOT_CAUSE_LABELS: Record<RootCause, { text: string; kind: string }> = {
   not_a_failure: { text: '答案正确', kind: 'ok' },
-  generation_fallback: { text: '生成端拒答', kind: 'warn' },
+  generation_ignored_retrieval: { text: '生成未采用检索', kind: 'warn' },
+  generation_fallback: { text: '生成端兜底', kind: 'warn' },
   compiled_away: { text: '编译丢词', kind: 'bad' },
   citation_dropped: { text: '引用被截断', kind: 'warn' },
   retrieval_miss: { text: '检索未命中', kind: 'bad' },
   graph_edge_missing: { text: '多跳缺跳', kind: 'bad' },
-  gold_annotation_suspect: { text: '疑似标注问题', kind: '' },
   unknown: { text: '未能定位', kind: '' },
 }
 

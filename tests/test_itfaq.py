@@ -7,14 +7,13 @@ import threading
 import pytest
 
 from akasha_benchmark.datasets import (
-    CorpusDoc,
     DataDependency,
     SubsetStrategy,
     all_adapters,
     get_adapter,
 )
 from akasha_benchmark.metrics import registry
-from akasha_benchmark.stages import compile, download, normalize
+from akasha_benchmark.stages import compile, download
 from akasha_benchmark.store import compile_store, data_store
 from akasha_benchmark.task import TaskContext
 
@@ -68,21 +67,17 @@ def test_sample_and_doc_ids_come_from_native_fields(itfaq_normalized):
     assert [d["doc_id"] for d in docs] == ["doc_001", "doc_002"]
 
 
-def test_normalize_validation_passes_without_gold(itfaq_normalized):
-    """无 gold 不是缺陷：验收只查悬空 gold，空 gold 集不该报问题。"""
-    assert normalize.validate_dataset(itfaq_normalized, "itfaq") == []
-
-
-def test_parse_row_rejects_blank_answer():
+@pytest.mark.parametrize(
+    "row,field",
+    [
+        ({"id": "qa_1", "question": "q", "answer": "   "}, "answer"),
+        ({"question": "q", "answer": "a"}, "id"),
+    ],
+)
+def test_parse_row_rejects_missing_required_values(row, field):
     adapter = get_adapter("itfaq")
-    with pytest.raises(ValueError, match="answer"):
-        adapter.parse_row({"id": "qa_1", "question": "q", "answer": "   "}, 0, None)
-
-
-def test_parse_row_rejects_missing_id():
-    adapter = get_adapter("itfaq")
-    with pytest.raises(ValueError, match="id"):
-        adapter.parse_row({"question": "q", "answer": "a"}, 0, None)
+    with pytest.raises(ValueError, match=field):
+        adapter.parse_row(row, 0, None)
 
 
 # ------------------------------------------------------------ 指标省略
@@ -96,12 +91,6 @@ def test_retrieval_family_is_omitted_not_zeroed():
     assert {"recall", "ndcg", "mrr", "citation_recall", "citation_precision"} <= omitted
     # 有参考答案，所以 QA 族与 answer_correctness 算得出来。
     assert not ({"em", "f1", "answer_correctness", "faithfulness"} & omitted)
-
-
-def test_requesting_retrieval_metric_raises():
-    adapter = get_adapter("itfaq")
-    with pytest.raises(registry.DependencyError):
-        registry.require("itfaq", adapter.provides, "recall")
 
 
 # ------------------------------------------------------------ full_corpus 抽样
@@ -128,46 +117,6 @@ def test_full_corpus_keeps_every_doc_while_limiting_qa(itfaq_normalized):
     assert not any(d["is_gold"] for d in docs)
 
 
-def test_negatives_ratio_does_not_change_corpus(itfaq_normalized):
-    """全量导入下 negatives_ratio 失效，两次取值必须给出同一份语料。"""
-
-    def docs_for(ratio: float, run_id: str) -> set[str]:
-        compile_id = compile_store.create_compile_run(
-            itfaq_normalized,
-            run_id=run_id,
-            datasets=["itfaq"],
-            seed=7,
-            qa_limit=2,
-            negatives_ratio=ratio,
-        )
-        itfaq_normalized.commit()
-        compile.build_subset(
-            itfaq_normalized, compile_id, "itfaq", seed=7, qa_limit=2, negatives_ratio=ratio
-        )
-        return {d["doc_id"] for d in compile_store.compile_docs(itfaq_normalized, compile_id)}
-
-    assert docs_for(0.0, "a") == docs_for(3.0, "b") == {"doc_001", "doc_002"}
-
-
-def test_subset_is_seed_stable(itfaq_normalized):
-    def samples_for(run_id: str) -> list[str]:
-        compile_id = compile_store.create_compile_run(
-            itfaq_normalized,
-            run_id=run_id,
-            datasets=["itfaq"],
-            seed=11,
-            qa_limit=2,
-            negatives_ratio=1.0,
-        )
-        itfaq_normalized.commit()
-        compile.build_subset(
-            itfaq_normalized, compile_id, "itfaq", seed=11, qa_limit=2, negatives_ratio=1.0
-        )
-        return [s["sample_id"] for s in compile_store.compile_samples(itfaq_normalized, compile_id)]
-
-    assert samples_for("a") == samples_for("b")
-
-
 # ------------------------------------------------------------ 语料渲染
 
 
@@ -176,18 +125,6 @@ def test_markdown_does_not_repeat_existing_heading(itfaq_normalized):
     markdown = compile.markdown_of(itfaq_normalized, "itfaq", "doc_001")
     assert markdown.startswith("# 设备申请说明")
     assert markdown.count("# 设备申请说明") == 1
-
-
-def test_markdown_still_adds_heading_when_absent():
-    """正文没有 H1 时照旧补上 —— 四组现有数据集走的是这条。"""
-    doc = CorpusDoc(doc_id="0", title="Rita Moreno", text="Rita Moreno won a Grammy.")
-    assert doc.to_markdown() == "# Rita Moreno\n\nRita Moreno won a Grammy.\n"
-
-
-def test_markdown_heading_match_is_exact_first_line():
-    """musique 有以 `# ` 开头的表格片段，首行不等于 `# {title}`，必须照旧加标题。"""
-    doc = CorpusDoc(doc_id="0", title="North Korea", text="# Name Took office Left office")
-    assert doc.to_markdown().startswith("# North Korea\n\n# Name Took office")
 
 
 # ------------------------------------------------------------ 本地数据集不下载

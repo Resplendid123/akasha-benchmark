@@ -11,38 +11,30 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..task import Stage, TaskContext
+from ..task import Stage
 from . import attribute, chain, compile, download, evaluate, normalize, query
 
 
 @dataclass(frozen=True)
 class StageSpec:
-    name: str
     label: str
     run: Stage
     # 参数名 -> 类型。未声明的键丢掉。
     params: dict[str, type] = field(default_factory=dict)
-    cost: str = ""
-    needs_akasha: bool = False
 
 
 STAGES: dict[str, StageSpec] = {
     "download": StageSpec(
-        name="download",
         label="下载数据集",
         run=download.run,
         params={"datasets": list},
-        cost="取决于网络，下载后自动校验原始文件",
     ),
     "normalize": StageSpec(
-        name="normalize",
         label="归一化",
         run=normalize.run,
         params={"datasets": list},
-        cost="秒级到分钟级，离线",
     ),
     "compile": StageSpec(
-        name="compile",
         label="编译",
         run=compile.run,
         params={
@@ -54,15 +46,9 @@ STAGES: dict[str, StageSpec] = {
             "negatives_ratio": float,
             "full_corpus": bool,
             "import_concurrency": int,
-            "compiler_model_id": int,
-            "embedding_model_id": int,
-            "image_model_id": int,
         },
-        cost="约 40 秒/篇，取决于 Akasha 的编译 worker 吞吐",
-        needs_akasha=True,
     ),
     "query": StageSpec(
-        name="query",
         label="查询",
         run=query.run,
         params={
@@ -70,16 +56,11 @@ STAGES: dict[str, StageSpec] = {
             "name": str,
             "datasets": list,
             "sample_limit": int,
-            "score_threshold": float,
             "concurrency": int,
-            "answer_model_id": int,
             "retry_failed": bool,
         },
-        cost="10–14 秒每条",
-        needs_akasha=True,
     ),
     "evaluate": StageSpec(
-        name="evaluate",
         label="评测",
         run=evaluate.run,
         params={
@@ -91,10 +72,8 @@ STAGES: dict[str, StageSpec] = {
             "judge_provider_id": int,
             "concurrency": int,
         },
-        cost="确定性指标秒级；勾了 Judge 会调模型花钱",
     ),
     "attribute": StageSpec(
-        name="attribute",
         label="归因",
         run=attribute.run,
         params={
@@ -102,9 +81,7 @@ STAGES: dict[str, StageSpec] = {
             "name": str,
             "use_model": bool,
             "provider_id": int,
-            "concurrency": int,
         },
-        cost="规则归因秒级；带模型时每条一次调用",
     ),
 }
 
@@ -138,18 +115,4 @@ def clean_params(stage: str, args: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def describe() -> list[dict[str, Any]]:
-    """各阶段的参数与代价，供 API 和前端展示。"""
-    return [
-        {
-            "stage": spec.name,
-            "label": spec.label,
-            "params": sorted(spec.params),
-            "cost": spec.cost,
-            "needs_akasha": spec.needs_akasha,
-        }
-        for spec in STAGES.values()
-    ]
-
-
-__all__ = ["STAGES", "StageSpec", "TaskContext", "chain", "clean_params", "describe"]
+__all__ = ["STAGES", "StageSpec", "chain", "clean_params"]

@@ -14,29 +14,19 @@ def create_query_run(
     *,
     name: str,
     compile_id: int,
-    score_threshold: float | None,
     concurrency: int,
     model_configs: Any,
-    config_group: str | None = None,
-    answer_model_id: int | None = None,
-    model_selection: dict[str, Any] | None = None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO query_run
-            (name, compile_id, score_threshold, concurrency, config_group, answer_model_id,
-             model_selection_json,
-             model_configs_json, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (name, compile_id, concurrency, model_configs_json, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             name,
             compile_id,
-            score_threshold,
             concurrency,
-            config_group,
-            answer_model_id,
-            dumps(model_selection),
             dumps(model_configs),
             STATUS_RUNNING,
             utc_now(),

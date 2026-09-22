@@ -1,18 +1,16 @@
-"""任务运行器：在后台线程里跑阶段，支持暂停、继续、清理。
-
-阶段在本进程里跑，参数与产物都在库里。后端重启会中断在跑的任务，
-启动时 :meth:`TaskRunner.recover` 把它们标成暂停，让用户显式继续。
-
-暂停是协作式的：阶段在每个可续跑的边界调 ``ctx.checkpoint()``。
-继续使用同一任务保存的参数与产物 ID，各阶段按自身规则重算或跳过。
-"""
+"""后台任务调度、暂停/继续、远端编译取消与链路推进。"""
 
 from __future__ import annotations
 
 import threading
 from typing import Any
 
-from akasha_benchmark.akasha_client import ACTIVE_RUN_STATUSES, AkashaClient, AkashaError
+from akasha_benchmark.akasha_client import (
+    ACTIVE_RUN_STATUSES,
+    AkashaClient,
+    AkashaError,
+    validate_cancel_result,
+)
 from akasha_benchmark.config import load_config
 from akasha_benchmark.stages import STAGES, chain, clean_params
 from akasha_benchmark.store import compile_store, connect, query_store, task_store
@@ -49,6 +47,22 @@ class TaskRunner:
         try:
             active = task_store.active_tasks(connection)
             for task in active:
+                try:
+                    self._cancel_remote_compile(
+                        connection, task, "Akasha-Benchmark backend restarted"
+                    )
+                except TaskRejected as exc:
+                    task_store.transition(
+                        connection, int(task["id"]), task_store.FAILED, error=str(exc)
+                    )
+                    task_store.log(
+                        connection,
+                        task_id=int(task["id"]),
+                        stage=task["stage"],
+                        level="error",
+                        message=f"后端重启后无法确认远端已停止：{exc}",
+                    )
+                    continue
                 task_store.transition(connection, int(task["id"]), task_store.PAUSED)
                 task_store.log(
                     connection,
@@ -132,9 +146,7 @@ class TaskRunner:
                 "datasets": datasets,
                 "concurrency": int(query_run["concurrency"]),
                 "name": query_run["name"],
-                "score_threshold": query_run["score_threshold"],
                 "sample_limit": None,
-                "answer_model_id": query_run.get("answer_model_id"),
                 "retry_failed": True,
             }
             task_id = task_store.create_task(connection, stage="query", params=params)
@@ -185,7 +197,26 @@ class TaskRunner:
                 raise TaskRejected(f"任务 #{task_id} 不存在")
             if task["status"] not in task_store.ACTIVE:
                 raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，不在运行")
-            self._cancel_remote_compile(connection, task, "Akasha-Benchmark task paused")
+            remote_results = self._cancel_remote_compile(
+                connection, task, "Akasha-Benchmark task paused"
+            )
+            task = task_store.get_task(connection, task_id) or task
+            if task["status"] not in task_store.ACTIVE:
+                return task
+            if task["stage"] == "compile" and remote_results and all(
+                result["disposition"] == "already_terminal"
+                and result["status"] != "cancelled"
+                for result in remote_results
+            ):
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage=task["stage"],
+                    level="info",
+                    message="远端编译已终态，本地继续同步最终状态",
+                )
+                connection.commit()
+                return task
             with self._lock:
                 event = self._pauses.get(task_id)
             if event is None:
@@ -237,10 +268,11 @@ class TaskRunner:
 
     def _cancel_remote_compile(
         self, connection, task: dict[str, Any], reason: str
-    ) -> None:
+    ) -> list[dict[str, str]]:
         if task.get("stage") != "compile":
-            return
+            return []
         run_ids = task.get("params", {}).get("remote_compile_run_ids") or []
+        remote_results: list[dict[str, str]] = []
         try:
             with AkashaClient(load_config(connection)) as client:
                 client.login()
@@ -259,17 +291,21 @@ class TaskRunner:
                         ]
                 for run_id in run_ids:
                     result = client.cancel_compile_run(str(run_id), reason)
+                    remote = validate_cancel_result(str(run_id), result)
+                    remote_results.append(remote)
                     task_store.log(
                         connection,
                         task_id=int(task["id"]),
                         stage="compile",
                         level="info",
                         message=(
-                            f"远端编译 Run {run_id} 已处理：{result.get('disposition', 'unknown')}，"
+                            f"远端编译 Run {run_id} 已处理：{remote['disposition']} / "
+                            f"{remote['status']}，"
                             f"清理 BullMQ job {result.get('removedJobCount', 0)} 个"
                         ),
                     )
             connection.commit()
+            return remote_results
         except (AkashaError, ValueError) as exc:
             connection.rollback()
             raise TaskRejected(f"远端编译 Run 取消失败，本地状态未变：{exc}") from exc
@@ -281,7 +317,6 @@ class TaskRunner:
                 raise TaskRejected(
                     f"{task['stage']} 任务 #{task['id']} 正在运行，请先等它结束或暂停"
                 )
-
         same_stage = [task for task in active if task["stage"] == stage]
         limit = STAGE_CONCURRENCY.get(stage, 1)
         if len(same_stage) >= limit:

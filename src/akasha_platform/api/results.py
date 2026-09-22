@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from akasha_benchmark import attribution, textdiff
+from akasha_benchmark import textdiff
 from akasha_benchmark.config import load_config
 from akasha_benchmark.lineage import BadPageId, LineageReader, LineageUnavailable
 from akasha_benchmark.metrics.interpretation import (
@@ -191,17 +191,13 @@ def attribution_detail(request: Request, attribution_id: int) -> dict[str, Any]:
         if row is None:
             raise HTTPException(404, f"归因 #{attribution_id} 不存在")
         results = attribution_store.attribution_results(connection, attribution_id)
-    latencies = [r["latency_ms"] for r in results if r.get("latency_ms")]
     return {
         **public_run(row),
         "count_by_root_cause": {
             cause: sum(1 for r in results if r["root_cause"] == cause)
             for cause in sorted({r["root_cause"] for r in results})
         },
-        # 规则归因不调模型，没有 latency，不进均值。
-        "latency_mean": sum(latencies) / len(latencies) if latencies else None,
-        "results": [{**r, "remedy": attribution.REMEDIES.get(r["root_cause"])} for r in results],
-        "remedies": attribution.REMEDIES,
+        "results": results,
     }
 
 

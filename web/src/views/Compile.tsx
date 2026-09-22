@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { api } from '../api'
-import type { AkashaFeature, AkashaModelProvider, CompileRun, DatasetEntry } from '../types'
+import type { CompileRun, DatasetEntry } from '../types'
 import {
   CleanupButton,
   ConfigPanel,
@@ -102,7 +102,7 @@ export function Compile({
                     {run.run_id} <span className="muted">#{run.id}</span>
                   </td>
                   <td className="small">{run.datasets.join(', ')}</td>
-                  <td className="small">{run.config_group ?? '—'}</td>
+                  <td className="small">{run.model_label ?? '—'}</td>
                   <td>
                     <StatusTag status={run.status} />
                   </td>
@@ -169,7 +169,6 @@ function NewCompile({
   datasets: DatasetEntry[]
   onStarted: () => void
 }) {
-  const models = useAsync(() => api.akashaModels(), [])
   const [selected, setSelected] = useState<string[]>([])
   const [runId, setRunId] = useState('')
   const [fullQa, setFullQa] = useState(true)
@@ -178,32 +177,12 @@ function NewCompile({
   const [fullCorpus, setFullCorpus] = useState(true)
   const [ratio, setRatio] = useState(1)
   const [importConcurrency, setImportConcurrency] = useState(10)
-  const [modelIds, setModelIds] = useState<Partial<Record<AkashaFeature, number>>>({})
   const start = useAction<unknown>()
   const selectedQaMax = Math.max(
     0,
     ...selected.map((name) => datasets.find((dataset) => dataset.name === name)?.qa_rows ?? 0),
   )
   const effectiveQaLimit = fullQa ? selectedQaMax : qaLimit
-  const compileFeatures: AkashaFeature[] = ['compiler', 'embedding', 'image']
-  const byFeature = (feature: AkashaFeature) =>
-    (models.data?.models ?? []).filter((entry) => entry.feature === feature)
-  const modelsReady = compileFeatures.every((feature) => modelIds[feature])
-
-  useEffect(() => {
-    if (!models.data) return
-    setModelIds((current) => {
-      const next = { ...current }
-      for (const feature of compileFeatures) {
-        if (!next[feature]) next[feature] = byFeature(feature)[0]?.id
-      }
-      return next
-    })
-  }, [models.data])
-
-  if (models.loading) return <Loading what="编译模型配置" />
-  if (models.error) return <Failed error={models.error} />
-
   return (
     <ConfigPanel storageKey="compile" title="新建编译">
       {datasets.length === 0 && (
@@ -217,16 +196,8 @@ function NewCompile({
         onChange={setSelected}
       />
 
-      <div className="row" style={{ marginTop: 10 }}>
-        {compileFeatures.map((feature) => (
-          <ModelSelect
-            key={feature}
-            feature={feature}
-            models={byFeature(feature)}
-            value={modelIds[feature] ?? ''}
-            onChange={(id) => setModelIds((current) => ({ ...current, [feature]: id }))}
-          />
-        ))}
+      <div className="note small" style={{ marginTop: 10 }}>
+        编译使用 Akasha 当前远端生效的 compiler、embedding 和 image 配置。
       </div>
 
       <div className="row" style={{ marginTop: 10 }}>
@@ -294,8 +265,7 @@ function NewCompile({
             selected.length === 0 ||
             effectiveQaLimit < 1 ||
             importConcurrency < 1 ||
-            importConcurrency > 16 ||
-            !modelsReady
+            importConcurrency > 16
           }
           onClick={() =>
             start.run(async () => {
@@ -305,9 +275,6 @@ function NewCompile({
                 seed,
                 full_corpus: fullCorpus,
                 import_concurrency: importConcurrency,
-                compiler_model_id: modelIds.compiler,
-                embedding_model_id: modelIds.embedding,
-                image_model_id: modelIds.image,
                 ...(fullCorpus ? {} : { negatives_ratio: ratio }),
                 ...(runId.trim() ? { run_id: runId.trim() } : {}),
               })
@@ -316,7 +283,7 @@ function NewCompile({
             })
           }
         >
-          {start.busy ? '应用配置并启动中…' : '应用配置并开始编译'}
+          {start.busy ? '启动中…' : '开始编译'}
         </button>
       </div>
     </ConfigPanel>
@@ -498,31 +465,6 @@ function CompileDetail({ run }: { run: CompileRun }) {
       )}
 
     </div>
-  )
-}
-
-function ModelSelect({
-  feature,
-  models,
-  value,
-  onChange,
-}: {
-  feature: AkashaFeature
-  models: AkashaModelProvider[]
-  value: number | ''
-  onChange: (id: number) => void
-}) {
-  return (
-    <Field label={`${feature} 模型`}>
-      <select value={value} onChange={(event) => onChange(Number(event.target.value))}>
-        <option value="">请选择</option>
-        {models.map((entry) => (
-          <option key={entry.id} value={entry.id}>
-            {entry.label} · {entry.model}
-          </option>
-        ))}
-      </select>
-    </Field>
   )
 }
 

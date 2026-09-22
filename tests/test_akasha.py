@@ -65,15 +65,13 @@ class FakeClient:
         configs: Any = None,
         retrieved: list[str] | None = None,
         accepted_runs: int = 1,
-        status_counts: dict[str, int] | None = None,
         page_log_items: list[dict[str, Any]] | None = None,
         run_items: list[dict[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.role = role
-        # accepted_runs=0 且 status_counts 为空 = Akasha 没接编译请求。
         self.accepted_runs = accepted_runs
-        self.status_counts = status_counts if status_counts is not None else {"succeeded": 1}
+        self.compile_submitted = False
         # 逐页编译日志。闸门失败时阶段会读它问原因。
         self.page_log_items: list[dict[str, Any]] = page_log_items or []
         # 编译 Run 明细，用于估算每篇耗时。
@@ -82,6 +80,8 @@ class FakeClient:
             if run_items is not None
             else [
                 {
+                    "runId": "remote-run-1",
+                    "status": "succeeded",
                     "runDurationMs": 8000,
                     "progress": {"text": {"expected": 4, "succeeded": 4, "failed": 0}},
                 }
@@ -127,17 +127,15 @@ class FakeClient:
         return {"id": f"page-{len(self.imported)}"}
 
     def compile_spaces(self, space_ids):
+        self.compile_submitted = True
         return {
             "acceptedRunCount": self.accepted_runs,
             "coalescedRunCount": 0,
             "runs": ([{"runId": "remote-run-1", "disposition": "created"}] if self.accepted_runs else []),
         }
 
-    def run_diagnostics_summary(self, space_ids):
-        return {"statusCounts": dict(self.status_counts)}
-
     def run_diagnostics(self, space_ids, *, limit=50):
-        return {"items": list(self.run_items)}
+        return {"items": list(self.run_items) if self.compile_submitted else []}
 
     def quality_diagnostics(self, space_ids):
         return self.quality
@@ -165,7 +163,7 @@ class FakeClient:
     def retry_pages(self, page_ids):
         return {"queuedPageCount": len(page_ids), "jobIds": ["retry-run-1"]}
 
-    def query(self, question, space_ids, score_threshold=None):
+    def query(self, question, space_ids):
         from akasha_benchmark.akasha_client import Response
 
         self.queries.append(question)
@@ -363,6 +361,36 @@ def test_client_collects_failed_run_pages_across_pages(monkeypatch):
         client.close()
 
 
+def test_retryable_pages_use_latest_status_across_runs(monkeypatch):
+    """旧 Run 失败但新 Run 已成功的页面不能再次提交 retry-pages。"""
+    client = AkashaClient(AkashaConfig())
+    pages = {
+        "original": [
+            {"sourcePageId": "eventually-ok", "status": "failed"},
+            {"sourcePageId": "still-failed", "status": "failed"},
+            {"sourcePageId": "already-ok", "status": "succeeded"},
+        ],
+        "retry": [
+            {"sourcePageId": "eventually-ok", "status": "succeeded"},
+            {
+                "sourcePageId": "still-failed",
+                "status": "skipped",
+                "errorCode": "manual_cancelled",
+            },
+        ],
+    }
+
+    monkeypatch.setattr(
+        client,
+        "run_pages",
+        lambda run_id, **_: {"items": pages[run_id], "total": len(pages[run_id]), "limit": 100},
+    )
+    try:
+        assert client.retryable_run_page_ids(["original", "retry"]) == ["still-failed"]
+    finally:
+        client.close()
+
+
 def test_client_requires_retry_batches_of_at_most_100(monkeypatch):
     client = AkashaClient(AkashaConfig())
     batches: list[list[str]] = []
@@ -440,7 +468,12 @@ def test_compile_records_pace_estimate(ready_connection, monkeypatch):
         return FakeClient(
             config,
             run_items=[
-                {"runDurationMs": 8000, "progress": {"text": {"expected": 4}}},
+                {
+                    "runId": "remote-run-1",
+                    "status": "succeeded",
+                    "runDurationMs": 8000,
+                    "progress": {"text": {"expected": 4}},
+                },
             ],
         )
 
@@ -455,21 +488,6 @@ def test_compile_records_pace_estimate(ready_connection, monkeypatch):
     assert pace["pages"] == 4
     assert pace["total_ms"] == 8000
     assert pace["per_page_ms"] == 2000
-
-
-def test_compile_pace_survives_missing_diagnostics(ready_connection, monkeypatch):
-    """诊断拿不到就不记 pace，编译照样成功：它是展示用的估算，不是闸门。"""
-
-    def factory(config):
-        return FakeClient(config, run_items=[])
-
-    monkeypatch.setattr(compile, "AkashaClient", factory)
-    ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2, "run_id": "p2"})
-    execute(compile.run, ctx)
-
-    run = compile_store.compile_run_by_run_id(ready_connection, "p2")
-    assert run["status"] == run_store.STATUS_SUCCEEDED
-    assert run["pace_json"] is None
 
 
 def test_compile_reports_page_failure_reason(ready_connection, monkeypatch):
@@ -555,7 +573,7 @@ def test_compile_fails_when_no_run_was_accepted(ready_connection, monkeypatch):
     """一个编译 Run 都没有算没编译，不算编译好了（两者的 active 都是 0）。"""
 
     def factory(config):
-        return FakeClient(config, accepted_runs=0, status_counts={})
+        return FakeClient(config, accepted_runs=0, run_items=[])
 
     monkeypatch.setattr(compile, "AkashaClient", factory)
     ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2})
@@ -571,11 +589,20 @@ def test_compile_waits_when_runs_are_still_active(ready_connection, monkeypatch)
     seen: list[dict[str, int]] = []
 
     class Slow(FakeClient):
-        def run_diagnostics_summary(self, space_ids):
+        def run_diagnostics(self, space_ids, *, limit=50):
             seen.append({})
-            # 第一次回「编译中」，第二次回终态。
-            counts = {"compiling": 1} if len(seen) == 1 else {"succeeded": 1}
-            return {"statusCounts": counts}
+            status = "compiling" if len(seen) == 1 else "succeeded"
+            return {
+                "items": [
+                    {
+                        "runId": "remote-run-1",
+                        "status": status,
+                        "progress": {
+                            "text": {"expected": 1, "succeeded": int(status == "succeeded"), "failed": 0, "skipped": 0}
+                        },
+                    }
+                ]
+            }
 
     monkeypatch.setattr(compile, "AkashaClient", lambda config: Slow(config))
     monkeypatch.setattr(compile.time, "sleep", lambda _seconds: None)
@@ -684,6 +711,76 @@ def test_compile_progress_counts_only_current_compile_pages(ready_connection):
     assert progress == {"expected": 2, "succeeded": 2, "failed": 0, "skipped": 0}
 
 
+def test_compile_progress_uses_latest_page_status_across_retry_runs(ready_connection):
+    compile_id = compile_store.create_compile_run(
+        ready_connection, run_id="retry-progress", datasets=["hotpotqa"],
+        seed=1, qa_limit=1, negatives_ratio=1.0,
+    )
+    compile.build_subset(
+        ready_connection, compile_id, "hotpotqa", seed=1, qa_limit=1, negatives_ratio=1.0
+    )
+    docs = compile_store.compile_docs(ready_connection, compile_id)[:2]
+    page_ids = []
+    for index, doc in enumerate(docs):
+        page_id = f"retry-target-{index}"
+        page_ids.append(page_id)
+        compile_store.record_page(
+            ready_connection, compile_id, doc["dataset"], doc["doc_id"],
+            page_id=page_id, error=None,
+        )
+    task_id = task_store.create_task(ready_connection, stage="compile", params={})
+    task_store.set_task_target(ready_connection, task_id, "compile", compile_id)
+    ready_connection.commit()
+
+    class RunPages(FakeClient):
+        def run_pages(self, run_id, *, page=1, limit=100):
+            items = (
+                [
+                    {"sourcePageId": page_ids[0], "status": "succeeded"},
+                    {"sourcePageId": page_ids[1], "status": "failed"},
+                ]
+                if run_id == "original"
+                else [{"sourcePageId": page_ids[1], "status": "succeeded"}]
+            )
+            return {"items": items, "total": len(items), "limit": limit}
+
+    progress = compile._target_run_progress(
+        context(ready_connection, {}, task_id=task_id),
+        RunPages(None),
+        [{"runId": "original"}, {"runId": "retry"}],
+    )
+    assert progress == {"expected": 2, "succeeded": 2, "failed": 0, "skipped": 0}
+
+
+def test_compile_progress_counts_merge_failure_as_failed(ready_connection):
+    compile_id = compile_store.create_compile_run(
+        ready_connection, run_id="merge-progress", datasets=["hotpotqa"],
+        seed=1, qa_limit=1, negatives_ratio=1.0,
+    )
+    compile.build_subset(
+        ready_connection, compile_id, "hotpotqa", seed=1, qa_limit=1, negatives_ratio=1.0
+    )
+    doc = compile_store.compile_docs(ready_connection, compile_id)[0]
+    compile_store.record_page(
+        ready_connection, compile_id, doc["dataset"], doc["doc_id"],
+        page_id="merge-page", error=None,
+    )
+    task_id = task_store.create_task(ready_connection, stage="compile", params={})
+    task_store.set_task_target(ready_connection, task_id, "compile", compile_id)
+    ready_connection.commit()
+
+    class MergeFailed(FakeClient):
+        def run_pages(self, run_id, *, page=1, limit=100):
+            return {
+                "items": [{"sourcePageId": "merge-page", "status": "succeeded", "mergeStatus": "failed"}],
+                "total": 1, "limit": limit,
+            }
+
+    assert compile._target_run_progress(
+        context(ready_connection, {}, task_id=task_id), MergeFailed(None), [{"runId": "run"}]
+    ) == {"expected": 1, "succeeded": 0, "failed": 1, "skipped": 0}
+
+
 def test_retry_batches_resume_current_run_before_submitting_pending(ready_connection, monkeypatch):
     compile_id = compile_store.create_compile_run(
         ready_connection, run_id="retry-state", datasets=["hotpotqa"],
@@ -731,6 +828,29 @@ def test_retry_batches_resume_current_run_before_submitting_pending(ready_connec
     assert result["progress"] == {
         "expected": 106, "succeeded": 106, "failed": 0, "skipped": 0
     }
+
+
+def test_retry_batches_reject_inconsistent_remote_run_count(ready_connection):
+    compile_id = compile_store.create_compile_run(
+        ready_connection, run_id="bad-retry-count", datasets=["hotpotqa"],
+        seed=1, qa_limit=1, negatives_ratio=1.0,
+    )
+    task_id = task_store.create_task(ready_connection, stage="compile", params={})
+    task_store.set_task_target(ready_connection, task_id, "compile", compile_id)
+    ready_connection.commit()
+
+    class BadCount(FakeClient):
+        def retry_pages(self, page_ids):
+            return {"queuedPageCount": 2, "jobIds": ["one-run"]}
+
+    with pytest.raises(RuntimeError, match="重试响应计数不一致"):
+        compile._retry_batches(
+            context(ready_connection, {}, task_id=task_id),
+            BadCount(None),
+            "space",
+            AkashaConfig(),
+            ["page-1"],
+        )
 
 
 def test_compile_does_not_finish_on_historical_run_before_new_run_appears(
@@ -920,7 +1040,7 @@ def test_compile_resume_retries_only_failed_remote_pages(ready_connection, monke
     assert retried == [[failed_page_id]]
     assert task_store.get_task(ready_connection, ctx.task_id)["params"][
         "remote_compile_run_ids"
-    ] == ["retry-run-1"]
+    ] == ["remote-run-1", "retry-run-1"]
 
 
 def test_compile_resume_adopts_active_remote_run(ready_connection, monkeypatch):
@@ -973,7 +1093,7 @@ def test_compile_resume_adopts_active_remote_run(ready_connection, monkeypatch):
 
     class Recovering(FakeClient):
         def put_model_config(self, feature, payload):
-            pytest.fail("旧编译任务没有模型 ID 时不应改远端模型配置")
+            pytest.fail("恢复编译任务不应修改远端模型配置")
 
         def run_diagnostics(self, space_ids, *, limit=50):
             nonlocal polls
@@ -1012,7 +1132,7 @@ def test_compile_resume_adopts_active_remote_run(ready_connection, monkeypatch):
     assert task_store.get_task(ready_connection, task_id)["status"] == task_store.SUCCEEDED
 
 
-def test_compile_resume_resubmits_when_cancelled_before_page_initialization(
+def test_compile_resume_retries_target_pages_when_cancelled_before_page_initialization(
     ready_connection, monkeypatch
 ):
     monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
@@ -1022,8 +1142,7 @@ def test_compile_resume_resubmits_when_cancelled_before_page_initialization(
     execute(compile.run, ctx)
     task_store.transition(ready_connection, ctx.task_id, task_store.PAUSED)
     ready_connection.commit()
-    submitted = False
-    compile_calls = 0
+    retried: list[list[str]] = []
 
     class CancelledBeforeInit(FakeClient):
         def run_diagnostics(self, space_ids, *, limit=50):
@@ -1034,7 +1153,7 @@ def test_compile_resume_resubmits_when_cancelled_before_page_initialization(
                     "text": {"expected": 0, "succeeded": 0, "failed": 0, "skipped": 0}
                 },
             }
-            if not submitted:
+            if not retried:
                 return {"items": [cancelled]}
             return {
                 "items": [
@@ -1055,26 +1174,38 @@ def test_compile_resume_resubmits_when_cancelled_before_page_initialization(
             }
 
         def compile_spaces(self, space_ids):
-            nonlocal submitted, compile_calls
-            submitted = True
-            compile_calls += 1
-            return {
-                "acceptedRunCount": 1,
-                "coalescedRunCount": 0,
-                "runs": [{"runId": "new-run", "disposition": "created"}],
-            }
+            pytest.fail("继续未初始化 Run 不应扫描整个 Space")
 
         def retry_pages(self, page_ids):
-            pytest.fail("没有逐页记录的页面不能调用 retry-pages")
+            retried.append(list(page_ids))
+            return {"queuedPageCount": len(page_ids), "jobIds": ["new-run"]}
+
+        def run_pages(self, run_id, *, page=1, limit=100):
+            if not retried:
+                return {"items": [], "total": 0, "limit": limit}
+            items = [
+                {"sourcePageId": page_id, "status": "succeeded"}
+                for page_id in retried[0]
+            ]
+            return {"items": items, "total": len(items), "limit": limit}
 
     monkeypatch.setattr(compile, "AkashaClient", lambda config: CancelledBeforeInit(config))
 
     execute(compile.run, context(ready_connection, {}, task_id=ctx.task_id))
 
-    assert compile_calls == 1
+    expected = list(
+        dict.fromkeys(
+            str(row["page_id"])
+            for row in compile_store.compile_docs(
+                ready_connection, int(ctx.target("compile"))
+            )
+            if row.get("page_id")
+        )
+    )
+    assert retried == [expected]
     assert task_store.get_task(ready_connection, ctx.task_id)["params"][
         "remote_compile_run_ids"
-    ] == ["new-run"]
+    ] == ["remote-run-1", "new-run"]
 
 
 def test_compile_imports_concurrently(ready_connection, monkeypatch):
@@ -1191,8 +1322,8 @@ def _compiled(connection, monkeypatch) -> int:
     return int(compile_store.compile_run_by_run_id(connection, "r1")["id"])
 
 
-def test_query_allows_embedding_model_change_with_warning(ready_connection, monkeypatch):
-    """配置漂移只用于标记可比性，任何 embedding 变化都不阻断查询。"""
+def test_query_blocks_embedding_model_change(ready_connection, monkeypatch):
+    """查询 embedding 与索引 embedding 不一致时必须重新编译。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     changed = {
         "configs": [
@@ -1204,31 +1335,21 @@ def test_query_allows_embedding_model_change_with_warning(ready_connection, monk
     ctx = context(
         ready_connection, {"compile_id": compile_id, "name": "embedding-changed"}
     )
-    execute(query.run, ctx)
-
-    run = query_store.query_run_by_name(ready_connection, "embedding-changed")
-    assert run is not None
-    assert run["status"] == run_store.STATUS_SUCCEEDED
-    logs = task_store.task_logs(ready_connection, ctx.task_id)
-    assert any(
-        entry["level"] == "warn"
-        and "embedding 配置与编译时不同" in entry["message"]
-        for entry in logs
-    )
+    with pytest.raises(RuntimeError, match="embedding.*必须重新编译"):
+        execute(query.run, ctx)
+    assert query_store.query_run_by_name(ready_connection, "embedding-changed") is None
 
 
 def test_query_allows_endpoint_and_other_config_changes(
     ready_connection, monkeypatch
 ):
-    """端点 scheme 和其它模型变化也只告警，不阻断查询。"""
+    """compiler、answer、image 变化可形成新查询；embedding 必须保持一致。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     changed = {
         "configs": [
-            (
-                {**entry, "baseUrl": "http://u"}
-                if entry["feature"] == "embedding"
-                else {**entry, "model": f"other-{entry['feature']}"}
-            )
+            entry
+            if entry["feature"] == "embedding"
+            else {**entry, "model": f"other-{entry['feature']}"}
             for entry in CONFIGS["configs"]
         ]
     }
@@ -1246,30 +1367,10 @@ def test_query_allows_endpoint_and_other_config_changes(
     assert run["status"] == run_store.STATUS_SUCCEEDED
 
 
-def test_query_applies_and_records_its_answer_model(ready_connection, monkeypatch):
+def test_query_uses_remote_answer_model_without_changing_it(ready_connection, monkeypatch):
     compile_id = _compiled(ready_connection, monkeypatch)
-    answer_model_id = config_store.upsert_akasha_model(
-        ready_connection,
-        feature="answer",
-        label="query-answer",
-        model="query-answer-model",
-        base_url="https://query.example/v1",
-        api_key="secret",
-    )
-    ready_connection.commit()
     pushed: list[tuple[str, dict[str, Any]]] = []
-    active = {
-        "configs": [
-            {
-                "feature": feature,
-                "provider": "openai-compatible",
-                "model": "query-answer-model" if feature == "answer" else f"query-{feature}",
-                "baseUrl": "https://query.example/v1",
-                "parameters": None,
-            }
-            for feature in model_configs.FEATURES
-        ]
-    }
+    active = CONFIGS
 
     class GroupClient(FakeClient):
         def put_model_config(self, feature, payload):
@@ -1284,36 +1385,21 @@ def test_query_applies_and_records_its_answer_model(ready_connection, monkeypatc
         query.run,
         context(
             ready_connection,
-            {
-                "compile_id": compile_id,
-                    "answer_model_id": answer_model_id,
-                "name": "query-own-group",
+                {
+                    "compile_id": compile_id,
+                    "name": "query-own-group",
                 "concurrency": 2,
             },
         ),
     )
 
     run = query_store.query_run_by_name(ready_connection, "query-own-group")
-    assert run["answer_model_id"] == answer_model_id
     assert run["concurrency"] == 2
     assert loads(run["model_configs_json"]) == active
-    assert [feature for feature, _ in pushed] == ["answer"]
-    selection = loads(run["model_selection_json"])
-    assert selection["answer"]["label"] == "query-answer"
+    assert pushed == []
 
 
-def test_compile_applies_three_selected_models_together(ready_connection, monkeypatch):
-    ids = {}
-    for feature in ("compiler", "embedding", "image"):
-        ids[feature] = config_store.upsert_akasha_model(
-            ready_connection,
-            feature=feature,
-            label=f"selected-{feature}",
-            model=f"model-{feature}",
-            base_url="https://models.example/v1",
-            api_key="secret",
-        )
-    ready_connection.commit()
+def test_compile_uses_remote_models_without_changing_them(ready_connection, monkeypatch):
     pushed: list[str] = []
 
     class SelectedClient(FakeClient):
@@ -1326,20 +1412,17 @@ def test_compile_applies_three_selected_models_together(ready_connection, monkey
         compile.run,
         context(
             ready_connection,
-            {
-                "datasets": ["hotpotqa"],
-                "qa_limit": 1,
-                "run_id": "selected-models",
-                **{f"{feature}_model_id": model_id for feature, model_id in ids.items()},
-            },
+                {
+                    "datasets": ["hotpotqa"],
+                    "qa_limit": 1,
+                    "run_id": "selected-models",
+                },
         ),
     )
 
     run = compile_store.compile_run_by_run_id(ready_connection, "selected-models")
-    assert pushed == ["compiler", "embedding", "image"]
-    assert run["compiler_model_id"] == ids["compiler"]
-    assert run["embedding_model_id"] == ids["embedding"]
-    assert run["image_model_id"] == ids["image"]
+    assert pushed == []
+    assert loads(run["model_configs_json"]) == CONFIGS
 
 
 def test_query_refuses_on_workspace_mismatch(ready_connection, monkeypatch):
@@ -1444,6 +1527,49 @@ def test_query_records_responses_and_resumes(ready_connection, monkeypatch):
     assert clients[-1].queries == []
 
 
+def test_query_resume_refuses_remote_answer_config_drift(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    monkeypatch.setattr(query, "AkashaClient", lambda config: FakeClient(config))
+    ctx = context(ready_connection, {"compile_id": compile_id, "name": "drift-query"})
+    execute(query.run, ctx)
+
+    changed = {
+        "configs": [
+            {**entry, **({"model": "changed-answer"} if entry["feature"] == "answer" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+
+    class Drifted(FakeClient):
+        def get_model_configs(self):
+            return changed
+
+        def put_model_config(self, feature, payload):
+            pytest.fail("继续查询不应覆盖远端模型配置")
+
+    monkeypatch.setattr(query, "AkashaClient", lambda config: Drifted(config))
+    with pytest.raises(RuntimeError, match="不能继续原查询.*answer"):
+        execute(query.run, context(ready_connection, {}, task_id=ctx.task_id))
+
+
+def test_query_refuses_embedding_drift_from_compile_snapshot(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    changed = {
+        "configs": [
+            {**entry, **({"model": "changed-embedding"} if entry["feature"] == "embedding" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+
+    class Drifted(FakeClient):
+        def get_model_configs(self):
+            return changed
+
+    monkeypatch.setattr(query, "AkashaClient", lambda config: Drifted(config))
+    with pytest.raises(RuntimeError, match="embedding.*必须重新编译"):
+        execute(query.run, context(ready_connection, {"compile_id": compile_id}))
+
+
 def test_query_uses_frozen_selection(ready_connection, monkeypatch):
     """固化选择让续跑不受后续抽样改动影响。"""
     compile_id = _compiled(ready_connection, monkeypatch)
@@ -1465,7 +1591,6 @@ def test_query_rejects_name_from_another_compile(ready_connection, monkeypatch):
         ready_connection,
         name="taken",
         compile_id=other,
-        score_threshold=None,
         concurrency=1,
         model_configs=CONFIGS,
     )

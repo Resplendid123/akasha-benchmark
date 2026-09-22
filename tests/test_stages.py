@@ -219,7 +219,6 @@ def _fixture_chain(connection, response: dict) -> tuple[int, int, int]:
         connection,
         name="q",
         compile_id=compile_id,
-        score_threshold=None,
         concurrency=1,
         model_configs={},
     )
@@ -357,6 +356,63 @@ def test_attribution_processes_all_eval_samples_without_metric_selection(normali
     assert len(attribution_store.attribution_results(normalized, int(run["id"]))) == len(samples)
 
 
+def test_attribution_model_writes_one_overall_report(normalized, monkeypatch):
+    """模型面向整轮指标只调用一次，不再逐样本生成叙述。"""
+    from akasha_benchmark.judge.client import JudgeReply
+
+    compile_id, query_id, eval_id = _fixture_chain(
+        normalized, {"answerMode": "general", "answer": "A general answer", "citations": []}
+    )
+    evaluate.evaluate_dataset(
+        normalized,
+        eval_id,
+        query_id,
+        compile_id,
+        "hotpotqa",
+        (2,),
+        frozenset({"recall", "hit", "em", "f1"}),
+    )
+    _task_row(normalized)
+    provider = type("Provider", (), {"provider_id": None})()
+    monkeypatch.setattr(attribute, "resolve_provider", lambda *args: provider)
+    calls: list[list[tuple[str, str]]] = []
+
+    def fake_complete_many(_provider, prompts, concurrency, *, max_tokens):
+        calls.append(prompts)
+        assert concurrency == 1
+        assert max_tokens == 4096
+        user_prompt = prompts[0][1]
+        assert "rule_root_cause_counts" not in user_prompt
+        assert "representative_rule_evidence" not in user_prompt
+        assert "root_cause" not in user_prompt
+        assert "sample_id" not in user_prompt
+        assert '"general_answer_examples":[' in user_prompt
+        assert '"answer":"A general answer"' in user_prompt
+        assert user_prompt.count('"answer":"A general answer"') == 2
+        return [
+            JudgeReply(
+                content='{"report":"整体表现\\n潜在原因\\n验证建议"}',
+                failure_kind=None,
+                raw=None,
+                status=200,
+                latency_ms=123,
+            )
+        ]
+
+    monkeypatch.setattr(attribute, "complete_many", fake_complete_many)
+    attribute.run(context(normalized, {"eval_id": eval_id, "use_model": True}))
+
+    run = attribution_store.list_attribution_runs(normalized, eval_id)[0]
+    results = attribution_store.attribution_results(normalized, int(run["id"]))
+    assert len(calls) == 1
+    assert len(calls[0]) == 1
+    assert "metric_summaries" in calls[0][0][1]
+    assert run["report"] == "整体表现\n潜在原因\n验证建议"
+    assert run["report_error"] is None
+    assert run["report_latency_ms"] == 123
+    assert all(set(row) >= {"root_cause", "evidence"} for row in results)
+
+
 def test_omitted_metrics_are_not_faked_as_zero():
     """narrativeqa 没有 gold 标注，整族检索指标必须省略而不是记 0。"""
     adapter = get_adapter("narrativeqa")
@@ -376,10 +432,16 @@ def test_resolve_metrics_rejects_unknown():
 # ------------------------------------------------------------ 参数白名单
 
 
-def test_clean_params_drops_undeclared_keys():
+@pytest.mark.parametrize(
+    "stage,payload,expected",
+    [
+        ("query", {"compile_id": "3", "retry_failed": True, "evil": "x"}, {"compile_id": 3, "retry_failed": True}),
+        ("attribute", {"eval_id": 3, "metric": "em", "sample_limit": 1}, {"eval_id": 3}),
+    ],
+)
+def test_clean_params_drops_undeclared_keys(stage, payload, expected):
     """参数经 HTTP 进来，不过滤等于让请求体决定阶段代码看到什么。"""
-    cleaned = clean_params("query", {"compile_id": "3", "retry_failed": True, "evil": "x"})
-    assert cleaned == {"compile_id": 3, "retry_failed": True}
+    assert clean_params(stage, payload) == expected
 
 
 def test_clean_params_rejects_wrong_types():
@@ -391,20 +453,12 @@ def test_clean_params_rejects_wrong_types():
         clean_params("bogus-stage", {})
 
 
-def test_clean_params_coerces_ks_to_int():
-    assert clean_params("evaluate", {"ks": ["2", "5"]}) == {"ks": [2, 5]}
-
-
-def test_attribution_params_do_not_accept_metric_or_sample_limit():
-    assert clean_params(
-        "attribute",
-        {"eval_id": 3, "metric": "em", "sample_limit": 1, "use_model": False},
-    ) == {"eval_id": 3, "use_model": False}
-
-
-def test_model_layer_params_accept_concurrency():
-    assert clean_params("evaluate", {"concurrency": "4"}) == {"concurrency": 4}
-    assert clean_params("attribute", {"concurrency": "3"}) == {"concurrency": 3}
+@pytest.mark.parametrize(
+    "payload,expected",
+    [({"ks": ["2", "5"]}, {"ks": [2, 5]}), ({"concurrency": "4"}, {"concurrency": 4})],
+)
+def test_clean_params_coerces_evaluate_values(payload, expected):
+    assert clean_params("evaluate", payload) == expected
 
 
 def test_evaluate_resume_restores_judge_scores_and_summary(normalized, monkeypatch):
