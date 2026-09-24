@@ -38,7 +38,6 @@ def _task_row(connection) -> None:
     connection.commit()
 
 
-# ------------------------------------------------------------ 归一化
 
 
 def test_normalize_writes_samples_and_corpus(normalized):
@@ -49,7 +48,6 @@ def test_normalize_writes_samples_and_corpus(normalized):
 
 
 def test_validate_catches_dangling_gold(normalized):
-    """gold 指向不存在的 doc_id 不会让任何阶段报错，只会让指标永远差一截。"""
     assert normalize.validate_dataset(normalized, "hotpotqa") == []
 
     normalized.execute("DELETE FROM corpus_doc WHERE dataset='hotpotqa' AND doc_id='0'")
@@ -72,11 +70,9 @@ def test_normalize_rejects_duplicate_sample_ids(db, dataset_dir, monkeypatch):
         normalize.normalize_dataset(db, "hotpotqa", None, dataset_dir)
 
 
-# ------------------------------------------------------------ 编译（抽样部分）
 
 
 def test_subset_covers_every_gold(normalized):
-    """先 QA 后 corpus：所选样本的 gold 必须全在子集语料内，否则 Recall 上限不是 1。"""
     compile_id = compile_store.create_compile_run(
         normalized, run_id="r", datasets=["hotpotqa"], seed=7, qa_limit=2, negatives_ratio=1.0
     )
@@ -97,7 +93,6 @@ def test_subset_covers_every_gold(normalized):
 
 
 def test_subset_is_seed_stable(normalized):
-    """同 seed 抽同一批 —— 「同子集换 embedding」的对照实验靠这一条。"""
 
     def docs_for(seed: int, run_id: str) -> set[str]:
         compile_id = compile_store.create_compile_run(
@@ -177,7 +172,6 @@ def test_full_corpus_keeps_every_document(normalized):
 
 
 def test_markdown_uses_heading_for_title(normalized):
-    """heading 承担 title，文件名承担 doc_id，两者独立，所以重复 title 不影响身份。"""
     markdown = compile.markdown_of(normalized, "hotpotqa", "0")
     assert markdown.startswith("# Rita Moreno")
 
@@ -192,7 +186,6 @@ def test_image_only_document_has_no_indexable_text():
     assert compile._has_indexable_text("# 标题\n\n这里有可检索的正文。")
 
 
-# ------------------------------------------------------------ 评测
 
 
 def _fixture_chain(connection, response: dict) -> tuple[int, int, int]:
@@ -273,7 +266,6 @@ def test_evaluate_scores_perfect_retrieval(normalized):
 
 
 def test_evaluate_separates_fallback_from_retrieval_failure(normalized):
-    """no_match 无条件返回空 retrievedSources —— 全样本与 knowledge 切片的差值就是它。"""
     compile_id, query_id, eval_id = _fixture_chain(
         normalized, {"answerMode": "no_match", "answer": "", "citations": []}
     )
@@ -285,8 +277,7 @@ def test_evaluate_separates_fallback_from_retrieval_failure(normalized):
         for row in eval_store.metric_summaries(normalized, eval_id)
     }
     assert summaries[("overall", "recall@2")]["value"] == pytest.approx(0.0)
-    # knowledge 切片里一条样本都没有，所以那一档没有指标行 —— 前端显示「—」
-    # 而不是 0，两者的区别正是「这一档没有样本」与「这一档得分为 0」。
+    # 空切片不生成指标行。
     assert ("knowledge_only", "recall@2") not in summaries
     modes = eval_store.dataset_evals(normalized, eval_id)[0]["answer_modes"]
     assert modes == {"no_match": pytest.approx(1.0)}
@@ -302,7 +293,7 @@ def test_evaluate_filters_to_selected_metrics(normalized):
     sample = eval_store.sample_evals(normalized, eval_id)[0]
     metrics = eval_store.sample_metrics_of(normalized, eval_id, sample["sample_id"])
     assert set(metrics) == {"em"}
-    # 明细仍然保留全部链路 —— 那是归因要读的东西，与「这一轮报哪些指标」是两件事。
+    # 明细保留完整链路供归因使用。
     assert "retrieval" in sample["detail"]
 
 
@@ -319,7 +310,6 @@ def test_evaluate_rejects_rebuilt_subset(normalized):
 
 
 def test_attribution_processes_all_eval_samples_without_metric_selection(normalized):
-    """归因样本来自 sample_eval 全集，不依赖是否产出某个指标。"""
     compile_id, _, eval_id = _fixture_chain(
         normalized, {"answerMode": "knowledge", "answer": "Rita Moreno"}
     )
@@ -357,7 +347,6 @@ def test_attribution_processes_all_eval_samples_without_metric_selection(normali
 
 
 def test_attribution_model_writes_one_overall_report(normalized, monkeypatch):
-    """模型面向整轮指标只调用一次，不再逐样本生成叙述。"""
     from akasha_benchmark.judge.client import JudgeReply
 
     compile_id, query_id, eval_id = _fixture_chain(
@@ -414,12 +403,10 @@ def test_attribution_model_writes_one_overall_report(normalized, monkeypatch):
 
 
 def test_omitted_metrics_are_not_faked_as_zero():
-    """narrativeqa 没有 gold 标注，整族检索指标必须省略而不是记 0。"""
     adapter = get_adapter("narrativeqa")
     assert DataDependency.GOLD_DOCS not in adapter.provides
     omitted = {d.name for d in registry.omitted(adapter.provides)}
     assert {"recall", "ndcg", "citation_recall"} <= omitted
-    # faithfulness 的依赖是空集，所以它对 narrativeqa 仍然成立。
     assert "faithfulness" not in omitted
 
 
@@ -429,7 +416,6 @@ def test_resolve_metrics_rejects_unknown():
     assert evaluate.resolve_metrics([]) == sorted(registry.METRIC_REGISTRY)
 
 
-# ------------------------------------------------------------ 参数白名单
 
 
 @pytest.mark.parametrize(
@@ -440,7 +426,6 @@ def test_resolve_metrics_rejects_unknown():
     ],
 )
 def test_clean_params_drops_undeclared_keys(stage, payload, expected):
-    """参数经 HTTP 进来，不过滤等于让请求体决定阶段代码看到什么。"""
     assert clean_params(stage, payload) == expected
 
 
@@ -542,6 +527,9 @@ def test_judge_runs_all_metrics_for_each_sample_before_next(normalized, monkeypa
     def fake_task(metric, question, answer, reference, body):
         return ((metric, question), lambda payload: (1.0, {}))
 
+    def fake_answer_relevancy(connection, question, answer, model_snapshot):
+        return (("answer_relevancy", question), lambda payload: (1.0, {}))
+
     def fake_complete_many(provider, prompts, concurrency):
         calls.append(list(prompts))
         return [
@@ -550,6 +538,7 @@ def test_judge_runs_all_metrics_for_each_sample_before_next(normalized, monkeypa
         ]
 
     monkeypatch.setattr(evaluate, "_judge_task", fake_task)
+    monkeypatch.setattr(evaluate, "_answer_relevancy_task", fake_answer_relevancy)
     monkeypatch.setattr(evaluate, "complete_many", fake_complete_many)
     provider = JudgeProvider("https://x", "m", "k")
 
@@ -600,7 +589,7 @@ def test_judge_resume_retries_failed_verdicts(normalized, monkeypatch):
     )
     calls = 0
 
-    def fake_task(metric, question, answer, reference, body):
+    def fake_answer_relevancy(connection, question, answer, model_snapshot):
         return (("system", "user"), lambda payload: (1.0, {}))
 
     def fake_complete_many(provider, prompts, concurrency):
@@ -608,7 +597,7 @@ def test_judge_resume_retries_failed_verdicts(normalized, monkeypatch):
         calls += len(prompts)
         return [JudgeReply("{}", None, "{}", 200) for _ in prompts]
 
-    monkeypatch.setattr(evaluate, "_judge_task", fake_task)
+    monkeypatch.setattr(evaluate, "_answer_relevancy_task", fake_answer_relevancy)
     monkeypatch.setattr(evaluate, "complete_many", fake_complete_many)
     evaluate._judge(
         ctx, eval_id, query_id, JudgeProvider("https://x", "m", "k"),

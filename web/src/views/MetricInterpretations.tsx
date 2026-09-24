@@ -41,6 +41,8 @@ function renderMetric(item: MetricItem, response: Record<string, unknown>) {
   const props = { key: item.name, item, response }
   switch (base) {
     case 'recall': return <RecallMetric {...props} />
+    case 'precision': return <RecallMetric {...props} />
+    case 'retrieval_f1': return <RecallMetric {...props} />
     case 'ndcg': return <NdcgMetric {...props} />
     case 'hit': return <HitMetric {...props} />
     case 'full_coverage': return <FullCoverageMetric {...props} />
@@ -49,8 +51,8 @@ function renderMetric(item: MetricItem, response: Record<string, unknown>) {
     case 'f1': return <TokenF1Metric {...props} />
     case 'citation_precision': return <CitationPrecisionMetric {...props} />
     case 'citation_recall': return <CitationRecallMetric {...props} />
-    case 'truncation_loss': return <TruncationLossMetric {...props} />
-    case 'truncated_gold': return <TruncatedGoldMetric {...props} />
+    case 'uncited_count': return <UncitedCountMetric {...props} />
+    case 'uncited_gold_count': return <UncitedGoldMetric {...props} />
     case 'graph_neighbor_precision': return <GraphNeighborPrecisionMetric {...props} />
     case 'graph_exclusive_gold_share': return <GraphExclusiveGoldShareMetric {...props} />
     case 'graph_neighbor_gold_snippets': return <GraphNeighborGoldSnippetsMetric {...props} />
@@ -382,10 +384,10 @@ function CitationRecallMetric({ item }: MetricProps) {
     </article>
   )
 }
-function TruncationLossMetric({ item }: MetricProps) {
+function UncitedCountMetric({ item }: MetricProps) {
   return <DocumentMetric item={item} title="已检索但未进入引用的文档" documents={item.evidence?.difference_documents ?? []} />
 }
-function TruncatedGoldMetric({ item }: MetricProps) {
+function UncitedGoldMetric({ item }: MetricProps) {
   return <DocumentMetric item={item} title="已检索但未进入引用的 Gold 文档" documents={item.evidence?.difference_documents ?? []} />
 }
 function DocumentMetric({ item, title, documents }: { item: MetricItem; title: string; documents: NonNullable<NonNullable<MetricItem['evidence']>['documents']> }) {
@@ -470,5 +472,3 @@ function JudgeVerdict({ item }: { item: MetricItem }) {
   const detail = item.evidence?.judge_detail ?? {}
   return <><h5>Judge 判定</h5><div className="metric-document-item"><strong>{String(detail.verdict ?? '无')}</strong>{detail.reason ? `：${String(detail.reason)}` : ''}</div></>
 }
-
-

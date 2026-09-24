@@ -37,3 +37,4 @@ CLAUDE.md
 /tmp/*
 !/tmp/process.py
 report/
+akasha-config.template.json

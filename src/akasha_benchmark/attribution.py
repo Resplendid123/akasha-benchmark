@@ -1,68 +1,205 @@
-"""归因判据：从指标 + 链路推出根因。
-
-两段式：规则不需要模型配置，逐样本分类；模型可选地分析整轮汇总指标并生成报告。
-
-| 根因                    | 判据                                          |
-| ----------------------- | --------------------------------------------- |
-| not_a_failure           | EM 命中或系统答案完整包含参考答案               |
-| generation_ignored_retrieval | general 且仍有检索结果                    |
-| generation_fallback     | general/no_match 且没有检索结果                 |
-| citation_dropped        | truncated_gold > 0（召回到了但引用被截断）      |
-| compiled_away           | hit@k == 0 且问题实词在编译时丢失               |
-| retrieval_miss          | hit@k == 0                                    |
-| graph_edge_missing      | gold 不全且图扩展没贡献独有 gold                |
-| unknown                 | 现有非 Judge 信号不足以定位                    |
-
-顺序即优先级。``not_a_failure`` 必须第一：答案明确正确时不再归为异常。
-其余 general / no_match 回答再归为 ``generation_fallback``。
-"""
+"""按指标和链路信号归因。"""
 
 from __future__ import annotations
 
 import json
+import unicodedata
+from collections import Counter
 from typing import Any
 
 from .metrics import qa, registry
 
-CAUSE_NOT_A_FAILURE = "not_a_failure"
+CAUSE_ANSWER_CORRECT = "answer_correct"
+CAUSE_ANSWER_INCORRECT = "answer_incorrect"
 CAUSE_GENERATION_IGNORED_RETRIEVAL = "generation_ignored_retrieval"
 CAUSE_GENERATION_FALLBACK = "generation_fallback"
+CAUSE_RETRIEVAL_EVIDENCE_INCOMPLETE = "retrieval_evidence_incomplete"
 CAUSE_COMPILED_AWAY = "compiled_away"
 CAUSE_CITATION_DROPPED = "citation_dropped"
 CAUSE_RETRIEVAL_MISS = "retrieval_miss"
 CAUSE_GRAPH_EDGE_MISSING = "graph_edge_missing"
 CAUSE_UNKNOWN = "unknown"
 
+EVIDENCE_CHAIN_SUPPORTED_OVERLAP = 0.8
+EVIDENCE_CHAIN_PARTIAL_OVERLAP = 0.35
+REFERENCE_STOPWORDS = {"a", "an", "and", "in", "of", "on", "the", "to"}
+
+
+def _normalized_tokens(text: str) -> list[str]:
+    return qa.tokenize(unicodedata.normalize("NFKC", text or ""))
+
+
+def _contains_tokens(haystack: list[str], needle: list[str]) -> bool:
+    width = len(needle)
+    return bool(
+        width
+        and any(
+            haystack[index : index + width] == needle
+            for index in range(len(haystack) - width + 1)
+        )
+    )
+
+
+def _token_recall(reference: str, context_tokens: list[str]) -> float:
+    reference_tokens = set(_normalized_tokens(reference))
+    if not reference_tokens:
+        return 0.0
+    return len(reference_tokens & set(context_tokens)) / len(reference_tokens)
+
+
+def _response_evidence(response: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(response, dict):
+        return []
+    rows: list[dict[str, str]] = []
+    for snippet in response.get("snippets") or []:
+        if not isinstance(snippet, dict):
+            continue
+        rows.append({
+            "source_type": "context",
+            "title": str(snippet.get("title") or ""),
+            "text": str(snippet.get("text") or ""),
+        })
+        for window in snippet.get("sourceWindows") or []:
+            if isinstance(window, dict):
+                rows.append({
+                    "source_type": "source_window",
+                    "title": str(window.get("title") or snippet.get("title") or ""),
+                    "text": str(window.get("text") or ""),
+                })
+    return [row for row in rows if row["title"] or row["text"]]
+
+
+def _matching_evidence(
+    evidence: list[dict[str, str]], support_text: str, answer: str
+) -> list[dict[str, Any]]:
+    support_tokens = set(_normalized_tokens(support_text))
+    answer_tokens = _normalized_tokens(answer)
+    best_by_text: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in evidence:
+        ordered_tokens = _normalized_tokens(f"{row['title']} {row['text']}")
+        tokens = set(ordered_tokens)
+        if not tokens:
+            continue
+        support_score = len(tokens & support_tokens) / len(support_tokens) if support_tokens else 0.0
+        answer_hit = _contains_tokens(ordered_tokens, answer_tokens)
+        if support_score >= EVIDENCE_CHAIN_PARTIAL_OVERLAP or answer_hit:
+            scored = {
+                **row,
+                "support_overlap": round(support_score, 6),
+                "answer_match": answer_hit,
+            }
+            key = (
+                row["source_type"],
+                " ".join(_normalized_tokens(row["title"])),
+                " ".join(_normalized_tokens(row["text"])),
+            )
+            previous = best_by_text.get(key)
+            if previous is None or (
+                scored["support_overlap"], scored["answer_match"]
+            ) > (previous["support_overlap"], previous["answer_match"]):
+                best_by_text[key] = scored
+    return sorted(
+        best_by_text.values(),
+        key=lambda row: (row["support_overlap"], row["answer_match"]),
+        reverse=True,
+    )[:3]
+
+
+def analyze_evidence_chain(
+    sample: dict[str, Any], response: dict[str, Any] | None
+) -> dict[str, Any]:
+    """检查 MuSiQue 各推理步骤的证据是否进入回答上下文。"""
+    detail = sample.get("detail") or {}
+    metadata = detail.get("metadata") or {}
+    decomposition = metadata.get("question_decomposition") or []
+    if sample.get("dataset") != "musique" or not decomposition:
+        return {
+            "status": "unavailable",
+            "reason": "dataset_has_no_decomposition_supports",
+            "steps": [],
+        }
+
+    response_evidence = _response_evidence(response)
+    context = "\n".join(
+        value
+        for row in response_evidence
+        for value in (row["title"], row["text"])
+        if value
+    )
+    context_tokens = _normalized_tokens(context)
+    steps: list[dict[str, Any]] = []
+    for position, step in enumerate(decomposition, 1):
+        answer = str(step.get("answer") or "")
+        support_title = str(step.get("support_title") or "")
+        support_text = str(step.get("support_text") or "")
+        answer_present = _contains_tokens(context_tokens, _normalized_tokens(answer))
+        title_present = _contains_tokens(context_tokens, _normalized_tokens(support_title))
+        support_overlap = _token_recall(support_text, context_tokens)
+        matched_evidence = _matching_evidence(response_evidence, support_text, answer)
+
+        if answer_present and support_overlap >= EVIDENCE_CHAIN_SUPPORTED_OVERLAP:
+            status = "supported"
+        elif (
+            answer_present
+            or title_present
+            or support_overlap >= EVIDENCE_CHAIN_PARTIAL_OVERLAP
+        ):
+            status = "partial"
+        else:
+            status = "missing"
+
+        steps.append(
+            {
+                "position": position,
+                "question": step.get("question"),
+                "answer": answer,
+                "support_doc_id": step.get("support_doc_id"),
+                "support_title": support_title,
+                "status": status,
+                "answer_present": answer_present,
+                "support_title_present": title_present,
+                "support_token_recall": round(support_overlap, 6),
+                "claim_retrieved": bool(matched_evidence),
+                "retrieved_evidence": matched_evidence,
+            }
+        )
+
+    counts = Counter(step["status"] for step in steps)
+    if counts["missing"]:
+        status = "incomplete"
+    elif counts["partial"]:
+        status = "partial"
+    else:
+        status = "complete"
+    answer_mode = sample.get("answer_mode")
+    return {
+        "status": status,
+        "step_count": len(steps),
+        "supported_step_count": counts["supported"],
+        "partial_step_count": counts["partial"],
+        "missing_step_count": counts["missing"],
+        "model_false_negative_candidate": answer_mode == "general" and status == "complete",
+        "steps": steps,
+        "thresholds": {
+            "supported_token_recall": EVIDENCE_CHAIN_SUPPORTED_OVERLAP,
+            "partial_token_recall": EVIDENCE_CHAIN_PARTIAL_OVERLAP,
+        },
+    }
+
 
 def _contains_reference(answer: str, references: list[str]) -> bool:
-    """参考答案的归一化 token 是否连续出现在系统答案中。"""
+    """答案是否覆盖某个参考答案至少 80% 的有效 token。"""
     answer_tokens = qa.tokenize(answer)
     for reference in references:
         reference_tokens = qa.tokenize(reference)
-        width = len(reference_tokens)
-        if width and any(
-            answer_tokens[index : index + width] == reference_tokens
-            for index in range(len(answer_tokens) - width + 1)
+        if not reference_tokens or (
+            len(reference_tokens) == 1 and reference_tokens[0] in REFERENCE_STOPWORDS
         ):
+            continue
+        overlap = len(set(answer_tokens) & set(reference_tokens)) / len(set(reference_tokens))
+        if overlap >= 0.8:
             return True
     return False
-
-
-def _answered_correctly(sample: dict[str, Any]) -> bool:
-    """答案是否算对：只使用本地确定性信号，不依赖 Judge 指标。
-
-    EM 命中或参考答案完整包含即成立。低 EM/F1 不作为失败证据：它们分不开
-    「答对了被散文稀释」与「答错了但词有重叠」。
-    """
-    metrics: dict[str, float] = sample.get("metrics") or {}
-    em = metrics.get("em")
-    if em is not None and em >= 1.0:
-        return True
-    detail = sample.get("detail") or {}
-    return _contains_reference(
-        str(sample.get("answer") or ""),
-        [str(value) for value in detail.get("reference_answers") or []],
-    )
 
 
 def _at_max_k(metrics: dict[str, float], prefix: str) -> float | None:
@@ -76,7 +213,9 @@ def _at_max_k(metrics: dict[str, float], prefix: str) -> float | None:
 
 
 def classify(
-    sample: dict[str, Any], lineage: list[dict[str, Any]] | None
+    sample: dict[str, Any],
+    lineage: list[dict[str, Any]] | None,
+    evidence_chain: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """规则归因，返回 ``{root_cause, evidence}``。
 
@@ -96,8 +235,9 @@ def classify(
     metrics.update(sample.get("metrics") or {})
     answer_mode = sample.get("answer_mode")
     hit = _at_max_k(metrics, "hit@")
+    recall = _at_max_k(metrics, "recall@")
     coverage = _at_max_k(metrics, "full_coverage@")
-    truncated = float(metrics.get("truncated_gold", 0.0) or 0.0)
+    uncited_gold = float(metrics.get("uncited_gold_count", 0.0) or 0.0)
     graph_exclusive = float(metrics.get("graph_exclusive_gold_share", 0.0) or 0.0) > 0
     has_retrieval = hit is not None and hit > 0
     reference_contained = _contains_reference(
@@ -110,27 +250,41 @@ def classify(
         lost_terms.extend(entry.get("question_terms_lost") or [])
     lost_terms = sorted(set(lost_terms))
 
+    answer_correct = float(metrics.get("em", 0.0)) >= 1.0 or reference_contained
     evidence: dict[str, Any] = {
         "answer_mode": answer_mode,
         "has_retrieval": has_retrieval,
         "hit": hit,
+        "recall": recall,
         "full_coverage": coverage,
-        "truncated_gold": truncated,
+        "uncited_gold_count": uncited_gold,
         "question_terms_lost": lost_terms,
         "graph_exclusive_gold_share": metrics.get("graph_exclusive_gold_share"),
         "reference_answer_contained": reference_contained,
+        "answer_correct": answer_correct,
         "gold_count": len(detail.get("gold_doc_ids") or []),
         "lineage_available": lineage is not None,
     }
+    if evidence_chain is not None:
+        evidence["evidence_chain"] = evidence_chain
 
-    # 顺序即优先级，见模块开头。答案明确正确时优先排除失败归因。
-    if _answered_correctly(sample):
-        cause = CAUSE_NOT_A_FAILURE
-    elif answer_mode == "general" and has_retrieval:
-        cause = CAUSE_GENERATION_IGNORED_RETRIEVAL
-    elif answer_mode and answer_mode != "knowledge":
-        cause = CAUSE_GENERATION_FALLBACK
-    elif truncated > 0:
+    chain = evidence.get("evidence_chain") or {}
+    if answer_mode == "general":
+        if answer_correct:
+            cause = CAUSE_GENERATION_FALLBACK
+        elif not has_retrieval:
+            cause = CAUSE_GENERATION_FALLBACK
+        elif chain.get("status") in {"incomplete", "partial"}:
+            cause = CAUSE_RETRIEVAL_EVIDENCE_INCOMPLETE
+        elif recall is not None and recall >= 1.0:
+            cause = CAUSE_GENERATION_IGNORED_RETRIEVAL
+        elif recall is not None and recall < 1.0:
+            cause = CAUSE_RETRIEVAL_EVIDENCE_INCOMPLETE
+        else:
+            cause = CAUSE_UNKNOWN
+    elif answer_mode == "knowledge" and answer_correct:
+        cause = CAUSE_ANSWER_CORRECT
+    elif uncited_gold > 0:
         cause = CAUSE_CITATION_DROPPED
     elif hit is not None and hit == 0 and lost_terms:
         cause = CAUSE_COMPILED_AWAY
@@ -138,6 +292,8 @@ def classify(
         cause = CAUSE_RETRIEVAL_MISS
     elif coverage is not None and coverage < 1.0 and not graph_exclusive:
         cause = CAUSE_GRAPH_EDGE_MISSING
+    elif answer_mode == "knowledge":
+        cause = CAUSE_ANSWER_INCORRECT
     else:
         cause = CAUSE_UNKNOWN
 

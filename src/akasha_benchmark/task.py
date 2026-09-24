@@ -63,8 +63,6 @@ class TaskContext:
             raise ValueError("任务产物已被清理，请新建任务")
         return target_id
 
-    # --- 暂停 ---
-
     @property
     def pause_requested(self) -> bool:
         return self._pause.is_set()
@@ -73,8 +71,6 @@ class TaskContext:
         """可续跑的边界。被请求暂停时抛 :class:`Paused`。"""
         if self._pause.is_set():
             raise Paused(f"任务 #{self.task_id} 已暂停")
-
-    # --- 日志与进度 ---
 
     def log(self, message: str, level: str = "info") -> None:
         from .store import task_store

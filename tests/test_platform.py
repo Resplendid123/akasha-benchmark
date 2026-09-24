@@ -114,7 +114,6 @@ def _compile_run(connection, **overrides) -> int:
     return compile_store.create_compile_run(connection, **(params | overrides))
 
 
-# ------------------------------------------------------------ 任务生命周期
 
 
 def _register(monkeypatch, name: str, run) -> None:
@@ -138,7 +137,6 @@ def _wait(settings, task_id: int, statuses: set[str], timeout: float = 5.0) -> d
 
 
 def test_task_succeeds_and_logs_are_kept_after_cleanup(settings, monkeypatch):
-    """审计日志只追加：清理任务记录之后它仍然查得到。"""
 
     def stage(ctx):
         ctx.log("干了点事")
@@ -196,7 +194,6 @@ def test_failed_query_can_create_retry_task_without_original_task(settings, db, 
 
 
 def test_pause_stops_at_checkpoint_and_resume_continues(settings, monkeypatch):
-    """暂停是协作式的：停在已落库的位置上，继续时接着跑而不是重来。"""
     entered = threading.Event()
     release = threading.Event()
     calls: list[int] = []
@@ -206,7 +203,6 @@ def test_pause_stops_at_checkpoint_and_resume_continues(settings, monkeypatch):
         if len(calls) == 1:
             entered.set()
             release.wait(5)
-            # 第一次进来时会被请求暂停，checkpoint 在这里抛出。
             ctx.checkpoint()
             raise AssertionError("checkpoint 没有拦住暂停")
         ctx.log("续跑完成")
@@ -230,7 +226,6 @@ def test_pause_stops_at_checkpoint_and_resume_continues(settings, monkeypatch):
 
 @pytest.mark.parametrize("action", ["pause", "cleanup"])
 def test_compile_task_action_cancels_remote_bullmq_run(settings, db, monkeypatch, action):
-    """暂停和清理通过 Akasha 控制面取消精确 Run，不暂停共享 BullMQ 队列。"""
     calls: list[tuple[str, str]] = []
 
     class FakeAkasha(_AkashaStub):
@@ -320,7 +315,6 @@ def test_pause_distinguishes_cancelled_from_naturally_terminal_remote_run(
 
 
 def test_running_task_cannot_be_cleaned_up(settings, monkeypatch):
-    """在跑的任务不许删 —— 那会留下一个没人认领的线程还在写库。"""
     release = threading.Event()
     entered = threading.Event()
 
@@ -355,18 +349,22 @@ def test_same_stage_does_not_run_twice(settings, monkeypatch):
     release.set()
 
 
-def test_compile_resume_obeys_same_stage_serialization(settings, db, monkeypatch):
-    paused_id = task_store.create_task(db, stage="compile", params={})
+def test_compile_resume_allows_same_stage_concurrency(settings, db, monkeypatch):
+    configs = {"configs": []}
+    paused_id = task_store.create_task(
+        db, stage="compile", params={"model_configs": configs}
+    )
     task_store.transition(db, paused_id, task_store.PAUSED)
-    task_id = task_store.create_task(db, stage="compile", params={})
+    task_id = task_store.create_task(
+        db, stage="compile", params={"model_configs": configs}
+    )
     task_store.transition(db, task_id, task_store.RUNNING)
     db.commit()
 
     runner = TaskRunner(settings)
     monkeypatch.setattr(runner, "_spawn", lambda *args: None)
-    with pytest.raises(TaskRejected, match="正在运行"):
-        runner.resume(paused_id)
-    assert task_store.get_task(db, paused_id)["status"] == task_store.PAUSED
+    runner.resume(paused_id)
+    assert task_store.get_task(db, paused_id)["status"] == task_store.QUEUED
 
 
 def test_unknown_stage_and_bad_params_are_rejected(settings):
@@ -378,7 +376,6 @@ def test_unknown_stage_and_bad_params_are_rejected(settings):
 
 
 def test_recover_marks_orphaned_tasks_paused(settings):
-    """后端重启后线程没了，留着 running 会让界面显示一个不存在的任务。"""
     connection = connect(settings.db_path)
     try:
         task_id = task_store.create_task(connection, stage="compile", params={})
@@ -395,7 +392,6 @@ def test_recover_marks_orphaned_tasks_paused(settings):
         connection.close()
 
 
-# ------------------------------------------------------------ 路由
 
 
 def test_health(client):
@@ -404,7 +400,6 @@ def test_health(client):
 
 def test_datasets_route_reports_missing_files(client):
     body = client.get("/api/datasets").json()
-    # 跟注册表比，而不是写死条数 —— 加一组适配器不该让这条测试失败。
     assert {d["name"] for d in body["datasets"]} == set(DATASET_NAMES)
     entry = next(d for d in body["datasets"] if d["name"] == "hotpotqa")
     assert entry["normalized"] is False
@@ -414,7 +409,6 @@ def test_datasets_route_reports_missing_files(client):
 def test_metrics_route_narrows_by_dataset(client):
     body = client.get("/api/metrics?datasets=narrativeqa").json()
     assert "recall" not in body["computable_for_all"]
-    # faithfulness 不需要任何标注，所以它对 narrativeqa 也成立。
     assert "faithfulness" in body["computable_for_all"]
 
     both = client.get("/api/metrics?datasets=hotpotqa,narrativeqa").json()
@@ -428,7 +422,6 @@ def test_connection_put_only_updates_given_fields(client):
     assert body["base_url"] == "http://x"
     assert body["password"] == ""
 
-    # 只提交 password，base_url 不该被动。
     client.put("/api/connection", json={"password": "p"})
     body = client.get("/api/connection").json()
     assert body["base_url"] == "http://x"
@@ -446,7 +439,6 @@ def test_provider_api_key_never_leaves_the_backend(client):
     assert providers[0]["api_key_set"] is True
     assert "api_key" not in providers[0]
 
-    # 密钥留空表示保留原值。
     client.put(
         "/api/providers/judge",
         json={"label": "d", "base_url": "https://x/v1", "model": "m2", "api_key": ""},
@@ -489,7 +481,6 @@ def test_provider_probe_reports_failure_as_data(client, monkeypatch):
     assert payload["failure"] == "http:401"
     assert payload["status"] == 401
     assert "bad key" in payload["detail"]
-    # 探测的响应也不能带出密钥。
     assert payload["provider"]["api_key_set"] is True
     assert "api_key" not in payload["provider"]
 
@@ -513,8 +504,6 @@ def test_provider_probe_returns_the_reply(client, monkeypatch):
     payload = client.post(f"/api/providers/{provider_id}/probe").json()
     assert payload["ok"] is True
     assert payload["reply"] == "Hi there"
-    # 发的是一句 hi。user 消息里必须带 json —— JudgeClient 固定要求 json_object
-    # 输出，而有些 provider 规定消息里出现 "json" 才允许这个格式。
     assert len(sent) == 1
     _, user = sent[0]
     assert user.startswith("hi")
@@ -522,7 +511,6 @@ def test_provider_probe_returns_the_reply(client, monkeypatch):
 
 
 def test_provider_probe_reports_missing_key(client):
-    """没配密钥时也回 200 —— 那是配置问题，同样是要报告的结果。"""
     from akasha_benchmark.store import config_store
 
     connection = connect(client.app.state.settings.db_path)
@@ -646,6 +634,53 @@ def test_embedding_model_dimension_roundtrip_and_validation(client):
     assert "dimension" in invalid.json()["detail"]
 
 
+def test_akasha_embedding_probe_uses_minimal_request(client, monkeypatch):
+    from akasha_platform.api import config as config_api
+
+    model = client.put(
+        "/api/akasha-models",
+        json={
+            "feature": "embedding",
+            "label": "probe",
+            "base_url": "https://embedding.example/v1",
+            "model": "embedding-model",
+            "api_key": "secret",
+            "parameters": {"dimension": 3},
+        },
+    ).json()
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+        text = "{}"
+
+        @staticmethod
+        def json():
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def post(self, url, *, json, headers):
+            assert url == "https://embedding.example/v1/embeddings"
+            assert json == {"model": "embedding-model", "input": "hi"}
+            assert headers == {"Authorization": "Bearer secret"}
+            return FakeResponse()
+
+    monkeypatch.setattr(config_api.httpx, "Client", FakeClient)
+    result = client.post(f"/api/akasha-models/{model['id']}/probe")
+    assert result.status_code == 200
+    assert result.json()["ok"] is True
+    assert result.json()["reply"] == "embedding 成功，维度 3"
+
+
 def test_embedding_model_apply_sends_dimension(client, monkeypatch):
     client.put(
         "/api/connection",
@@ -727,7 +762,6 @@ def test_config_import_round_trips_export(client):
         },
     ]
 
-    # 清一遍再导回：导入后应与导出前一致。
     client.put("/api/connection", json={"password": "", "email": "", "base_url": ""})
     client.delete(f"/api/akasha-models/{model['id']}")
     client.delete(f"/api/providers/{judge['id']}")
@@ -748,7 +782,6 @@ def test_config_import_rejects_bad_role(client):
 
 
 def test_connection_test_flags_compiles_in_another_workspace(client, db_path, monkeypatch):
-    """预检：不必等起了任务才发现这些编译在当前连接下用不了。"""
     connection = connect(db_path)
     try:
         compile_id = _compile_run(connection, run_id="r1")
@@ -780,7 +813,6 @@ def test_connection_test_flags_compiles_in_another_workspace(client, db_path, mo
 
 
 def test_raw_samples_serves_qa_and_corpus_separately(client, dataset_dir, monkeypatch):
-    """样本与语料是两个入口，读的是两个文件。"""
     from akasha_platform.api import datasets as datasets_api
 
     monkeypatch.setattr(datasets_api, "DEFAULT_DATASET_DIR", dataset_dir)
@@ -796,13 +828,11 @@ def test_raw_samples_serves_qa_and_corpus_separately(client, dataset_dir, monkey
     assert len(corpus["rows"]) == 1
     assert corpus["rows"] != qa["rows"]
 
-    # 默认是 qa，与加了 kind 之前的行为一致。
     assert client.get("/api/datasets/hotpotqa/raw").json()["kind"] == "qa"
     assert client.get("/api/datasets/hotpotqa/raw?kind=bogus").status_code == 422
 
 
 def test_raw_samples_searches_qa_and_corpus(client, dataset_dir, monkeypatch):
-    """原始结构因数据集而异，搜索应覆盖嵌套字段而不依赖适配器。"""
     from akasha_platform.api import datasets as datasets_api
 
     monkeypatch.setattr(datasets_api, "DEFAULT_DATASET_DIR", dataset_dir)
@@ -838,6 +868,16 @@ def test_normalized_sample_search_matches_gold_title_and_content(client, normali
     assert [row["sample_id"] for row in by_content["samples"]] == ["hotpotqa:q2"]
 
 
+def test_normalized_sample_search_matches_gold_content_without_duplicate_scan(
+    client, normalized
+):
+    result = client.get(
+        "/api/datasets/hotpotqa/samples", params={"q": "film festival", "limit": 1}
+    ).json()
+    assert result["total"] == 1
+    assert result["samples"][0]["gold_titles"] == ["Venice"]
+
+
 def test_normalized_corpus_returns_full_text(client, normalized):
     long_text = "x" * 800
     normalized.execute(
@@ -858,7 +898,6 @@ def test_normalized_corpus_returns_full_text(client, normalized):
 def test_normalized_dataset_browsing_filters_and_pages_in_sqlite(
     client, normalized, monkeypatch
 ):
-    """列表路由不能再调用会把整组样本或正文载入内存的旧接口。"""
     from akasha_platform.api import datasets as datasets_api
 
     def reject_full_load(*args, **kwargs):
@@ -901,7 +940,6 @@ def test_task_tree_route(client):
 
 
 def test_provider_rename_updates_the_same_row(client):
-    """带 id 的改名改的是那一条 —— 不带 id 会按 label 认行，于是变成新增。"""
     created = client.put(
         "/api/providers/judge",
         json={"label": "default", "base_url": "https://x/v1", "model": "m", "api_key": "secret"},
@@ -947,7 +985,6 @@ def test_provider_rename_onto_a_taken_label_is_rejected(client):
 
 
 def test_provider_carries_no_sampling_params(client):
-    """温度与长度上限不是配置项 —— judge 分数要可比，它们由 judge/client.py 固定。"""
     client.put(
         "/api/providers/judge",
         json={"label": "d", "base_url": "https://x/v1", "model": "m", "temperature": 0.9},
@@ -958,7 +995,6 @@ def test_provider_carries_no_sampling_params(client):
 
 
 def test_model_config_put_fills_the_only_legal_provider(client, monkeypatch):
-    """provider 不进表单，但 Akasha 的 PUT 要它，所以后端补上。"""
     client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
     sent: dict = {}
 
@@ -1074,7 +1110,7 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
         normalized,
         attribution_id,
         sample_id="sample-venice",
-        root_cause="not_a_failure",
+        root_cause="answer_correct",
         evidence={},
     )
     normalized.commit()
@@ -1244,7 +1280,6 @@ def test_auth_token_allows_cors_preflight_without_credentials(db_path):
 
 
 def test_non_loopback_without_token_refuses_to_start(db_path):
-    """这个服务持有 Akasha 管理员凭据并能起长任务，不能裸奔在 0.0.0.0 上。"""
     with pytest.raises(RuntimeError, match="拒绝绑定"):
         create_app(Settings(db_path=db_path, host="0.0.0.0"))
 
@@ -1355,6 +1390,30 @@ def test_compile_and_query_tasks_can_run_concurrently(settings, db, monkeypatch)
     db.commit()
     query_task = runner.start("query", {"compile_id": 1})
     assert query_task["stage"] == "query"
+
+
+@pytest.mark.parametrize(
+    "stage,args",
+    [
+        ("compile", {"datasets": ["hotpotqa"]}),
+        ("query", {"compile_id": 1}),
+    ],
+)
+def test_compile_and_query_allow_same_stage_concurrency(settings, db, monkeypatch, stage, args):
+    from akasha_platform import tasks as task_runner
+
+    class Fake(_AkashaStub):
+        def get_model_configs(self):
+            return {"configs": []}
+
+    monkeypatch.setattr(task_runner, "AkashaClient", Fake)
+    monkeypatch.setattr(TaskRunner, "_spawn", lambda *values: None)
+    runner = TaskRunner(settings)
+    first = runner.start(stage, args)
+    task_store.transition(db, int(first["id"]), task_store.RUNNING)
+    db.commit()
+    second = runner.start(stage, args)
+    assert second["stage"] == stage
 
 
 @pytest.mark.parametrize(

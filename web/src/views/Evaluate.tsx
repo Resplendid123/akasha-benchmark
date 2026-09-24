@@ -32,7 +32,6 @@ import {
   usePoll,
 } from '../ui'
 
-// 指标分族，顺序即勾选面板里的顺序，key 对应后端 registry 的 family。
 const FAMILIES = [
   { key: 'retrieval', label: '检索质量', hint: '召回够不够，需要 gold 标注' },
   { key: 'qa', label: '生成质量', hint: '与参考答案比字面，确定性计算' },
@@ -51,7 +50,6 @@ function metricFamily(name: string, definitions: MetricsView['definitions']): st
   return definitions.find((definition) => definition.name === metricBaseName(name))?.family ?? null
 }
 
-/** 评测层：针对某次查询结果配置评估参数并计算指标。 */
 export function Evaluate({
   activeQuery,
   activeEval,
@@ -449,7 +447,6 @@ function Results({ evalId }: { evalId: number }) {
 
       {data.judge.total > 0 && (
         <div className={`note${data.judge.failure_rate > 0.1 ? ' bad' : ' plain'}`}>
-          {/* 跨全部 judge 指标的合计，逐指标的均值在下面那张表里。 */}
           <strong>Judge 调用 {data.judge.total} 次</strong> · 已评分 {data.judge.scored}，失败率{' '}
           {percent(data.judge.failure_rate)}
           {data.judge.latency_mean !== null && (
@@ -539,7 +536,6 @@ function SampleResults({
     setMode('')
   }, [dataset])
 
-  // 样本详情覆盖整个列表，带返回按钮。
   if (openSample) {
     return (
       <div style={{ marginTop: 18 }}>
@@ -637,11 +633,6 @@ function EvalSampleView({ evalId, sampleId }: { evalId: number; sampleId: string
   if (detail.loading) return <Loading what="样本明细" />
   if (detail.error) return <Failed error={detail.error} />
   if (!detail.data) return null
-  const response = detail.data.response ?? {}
-  const retrieved = records(response.retrievedSources)
-  const snippets = records(response.snippets)
-  const citations = records(response.citations)
-  const evidence = records(response.citationEvidence)
   return (
     <div className="panel flat" style={{ marginTop: 10 }}>
       <h4>响应概览</h4>
@@ -658,38 +649,9 @@ function EvalSampleView({ evalId, sampleId }: { evalId: number; sampleId: string
       <h4>逐样本指标</h4>
       <MetricTags metrics={detail.data.metrics} />
 
-      <RetrievalResults snippets={snippets} retrieved={retrieved} />
-
-      <h4>引用证据（{citations.length}）</h4>
-      {citations.length === 0 ? (
-        <p className="small muted">没有引用。</p>
-      ) : (
-        <div className="detail-list">
-          {citations.map((citation, index) => (
-            <DetailCard key={index} title={`引用 ${index + 1}`}>
-              <MetaLine record={citation} fields={[['sourcePageId', 'page_id'], ['title', '标题']]} />
-              {strings(evidence[index]?.excerpts).map((excerpt, excerptIndex) => (
-                <blockquote key={excerptIndex}>{excerpt}</blockquote>
-              ))}
-            </DetailCard>
-          ))}
-        </div>
-      )}
-
-      {detail.data.judge_verdicts.length > 0 && <h4>Judge 判据</h4>}
-      {detail.data.judge_verdicts.map((verdict) => (
-        <JudgeVerdictView key={verdict.metric} verdict={verdict} />
-      ))}
+      <p className="small muted">检索上下文、引用证据和 Judge 明细请在归因层查看。</p>
     </div>
   )
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function records(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter(isRecord) : []
 }
 
 function strings(value: unknown): string[] {
@@ -722,159 +684,6 @@ function MetricTags({
   )
 }
 
-function RetrievalResults({
-  snippets,
-  retrieved,
-}: {
-  snippets: Record<string, unknown>[]
-  retrieved: Record<string, unknown>[]
-}) {
-  const [offset, setOffset] = useState(0)
-  const limit = 5
-  const items = snippets.length > 0 ? snippets : retrieved
-  const rich = snippets.length > 0
-
-  return (
-    <>
-      <h4>检索结果（{items.length}）</h4>
-      {items.length === 0 ? (
-        <p className="small muted">没有检索来源。</p>
-      ) : (
-        <>
-          <div className="detail-list">
-            {items.slice(offset, offset + limit).map((item, index) => (
-              <DetailCard
-                key={offset + index}
-                title={`${offset + index + 1}. ${text(item.title, '无标题')}`}
-              >
-                <MetaLine
-                  record={item}
-                  fields={
-                    rich
-                      ? [['score', '分数'], ['sourcePageId', 'page_id']]
-                      : [['sourcePageId', 'page_id'], ['id', 'ID'], ['score', '分数']]
-                  }
-                />
-                {rich && (
-                  <>
-                    <TagList values={strings(item.retrievalReasons)} />
-                    <div className="readable-text">{text(item.text, '无正文')}</div>
-                  </>
-                )}
-              </DetailCard>
-            ))}
-          </div>
-          {items.length > limit && (
-            <Pager
-              total={items.length}
-              offset={offset}
-              limit={limit}
-              onChange={setOffset}
-            />
-          )}
-        </>
-      )}
-    </>
-  )
-}
-
-function DetailCard({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="detail-card">
-      <strong>{title}</strong>
-      {children}
-    </section>
-  )
-}
-
-function MetaLine({
-  record,
-  fields,
-}: {
-  record: Record<string, unknown>
-  fields: [string, string][]
-}) {
-  const shown = fields.filter(([key]) => record[key] !== null && record[key] !== undefined && record[key] !== '')
-  if (shown.length === 0) return null
-  return (
-    <div className="detail-meta">
-      {shown.map(([key, label]) => <span key={key}>{label}：<span className="mono">{String(record[key])}</span></span>)}
-    </div>
-  )
-}
-
-function TagList({ values }: { values: string[] }) {
-  if (values.length === 0) return null
-  return <div className="metric-tags">{values.map((value) => <span key={value} className="tag accent">{value}</span>)}</div>
-}
-
-function JudgeVerdictView({ verdict }: { verdict: EvalSampleDetail['judge_verdicts'][number] }) {
-  const detail = verdict.detail ?? {}
-  const claims = records(detail.claims)
-  const sentences = records(detail.sentences)
-  const passages = records(detail.passages)
-  const hidden = new Set([
-    'claims', 'sentences', 'passages', 'raw_response', 'raw_http_response',
-    'claim_count', 'sentence_count', 'passage_count', 'supported', 'unsupported',
-    'contradicted', 'relevant', 'useful', 'verdict', 'reason', 'skipped', 'error',
-  ])
-  const extras = Object.entries(detail).filter(([key]) => !hidden.has(key))
-  return (
-    <section className="judge-card">
-      <div className="spread">
-        <strong>{verdict.metric}</strong>
-        <div className="row tight">
-          <span className={`tag ${verdict.failure_kind ? 'bad' : verdict.score === null ? '' : 'ok'}`}>
-            {verdict.failure_kind ?? (verdict.score === null ? '无定义' : verdict.score.toFixed(4))}
-          </span>
-          {verdict.latency_ms !== null && <span className="small muted">{duration(verdict.latency_ms)}</span>}
-        </div>
-      </div>
-      {Boolean(detail.skipped) && <p className="small muted">已跳过：{String(detail.skipped)}</p>}
-      {Boolean(detail.error) && <p className="small" style={{ color: 'var(--bad)' }}>{String(detail.error)}</p>}
-      {Boolean(detail.verdict) && <p><strong>结论：</strong>{String(detail.verdict)}</p>}
-      {Boolean(detail.reason) && <p><strong>理由：</strong>{String(detail.reason)}</p>}
-      {claims.length > 0 && <VerdictItems items={claims} textKey="claim" textLabel="陈述" />}
-      {sentences.length > 0 && <VerdictItems items={sentences} textKey="sentence" textLabel="句子" />}
-      {passages.length > 0 && <VerdictItems items={passages} textKey="index" textLabel="段落" numericKey />}
-      {extras.length > 0 && (
-        <dl className="kv compact-kv">
-          {extras.map(([key, value]) => (
-            <div key={key} className="kv-row"><dt>{key}</dt><dd><ReadableValue value={value} /></dd></div>
-          ))}
-        </dl>
-      )}
-    </section>
-  )
-}
-
-function VerdictItems({ items, textKey, textLabel, numericKey = false }: { items: Record<string, unknown>[]; textKey: string; textLabel: string; numericKey?: boolean }) {
-  return (
-    <div className="detail-list">
-      {items.map((item, index) => (
-        <div key={index} className="verdict-item">
-          <div>
-            <strong>{textLabel} {numericKey ? `#${String(item[textKey] ?? index + 1)}` : index + 1}：</strong>
-            {!numericKey && String(item[textKey] ?? '')}
-          </div>
-          <div className="row tight">
-            {item.verdict !== undefined && <span className="tag">{String(item.verdict)}</span>}
-            {item.evidence !== undefined && item.evidence !== '' && <span className="small muted">证据：{String(item.evidence)}</span>}
-          </div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function ReadableValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined || value === '') return <>—</>
-  if (Array.isArray(value)) return <>{value.map((item, index) => <div key={index}><ReadableValue value={item} /></div>)}</>
-  if (isRecord(value)) return <dl className="kv compact-kv">{Object.entries(value).map(([key, item]) => <div key={key} className="kv-row"><dt>{key}</dt><dd><ReadableValue value={item} /></dd></div>)}</dl>
-  return <>{String(value)}</>
-}
-
-/** 并排展示全样本与 knowledge 子集的指标均值。 */
 function ScopeTable({
   scopes,
   family,

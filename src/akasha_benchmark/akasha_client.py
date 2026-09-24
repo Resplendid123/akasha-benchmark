@@ -32,7 +32,6 @@ import httpx
 
 from .config import AkashaConfig
 
-# knowledge_space_compile_run 里表示「还在跑」的状态取值。
 ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "compiling", "aggregate_pending", "aggregating"}
 )
@@ -200,8 +199,6 @@ class AkashaClient:
     def close(self) -> None:
         self._client.close()
 
-    # --- 底层管道 ---
-
     def _throttle(self) -> None:
         """请求之间留固定间隔，避免瞬间打满 LLM 配额。"""
         gap = self.config.request_interval_seconds
@@ -314,8 +311,6 @@ class AkashaClient:
     def get(self, path: str, **kwargs: Any) -> Any:
         return self.request("GET", path, **kwargs).body
 
-    # --- 认证 ---
-
     def login(self) -> None:
         """复用进程内或本地 JWT；同一进程的客户端只会有一个实际登录。"""
         self.config.require_credentials()
@@ -364,8 +359,6 @@ class AkashaClient:
         """``/api/users/me`` 同时带回解析出的 workspace，以及 user.role。"""
         return self.post("users/me")
 
-    # --- Space 管理 ---
-
     def create_space(self, name: str, slug: str, description: str = "") -> dict[str, Any]:
         # slug 必须是纯字母数字，长度 2-100。不重试：重试可能建出第二个 Space。
         return self.post(
@@ -373,8 +366,6 @@ class AkashaClient:
             {"name": name, "slug": slug, "description": description},
             retry=False,
         )
-
-    # --- 导入 ---
 
     def import_page_text(
         self, filename: str, markdown: str, space_id: str
@@ -393,8 +384,6 @@ class AkashaClient:
             data={"spaceId": space_id},
             retry=False,
         )
-
-    # --- 知识编译 ---
 
     def compile_spaces(self, space_ids: list[str]) -> dict[str, Any]:
         """立即建 Run，绕过 1 小时静默期。"""
@@ -466,9 +455,7 @@ class AkashaClient:
             {"spaceIds": space_ids, "limit": limit},
         )
 
-    # --- 模型配置 ---
-
-    def get_model_configs(self) -> Any:
+    def get_model_configs(self) -> dict[str, Any]:
         """拉取 compiler / embedding / answer / image 四项配置，用于快照比对。"""
         return self.get("llm-wiki/admin/model-configs")
 
@@ -476,8 +463,6 @@ class AkashaClient:
         return self.request(
             "PUT", f"llm-wiki/admin/model-configs/{feature}", json_body=payload
         ).body
-
-    # --- 查询 ---
 
     def query(
         self,

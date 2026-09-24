@@ -5,7 +5,6 @@ import { Failed, Field, Loading, useAction, useAsync } from '../ui'
 
 const DATASETS = ['hotpotqa', '2wikimultihopqa', 'musique']
 
-/** 测试层：用小样本运行编译、查询、评测、归因四阶段。 */
 export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
   const datasets = useAsync(() => api.datasets(), [])
   const judges = useAsync<Provider[]>(() => api.providers('judge'), [])
@@ -101,7 +100,7 @@ export function Testing({ onOpenTasks }: { onOpenTasks: () => void }) {
               {start.busy ? '启动中…' : '开始链路测试'}
             </button>
             <span className="small muted">
-              仅对所选样本执行编译 → 查询 → 评测 → 归因；自动全选 {metricCount} 个
+              仅对所选问题执行编译 → 查询 → 评测 → 归因；目标语料 5 篇，固定 k=2；自动全选 {metricCount} 个
               {withJudge ? '可计算指标（含 Judge）' : '确定性指标'}
             </span>
           </div>
@@ -148,8 +147,13 @@ function SamplePicker({
 
       {selected && (
         <div className="note ok small">
-          已选择 <strong>{selected.gold_titles?.join(' / ') || selected.question}</strong>
+          已选择问题 <strong>{selected.question}</strong>
           <span className="mono" style={{ marginLeft: 8 }}>{selected.sample_id}</span>
+          {selected.gold_titles?.length ? (
+            <div className="small muted" style={{ marginTop: 4 }}>
+              gold 文档：{selected.gold_titles.join(' / ')}；测试语料共补到 5 篇
+            </div>
+          ) : null}
         </div>
       )}
 
@@ -167,10 +171,10 @@ function SamplePicker({
               className={`sample-picker-item ${selected?.sample_id === sample.sample_id ? 'selected' : ''}`}
               onClick={() => onSelect(sample)}
             >
-              <span className="sample-picker-title">
-                {sample.gold_titles?.join(' / ') || '（无内容标题）'}
+              <span className="sample-picker-title">{sample.question}</span>
+              <span className="small muted">
+                gold 文档：{sample.gold_titles?.join(' / ') || '（无内容标题）'}
               </span>
-              <span>{sample.question}</span>
               <span className="small muted">参考答案：{sample.answers.join(' / ')}</span>
               <span className="mono small muted">{sample.sample_id}</span>
             </button>

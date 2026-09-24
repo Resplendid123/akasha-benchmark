@@ -16,9 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-# doc_id / sample_id 的口径收在这里一处，预处理与评测两侧都从这里读。
-# corpus 行身份：值是原生身份字段名，或哨兵 "row_idx" 表示用原始全量文件行号
-# （抽子集后不重新编号）。musique 的 title 有歧义时用 (title, text) 消歧。
+# corpus 行身份规则；row_idx 使用原始全量文件行号。
 CORPUS_ID_RULES: dict[str, str] = {
     "hotpotqa": "idx",
     "2wikimultihopqa": "row_idx",
@@ -27,8 +25,7 @@ CORPUS_ID_RULES: dict[str, str] = {
     "itfaq": "id",
 }
 
-# 样本身份。hotpotqa / 2wiki 的原生字段是 "_id"，musique 与 itfaq 是 "id"；
-# narrativeqa 没有原生 QA ID，用它在全量文件里的行号字符串。
+# 样本身份规则；narrativeqa 使用原始全量文件行号。
 SAMPLE_ID_RULES: dict[str, str] = {
     "hotpotqa": "native_id",
     "2wikimultihopqa": "native_id",

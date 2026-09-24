@@ -18,14 +18,10 @@ class DatasetAdapter(ABC):
     """把某个数据集的原始行转成 :class:`CanonicalSample`。"""
 
     name: ClassVar[str]
-    aliases: ClassVar[tuple[str, ...]] = ()
     qa_filename: ClassVar[str]
     corpus_filename: ClassVar[str]
-    # 这个数据集拥有哪些标注，决定哪些指标算得出来。
     provides: ClassVar[frozenset[DataDependency]]
-    # 编译抽子集走哪条路。
     subset_strategy: ClassVar[SubsetStrategy]
-    # 假就是本地数据集：下载阶段只校验存在性，不发 HTTP。
     downloadable: ClassVar[bool] = True
     version: ClassVar[str] = "1"
 

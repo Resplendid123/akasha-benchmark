@@ -91,7 +91,6 @@ export const api = {
       startup: { recovered_tasks: number }
     }>('/api/health'),
 
-  // --- 配置 ---
   connection: () => request<Connection>('/api/connection'),
   saveConnection: (payload: Record<string, unknown>) =>
     put<{ updated: string[]; connection: Connection }>('/api/connection', payload),
@@ -103,12 +102,12 @@ export const api = {
     put<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, payload),
   deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
   probeProvider: (id: number) => post<ProviderProbe>(`/api/providers/${id}/probe`),
-  // Akasha 模型配置：按 feature 独立保存和应用。
   akashaModels: (feature?: string) =>
     request<AkashaModelsView>(`/api/akasha-models${query({ feature })}`),
   saveAkashaModel: (payload: Record<string, unknown>) =>
     put<{ id: number; feature: string; label: string }>('/api/akasha-models', payload),
   deleteAkashaModel: (id: number) => del<{ deleted: number }>(`/api/akasha-models/${id}`),
+  probeAkashaModel: (id: number) => post<ProviderProbe>(`/api/akasha-models/${id}/probe`),
   applyAkashaModel: (id: number) => post<{ applied: string }>(`/api/akasha-models/${id}/apply`),
   exportConfig: () => request<Record<string, unknown>>('/api/config/export'),
   importConfig: (data: Record<string, unknown>) =>
@@ -117,7 +116,6 @@ export const api = {
       data,
     ),
 
-  // --- 数据集层与归一化层 ---
   datasets: () => request<{ datasets: DatasetEntry[]; dataset_dir: string }>('/api/datasets'),
   deleteDataset: (name: string) =>
     del<{ deleted: number }>(`/api/datasets/${encodeURIComponent(name)}`),
@@ -134,7 +132,6 @@ export const api = {
   metrics: (datasets: string[] = []) =>
     request<MetricsView>(`/api/metrics${query({ datasets: datasets.join(',') })}`),
 
-  // --- 编译层 ---
   compiles: () => request<{ compiles: CompileRun[] }>('/api/compiles'),
   compileDocs: (
     id: number,
@@ -152,7 +149,6 @@ export const api = {
       note: string
     }>(`/api/compiles/${id}`),
 
-  // --- 查询层 ---
   responses: (
     id: number,
     params: { dataset?: string; answer_mode?: string; q?: string; limit?: number; offset?: number } = {},
@@ -164,7 +160,6 @@ export const api = {
   retryFailedQuery: (id: number) => post<Task>(`/api/queries/${id}/retry-failed`),
   deleteQuery: (id: number) => del<{ deleted: number }>(`/api/queries/${id}`),
 
-  // --- 评测层 ---
   evalRun: (id: number) => request<EvalDetail>(`/api/evals/${id}`),
   evalSamples: (
     id: number,
@@ -175,19 +170,16 @@ export const api = {
     request<EvalSampleDetail>(`/api/evals/${id}/samples/${encodeURIComponent(sampleId)}`),
   deleteEval: (id: number) => del<{ deleted: number }>(`/api/evals/${id}`),
 
-  // --- 归因层 ---
   attribution: (id: number) => request<AttributionDetail>(`/api/attributions/${id}`),
   deleteAttribution: (id: number) => del<{ deleted: number }>(`/api/attributions/${id}`),
   lineage: (pageId: string, question = '') =>
     request<Lineage>(`/api/lineage/${encodeURIComponent(pageId)}${query({ question })}`),
 
-  // --- 任务层 ---
   taskTree: () => request<TaskTree>('/api/task-tree'),
   task: (id: number, afterId = 0) =>
     request<TaskDetail>(`/api/tasks/${id}${query({ after_id: afterId })}`),
   startTask: (stage: string, args: Record<string, unknown>) =>
     post<Task>(`/api/tasks/${stage}`, args),
-  // 起四条普通阶段任务，返回链首那条。
   startChain: (args: Record<string, unknown>) => post<Task>('/api/chain', args),
   pauseTask: (id: number) => post<Task>(`/api/tasks/${id}/pause`),
   resumeTask: (id: number) => post<Task>(`/api/tasks/${id}/resume`),

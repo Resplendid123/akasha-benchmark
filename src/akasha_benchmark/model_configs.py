@@ -14,14 +14,9 @@ FEATURES = ("compiler", "embedding", "answer", "image")
 _FIELDS = ("feature", "model", "baseUrl", "parameters")
 
 
-def normalize(model_configs: Any) -> list[dict[str, Any]]:
+def normalize(model_configs: dict[str, Any]) -> list[dict[str, Any]]:
     """整成稳定形状：只留 :data:`_FIELDS`，按 feature 排序。"""
-    if isinstance(model_configs, dict):
-        entries = model_configs.get("configs") or []
-    elif isinstance(model_configs, list):
-        entries = model_configs
-    else:
-        return []
+    entries = model_configs.get("configs") or []
     cleaned = [
         {field: entry.get(field) for field in _FIELDS}
         for entry in entries
@@ -30,17 +25,17 @@ def normalize(model_configs: Any) -> list[dict[str, Any]]:
     return sorted(cleaned, key=lambda e: str(e.get("feature")))
 
 
-def feature_of(model_configs: Any, feature: str) -> dict[str, Any] | None:
+def feature_of(model_configs: dict[str, Any], feature: str) -> dict[str, Any] | None:
     for entry in normalize(model_configs):
         if entry.get("feature") == feature:
             return entry
     return None
 
 
-def matches(left: Any, right: Any, feature: str) -> bool:
+def matches(left: dict[str, Any], right: dict[str, Any], feature: str) -> bool:
     return feature_of(left, feature) == feature_of(right, feature)
 
 
-def drift(current: Any, snapshot: Any) -> dict[str, bool]:
+def drift(current: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, bool]:
     """哪些项与快照不一致；差异用于告警，不阻断查询。"""
     return {feature: not matches(current, snapshot, feature) for feature in FEATURES}

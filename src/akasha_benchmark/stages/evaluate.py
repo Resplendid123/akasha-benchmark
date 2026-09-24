@@ -13,6 +13,8 @@ import sqlite3
 import uuid
 from typing import Any
 
+import httpx
+
 from ..datasets import DataDependency, get_adapter
 from ..judge import (
     answer_correctness,
@@ -26,8 +28,10 @@ from ..judge.client import (
     parse_json_object,
 )
 from ..judge.providers import resolve_provider
+from ..config import load_config
 from ..metrics import attribution, multihop, qa, registry, retrieval
-from ..store import compile_store, eval_store, query_store, run_store
+from ..model_configs import feature_of
+from ..store import compile_store, config_store, eval_store, loads, query_store, run_store
 from ..task import TaskContext
 
 DEFAULT_KS = retrieval.DEFAULT_KS
@@ -123,7 +127,6 @@ def evaluate_dataset(
 
         retrieved = body.get("retrievedSources") or [] if ok else []
         citations = body.get("citations") or [] if ok else []
-        evidence = body.get("citationEvidence") or [] if ok else []
         snippets = body.get("snippets") or [] if ok else []
         answer = (body.get("answer") or "") if ok else ""
 
@@ -143,7 +146,7 @@ def evaluate_dataset(
             detail["unmapped_page_ids"] = retrieval.unmapped_page_ids(retrieved, page_to_doc)
             detail["retrieval"] = retrieval.evaluate_sample(ranked, sample["gold_doc_ids"], ks)
             detail["attribution"] = attribution.evaluate_sample(
-                citations, retrieved, evidence, sample["gold_doc_ids"], page_to_doc
+                citations, retrieved, sample["gold_doc_ids"], page_to_doc
             )
             detail["multihop"] = multihop.evaluate_sample(
                 snippets, sample["gold_doc_ids"], page_to_doc
@@ -217,22 +220,14 @@ def _judge_task(
 ) -> tuple[tuple[str, str], Any] | None:
     """把一条 judge 指标摊成 ``((system, user), 解析函数)``。
 
-    四个判据的差异收在这里，调用方只有一条路径。返回 ``None`` 表示这一条
+    三个文本判据的差异收在这里。返回 ``None`` 表示这一条
     在这个样本上无定义，应当跳过而不是记 0。
     """
     if metric == "faithfulness":
         prompt = faithfulness.build_prompt(question, answer, body)
         return (prompt, faithfulness.parse_verdict) if prompt else None
-    if metric == "answer_relevancy":
-        built = answer_relevancy.build_prompt(question, answer, body)
-        if not built:
-            return None
-        system, user, sentences = built
-        return (system, user), lambda payload: answer_relevancy.parse_verdict(
-            payload, sentences
-        )
     if metric == "context_relevancy":
-        built = context_relevancy.build_prompt(question, answer, body)
+        built = context_relevancy.build_prompt(question, body)
         if not built:
             return None
         system, user, count = built
@@ -241,6 +236,54 @@ def _judge_task(
         prompt = answer_correctness.build_prompt(question, answer, reference)
         return (prompt, answer_correctness.parse_verdict) if prompt else None
     raise ValueError(f"没有实现 judge 指标 {metric!r}")
+
+
+def _answer_relevancy_task(
+    connection: sqlite3.Connection,
+    question: str,
+    answer: str,
+    model_snapshot: dict[str, Any],
+) -> tuple[tuple[str, str], Any] | None:
+    built = answer_relevancy.build_prompt(answer)
+    if built is None or not question.strip():
+        return None
+    applied = feature_of(model_snapshot, "embedding") or {}
+    records = config_store.list_model_providers(connection, "embedding")
+    record = next(
+        (
+            row
+            for row in records
+            if (row.get("api_key") or "").strip()
+            and row.get("model") == applied.get("model")
+            and str(row.get("base_url") or "").rstrip("/")
+            == str(applied.get("baseUrl") or "").rstrip("/")
+        ),
+        None,
+    )
+    if record is None:
+        return None
+    config = load_config(connection)
+
+    def parse(payload: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+        generated = answer_relevancy.parse_generated_question(payload)
+        try:
+            score = answer_relevancy.embedding_similarity(
+                question,
+                generated,
+                base_url=str(record["base_url"]),
+                model=str(record["model"]),
+                api_key=str(record["api_key"]),
+                timeout_seconds=config.timeout_seconds,
+            )
+        except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
+            raise ValueError(f"embedding similarity failed: {type(exc).__name__}: {exc}") from exc
+        return score, {
+            "method": "generated_question_embedding",
+            "generated_question": generated,
+            "embedding_model": record["model"],
+        }
+
+    return built, parse
 
 
 def _record_reply(
@@ -326,6 +369,8 @@ def _judge(
         for metric in metrics
     }
     rows = eval_store.sample_evals(ctx.db, eval_id)
+    query_run = query_store.get_query_run(ctx.db, query_id) or {}
+    query_model_snapshot = loads(query_run.get("model_configs_json"))
     for position, row in enumerate(rows, 1):
         ctx.checkpoint()
         response = query_store.response_of(ctx.db, query_id, row["sample_id"])
@@ -335,13 +380,20 @@ def _judge(
         for metric in metrics:
             if row["sample_id"] in already_by_metric[metric]:
                 continue
-            task = _judge_task(
-                metric,
-                (response or {}).get("question") or "",
-                row["answer"] or "",
-                references[0] if references else "",
-                body,
-            )
+            question = (response or {}).get("question") or ""
+            answer = row["answer"] or ""
+            if metric == "answer_relevancy":
+                task = _answer_relevancy_task(
+                    ctx.db, question, answer, query_model_snapshot
+                )
+            else:
+                task = _judge_task(
+                    metric,
+                    question,
+                    answer,
+                    references[0] if references else "",
+                    body,
+                )
             if task is None:
                 # 这一条在这个样本上无定义，记 None 并跳过。
                 eval_store.record_judge_verdict(

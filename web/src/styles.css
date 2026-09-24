@@ -1,5 +1,3 @@
-/* 语义色区分缺失、不可计算与失败；正文和状态文字保持 WCAG AA 对比度。 */
-
 :root {
   --bg: #ffffff;
   --panel: #fbfcfd;
@@ -34,8 +32,6 @@ a:hover { text-decoration: underline; }
 code, pre, .mono { font-family: var(--mono); }
 
 .app { display: flex; min-height: 100vh; }
-
-/* --- 左栏：八层，顺序即流水线顺序 --- */
 
 .sidebar {
   width: 232px;
@@ -124,12 +120,8 @@ h5 {
   .grid2, .grid3 { grid-template-columns: 1fr; }
 }
 
-/* 表单：字段两列等宽，输入框填满格子而不是各自写 minWidth。
- * compact 给数值字段，一行排得下五个。 */
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; }
 .form-grid.compact { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-/* 三四个字段排成一行。auto-fit 会把空轨道折掉，所以三个字段就是三等分，
- * 窄屏放不下 190px 时自己换行。 */
 .form-grid.inline { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .form-grid + .form-grid { margin-top: 10px; }
 .form-grid label.field > input,
@@ -150,10 +142,8 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 tbody tr:hover { background: var(--panel-2); }
 tbody tr.selected { background: var(--accent-soft); }
 
-/* 数据列分摊剩余宽度，操作列收窄并靠右，避免列间出现大块空白。 */
 .records-table { table-layout: auto; }
 .records-table td { white-space: nowrap; }
-/* 记录列表统一左对齐；明细表保留数字右对齐，方便纵向比较。 */
 .records-table th.num,
 .records-table td.num { text-align: left; }
 .records-table th:last-child,
@@ -194,8 +184,6 @@ tbody tr.selected { background: var(--accent-soft); }
   .record-search input { min-width: 0; flex: 1 1 auto; }
 }
 
-/* --- 语义色：三档，文字都取深色调 --- */
-
 .tag {
   display: inline-block; padding: 1px 7px; border-radius: 10px;
   font-size: 11px; font-family: var(--mono);
@@ -220,10 +208,6 @@ tbody tr.selected { background: var(--accent-soft); }
 .note strong { font-weight: 600; }
 .note ul { margin: 6px 0 0; padding-left: 20px; }
 
-/* --- 控件 --- */
-
-/* font: inherit 是关键：button 不继承 font-family，不写就落回 UA 默认字体，
- * 中文会和页面其余部分不是同一个字面。 */
 button.action {
   display: inline-flex; align-items: center; justify-content: center; gap: 5px;
   min-height: 28px;
@@ -251,7 +235,6 @@ button.action.danger:hover:not(:disabled) {
   background: var(--bad-soft); border-color: var(--bad); color: var(--bad);
 }
 button.action.danger:active:not(:disabled) { background: #fbdcdc; }
-/* 表格行内的按钮。2px 的上下内边距点起来太窄，min-height 兜住。 */
 button.action.small { min-height: 24px; padding: 3px 9px; font-size: 12px; }
 
 input, select, textarea {
@@ -282,15 +265,12 @@ pre.block.tall { max-height: min(300px, 60vh); }
 .mode-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46ch; }
 
-/* --- diff：丢掉的词与新增的词 --- */
-
 .chip {
   display: inline-block; padding: 1px 6px; margin: 2px;
   border-radius: 4px; font-family: var(--mono); font-size: 12px;
 }
 .chip.dropped { background: var(--bad-soft); color: var(--bad); border: 1px solid #eaa9ac; }
 .chip.added { background: var(--ok-soft); color: var(--ok); border: 1px solid #a8d8c4; }
-/* 问题里的实词被编译丢掉 —— 这条样本的词法召回已经断了。最显眼的一档。 */
 .chip.lost { background: var(--bad); color: #fff; font-weight: 600; border: 1px solid var(--bad); }
 
 .bar { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
@@ -298,13 +278,9 @@ pre.block.tall { max-height: min(300px, 60vh); }
 .bar.ok > div { background: var(--ok); }
 .bar.bad > div { background: var(--bad); }
 
-/* --- 两栏并排：原文 vs 编译产物 --- */
-
 .side-by-side { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 1000px) { .side-by-side { grid-template-columns: 1fr; } }
 .side-by-side h4 { margin-top: 0; }
-
-/* --- 指标勾选 --- */
 
 .metric-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 14px;
@@ -342,14 +318,13 @@ button.sample-picker-item.selected { border-color: var(--accent); background: va
 }
 .metric-family-filter .action.primary .muted { color: inherit; opacity: .75; }
 
-/* --- 详情键值对 --- */
-
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 13px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
 .kv-row { display: contents; }
 .compact-kv { margin-top: 8px; }
 .metric-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+button.tag { cursor: pointer; }
 .detail-list { display: grid; gap: 8px; margin-top: 8px; }
 .sample-chain,
 .sample-metrics,
@@ -370,6 +345,17 @@ button.sample-picker-item.selected { border-color: var(--accent); background: va
   display: inline-flex; align-items: baseline; gap: 6px; padding: 4px 8px;
   border: 1px solid #b8ddce; border-radius: 999px; background: var(--ok-soft);
 }
+.evidence-chain-panel {
+  margin-top: 14px; padding: 12px 14px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--panel-2);
+}
+.evidence-chain-steps { display: grid; gap: 8px; margin-top: 10px; }
+.evidence-chain-step {
+  padding: 9px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: #fff;
+}
+.evidence-chain-claims { margin-top: 8px; }
+.evidence-chain-claims blockquote { margin: 5px 0 0; padding: 6px 8px; }
 .sample-metrics { margin-top: 20px; }
 .full-chain-section { margin-top: 20px; }
 .sample-metrics-title { margin-bottom: 9px; color: var(--text); }
@@ -458,7 +444,6 @@ button.sample-picker-item.selected { border-color: var(--accent); background: va
 .verdict-item { border-top: 1px solid var(--border); padding-top: 7px; font-size: 13px; }
 .verdict-item:first-child { border-top: 0; padding-top: 0; }
 
-/* 密码与 api_key 一套样式：显隐按钮在输入框内，不占用文字区域。 */
 .secret-input { position: relative; display: flex; width: 100%; }
 .secret-input input { width: 100%; min-width: 0; padding-right: 34px; }
 /* Edge 自带一个 reveal 按钮，不去掉会和下面这个并排出现两个眼睛。 */
@@ -474,7 +459,6 @@ button.sample-picker-item.selected { border-color: var(--accent); background: va
 .secret-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
 .secret-toggle svg { display: block; }
 
-/* 任务按运行产物组成分叉树；颜色与缩进共同表达 compile → query → eval → attribution。 */
 .task-tree-node {
   margin: 10px 0; padding: 10px 10px 4px; border: 1px solid var(--border);
   border-left: 4px solid var(--accent); border-radius: 7px; background: var(--panel);

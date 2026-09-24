@@ -1,7 +1,6 @@
 """context_relevancy：检索回来的上下文里有多少是这个问题用得上的。
 
 判的是检索的信噪比，与 recall 互补：recall 说够不够，这个说干不干净。
-不依赖 gold 标注，由模型判相关性，所以 narrativeqa 也能用。
 """
 
 from __future__ import annotations
@@ -43,11 +42,6 @@ def build_context(response: dict[str, Any]) -> tuple[str, int]:
         text = (snippet.get("text") or "")[:MAX_SNIPPET_CHARS]
         if text:
             parts.append(f"[{len(parts) + 1}] {title}\n{text}")
-    if not parts:
-        for source in (response.get("retrievedSources") or [])[:MAX_SNIPPETS]:
-            title = source.get("title")
-            if title:
-                parts.append(f"[{len(parts) + 1}] {title}")
     return "\n\n".join(parts), len(parts)
 
 
@@ -79,13 +73,8 @@ def parse_verdict(
     }
 
 
-def build_prompt(
-    question: str, answer: str, response: dict[str, Any]
-) -> tuple[str, str, int] | None:
-    """拼出 ``(system, user, 上下文条数)``。没有上下文时返回 ``None``。
-
-    ``answer`` 用不上，保留形参是为了与另外三个判据共用调用签名。
-    """
+def build_prompt(question: str, response: dict[str, Any]) -> tuple[str, str, int] | None:
+    """拼出 ``(system, user, 上下文条数)``。没有上下文时返回 ``None``。"""
     if not question.strip():
         return None
     context, count = build_context(response)

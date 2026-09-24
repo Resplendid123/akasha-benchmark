@@ -57,8 +57,10 @@ _ANSWERS = frozenset({DataDependency.REFERENCE_ANSWERS})
 _NONE: frozenset[DataDependency] = frozenset()
 
 METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
-    # --- 检索：一律用 retrievedSources，不用 citations（后者已被裁剪过）---
+    # 检索指标使用未裁剪的 retrievedSources。
+    _definition("precision", FAMILY_RETRIEVAL, _GOLD, "前 k 个实际返回文档中命中的 gold 占比", per_k=True),
     _definition("recall", FAMILY_RETRIEVAL, _GOLD, "前 k 个里命中的 gold 占比", per_k=True),
+    _definition("retrieval_f1", FAMILY_RETRIEVAL, _GOLD, "Precision@k 与 Recall@k 的调和平均", per_k=True),
     _definition("ndcg", FAMILY_RETRIEVAL, _GOLD, "二元相关性下的 nDCG", per_k=True),
     _definition("hit", FAMILY_RETRIEVAL, _GOLD, "前 k 个里至少命中一个 gold", per_k=True),
     _definition(
@@ -69,7 +71,6 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         per_k=True,
     ),
     _definition("mrr", FAMILY_RETRIEVAL, _GOLD, "首个 gold 的倒数排名"),
-    # --- 答案质量 ---
     _definition(
         "em",
         FAMILY_QA,
@@ -82,20 +83,18 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         _ANSWERS,
         "token F1。会被解释性 token 稀释，绝对值只可同配置比较",
     ),
-    # --- 引用归因 ---
     _definition("citation_precision", FAMILY_ATTRIBUTION, _GOLD, "被引文档里 gold 的占比"),
     _definition("citation_recall", FAMILY_ATTRIBUTION, _GOLD, "gold 里被引用的占比"),
     _definition(
-        "truncation_loss", FAMILY_ATTRIBUTION, _GOLD, "召回但未被引用的篇数", higher_is_better=False
+        "uncited_count", FAMILY_ATTRIBUTION, _GOLD, "已检索但未被引用的文档数", higher_is_better=False
     ),
     _definition(
-        "truncated_gold",
+        "uncited_gold_count",
         FAMILY_ATTRIBUTION,
         _GOLD,
-        "被截断掉的 gold 篇数",
+        "已检索但未被引用的 gold 文档数",
         higher_is_better=False,
     ),
-    # --- 多跳 ---
     _definition(
         "graph_exclusive_gold_share",
         FAMILY_MULTIHOP,
@@ -108,11 +107,10 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         _GOLD,
         "按文档去重后，图扩展命中的文档中 gold 所占比例",
     ),
-    # --- 诊断计数：读其他指标时的分母与背景，进 registry 以便 UI 拿到方向声明 ---
+    # 供其他指标和 UI 使用的诊断计数。
     _definition(
         "graph_neighbor_gold_snippets", FAMILY_MULTIHOP, _GOLD, "图扩展 snippet 里命中 gold 的条数"
     ),
-    # --- judge：除 answer_correctness 外 requires 都是空集，所以四组都成立 ---
     _definition(
         "faithfulness",
         FAMILY_JUDGE,

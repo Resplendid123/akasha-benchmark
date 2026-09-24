@@ -9,7 +9,7 @@ from __future__ import annotations
 import queue
 import sqlite3
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
 
 import httpx
@@ -99,6 +99,7 @@ def run(ctx: TaskContext) -> None:
             raise RuntimeError(mismatch)
 
         current = client.get_model_configs()
+        ctx.freeze(model_configs=current)
         snapshot = loads(compile_run["model_configs_json"])
         changed = drift(current, snapshot)
         if changed["embedding"]:
@@ -220,8 +221,7 @@ def _issue(
             emit(_query_one(client, sample, space_id))
         return
 
-    # 每个 worker 一个独立客户端：限流器用实例上的 _last_request_at，
-    # 共用一个实例会退化成「一起睡、一起发」。落库只在主线程做。
+    # 每个 worker 使用独立客户端，落库仍在主线程完成。
     extra = [AkashaClient(client.config) for _ in range(concurrency - 1)]
     try:
         for spare in extra:
@@ -238,12 +238,23 @@ def _issue(
                 pool.put(borrowed)
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            # 分批提交，暂停时只需要等当前这批收尾。
-            for start in range(0, len(todo), concurrency):
+            # 请求完成即补位，暂停时仅等待当前并发窗口。
+            pending: set[Future[dict[str, Any]]] = set()
+            cursor = 0
+
+            def fill_window() -> None:
+                nonlocal cursor
+                while cursor < len(todo) and len(pending) < concurrency:
+                    pending.add(executor.submit(task, todo[cursor]))
+                    cursor += 1
+
+            fill_window()
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    emit(future.result())
                 ctx.checkpoint()
-                batch = todo[start : start + concurrency]
-                for row in executor.map(task, batch):
-                    emit(row)
+                fill_window()
     finally:
         for spare in extra:
             spare.close()

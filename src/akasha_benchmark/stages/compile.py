@@ -65,7 +65,6 @@ class CompileOptions:
     full_corpus: bool
     import_concurrency: int
 POLL_INTERVAL_SECONDS = 30.0
-POLL_TIMEOUT_SECONDS = 7200.0
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MARKDOWN_HEADING = re.compile(r"^\s*#+\s*.*$", re.MULTILINE)
 
@@ -294,7 +293,6 @@ def _wait_for_compile(
     空的 ``statusCounts`` 与「全部终态」分开报：两者的 ``active`` 都是 0，
     但前者是压根没编译。``expect_runs`` 为 0 且看不到 Run 时立即返回。
     """
-    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     baseline_run_ids = baseline_run_ids or set()
     expected_run_ids = expected_run_ids or set()
     while True:
@@ -338,8 +336,7 @@ def _wait_for_compile(
         elif expect_runs and diagnostics_ok and any(
             run.get("runId") or run.get("id") or run.get("spaceJobSequence") for run in runs
         ):
-            # 已知空间历史 Run，但本次 accepted Run 尚未出现在诊断列表中；继续等，
-            # 不能用包含历史 Run 的 summary 提前结束。
+            # 等待本次 accepted Run 出现在诊断列表。
             counts = {}
             progress = {}
             active = 1
@@ -377,8 +374,6 @@ def _wait_for_compile(
             }
         if not counts and expect_runs == 0:
             return {"status_counts": counts, "no_runs": True, "timed_out": False}
-        if time.monotonic() > deadline:
-            return {"status_counts": counts, "no_runs": not counts, "timed_out": True}
         if not counts:
             ctx.progress(0, None, "等待远端编译")
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -731,6 +726,7 @@ def _execute(
         record = compile_store.get_compile_run(ctx.db, compile_id) or {}
         space_id = record.get("space_id")
         current_configs = client.get_model_configs()
+        ctx.freeze(model_configs=current_configs)
         saved_configs = loads(record.get("model_configs_json"))
         if resuming and saved_configs:
             changed = [
@@ -778,8 +774,7 @@ def _execute(
 
 def _prepare_subset(ctx: TaskContext, compile_id: int, options: CompileOptions) -> None:
     """首次运行固化抽样子集；继续运行复用已有子集。"""
-    # 已抽过子集就不重抽：重抽会让已导入文档的 page_id 指向不在子集里的文档，
-    # 而那种错配不报错，只会让每个检索指标都算错。
+    # 续跑复用固化子集，避免 page_id 与文档错配。
     if not compile_store.compile_docs(ctx.db, compile_id):
         for dataset in options.datasets:
             ctx.checkpoint()
@@ -872,8 +867,7 @@ def _run_remote_compile(
             and not int((run.get("progress") or {}).get("text", {}).get("expected") or 0)
             for run in previous_runs
         ):
-            # RunPage 尚未初始化，没有远端逐页状态可筛选；只重试本次编译明确
-            # 导入的页面，不调用会扫描整个 Space 的 compile-spaces。
+            # 未初始化 RunPage 时仅重试本次导入页。
             target_page_ids = list(
                 dict.fromkeys(
                     str(row["page_id"])
@@ -944,11 +938,6 @@ def _run_remote_compile(
             f"coalesced={coalesced}）。{len(compile_store.compile_docs(ctx.db, compile_id))} "
             "篇语料已上传但没被编译，请检查 Akasha 的编译 worker 是否在跑。"
         )
-    if wait["timed_out"]:
-        raise RuntimeError(
-            f"编译轮询超时（{POLL_TIMEOUT_SECONDS}s），"
-            f"状态 {wait['status_counts']}。此时查询会得到偏低但不报错的指标。"
-        )
     ctx.log(f"编译终态：{wait['status_counts']}")
 
     pace = _compile_pace(client, space_id, wait.get("runs") or None)
@@ -960,8 +949,7 @@ def _run_remote_compile(
         )
 
     quality = _quality_gate(client, space_id)
-    # 质量接口只报告空间里缺了多少产物，不报告是否仍有可用产物。保存本次
-    # Run 的逐页结果，让查询层能区分「全军覆没」与「仅少数页面失败」。
+    # 保存逐页结果，供查询层区分全量与部分失败。
     ordered_run_ids = list(
         dict.fromkeys(
             [str(value) for value in ctx.params.get("remote_compile_run_ids") or []]

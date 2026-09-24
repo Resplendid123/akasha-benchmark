@@ -5,10 +5,11 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from akasha_benchmark.akasha_client import AkashaClient, AkashaError
-from akasha_benchmark.judge import JudgeClient, JudgeConfigError
+from akasha_benchmark.judge import JudgeClient, JudgeConfigError, JudgeProvider
 from akasha_benchmark.judge.providers import resolve_provider
 from akasha_benchmark.model_configs import FEATURES, drift
 from akasha_benchmark.store import compile_store, config_store, loads, task_store
@@ -291,8 +292,7 @@ def probe_provider(request: Request, provider_id: int) -> dict[str, Any]:
             return {"ok": False, "failure": "config", "detail": str(exc)}
 
     with JudgeClient(provider) as client:
-        # prompt 里必须出现 "json"：有些 provider 以此为 json_object 格式的前提，
-        # 裸一句 hi 会被它们判 400，而那是探测本身的问题。
+        # 部分 provider 要求提示词包含 "json" 才接受 json_object。
         reply = client.complete(
             "You reply with a single JSON object.",
             'hi — reply as JSON: {"reply": "<your greeting>"}',
@@ -440,6 +440,107 @@ def delete_akasha_model(request: Request, model_id: int) -> dict[str, Any]:
     if not removed:
         raise HTTPException(404, f"Akasha 模型配置 #{model_id} 不存在")
     return {"deleted": removed}
+
+
+@router.post("/akasha-models/{model_id}/probe")
+def probe_akasha_model(request: Request, model_id: int) -> dict[str, Any]:
+    """用最小请求探测一个 Akasha 模型端点。"""
+    config = config_of(request)
+    with db(request) as connection:
+        record = config_store.get_model_provider(connection, model_id)
+        if record is None or record["purpose"] not in FEATURES:
+            raise HTTPException(404, f"Akasha 模型配置 #{model_id} 不存在")
+
+    feature = str(record["purpose"])
+    provider = JudgeProvider(
+        provider_id=int(record["id"]),
+        base_url=str(record["base_url"]),
+        model=str(record["model"]),
+        api_key=str(record["api_key"] or ""),
+        timeout_seconds=config.timeout_seconds,
+    )
+    redacted = provider.redacted()
+
+    try:
+        key = provider.resolve_key()
+    except JudgeConfigError as exc:
+        return {
+            "ok": False,
+            "failure": "config",
+            "status": None,
+            "reply": "",
+            "detail": str(exc),
+            "provider": redacted,
+        }
+
+    if feature != "embedding":
+        with JudgeClient(provider) as client:
+            reply = client.complete(
+                "You reply with a single JSON object.",
+                'hi — reply as JSON: {"reply": "<your greeting>"}',
+            )
+        return {
+            "ok": reply.failure_kind is None,
+            "failure": reply.failure_kind,
+            "status": reply.status,
+            "reply": (reply.content or "")[:400],
+            "detail": None if reply.failure_kind is None else (reply.raw or "")[:600],
+            "provider": redacted,
+        }
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(config.timeout_seconds)) as client:
+            response = client.post(
+                f"{provider.base_url.rstrip('/')}/embeddings",
+                json={"model": provider.model, "input": "hi"},
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        if not response.is_success:
+            return {
+                "ok": False,
+                "failure": "http_error",
+                "status": response.status_code,
+                "reply": "",
+                "detail": response.text[:600],
+                "provider": redacted,
+            }
+        body = response.json()
+        vector = ((body.get("data") or [{}])[0]).get("embedding")
+        if not isinstance(vector, list) or not vector:
+            return {
+                "ok": False,
+                "failure": "invalid_response",
+                "status": response.status_code,
+                "reply": "",
+                "detail": "响应没有返回 embedding 向量",
+                "provider": redacted,
+            }
+        return {
+            "ok": True,
+            "failure": None,
+            "status": response.status_code,
+            "reply": f"embedding 成功，维度 {len(vector)}",
+            "detail": None,
+            "provider": redacted,
+        }
+    except httpx.TimeoutException as exc:
+        return {
+            "ok": False,
+            "failure": "timeout",
+            "status": None,
+            "reply": "",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "provider": redacted,
+        }
+    except (httpx.RequestError, ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+        return {
+            "ok": False,
+            "failure": "request_error",
+            "status": None,
+            "reply": "",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "provider": redacted,
+        }
 
 
 @router.post("/akasha-models/{model_id}/apply")

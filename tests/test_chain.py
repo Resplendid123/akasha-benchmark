@@ -30,7 +30,6 @@ from akasha_benchmark.store import (
 
 
 def _imported_pages(connection) -> list[str]:
-    """本次编译已导入的 page_id。gold 优先，让检索指标算得出非零值。"""
     runs = compile_store.list_compile_runs(connection)
     if not runs:
         return []
@@ -44,12 +43,12 @@ def test_build_lays_out_four_steps(normalized, monkeypatch):
     steps = chain.build({"dataset": "hotpotqa", "sample_id": sample_id}, normalized)
 
     assert [s["stage"] for s in steps] == ["compile", "query", "evaluate", "attribute"]
-    # 链首不需要关联参数，后三步各自等上一步的产物 id。
     assert "link" not in steps[0]
     assert [s["link"] for s in steps[1:]] == ["compile_id", "query_id", "eval_id"]
-    # 每一步的阶段名都得是真实阶段，否则运行器起不来。
     assert all(s["stage"] in STAGES for s in steps)
     assert steps[0]["params"]["sample_ids"] == [sample_id]
+    assert steps[0]["params"]["negatives_ratio"] == 1.5
+    assert steps[2]["params"]["ks"] == [2]
     expected = {
         definition.name
         for definition in registry.available(get_adapter("hotpotqa").provides)
@@ -102,7 +101,7 @@ def test_build_requires_sample_from_selected_dataset(normalized, monkeypatch):
 
 
 def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
-    """运行器自动推进完整链路，最终完成四条任务。"""
+    from akasha_platform import tasks as platform_tasks
     from akasha_platform.settings import Settings
     from akasha_platform.tasks import TaskRunner
 
@@ -114,6 +113,7 @@ def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
         connection.close()
 
     monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
+    monkeypatch.setattr(platform_tasks, "AkashaClient", lambda config: FakeClient(config))
 
     def _fake_query_client(config):
         probe = connect(db_path)
@@ -130,7 +130,6 @@ def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
         {"dataset": "hotpotqa", "sample_id": "hotpotqa:q1", "use_model": False}
     )
 
-    # 四条任务依次跑完，最长的一步是编译。
     deadline = time.time() + 120
     while time.time() < deadline:
         probe = connect(db_path)
@@ -156,7 +155,6 @@ def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
             "attribute",
         ]
         assert all(t["status"] == task_store.SUCCEEDED for t in tasks)
-        # 四条共用链首的链号，且链尾不再往下接。
         assert {t["chain_id"] for t in tasks} == {int(head["id"])}
         assert task_store.task_chain(probe, max(int(t["id"]) for t in tasks))[1] == []
     finally:

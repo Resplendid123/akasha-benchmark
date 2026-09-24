@@ -36,7 +36,6 @@ function tasksIn(nodes: TaskTreeNode[]): Task[] {
   ])
 }
 
-/** 任务层：按运行产物外键展示编译 → 查询 → 评测 → 归因分叉树。 */
 export function Tasks() {
   const tasks = useAsync(() => api.taskTree(), [])
   const [open, setOpen] = useState<number | null>(null)
@@ -308,7 +307,6 @@ function Row({
   )
 }
 
-/** 增量日志，只拉 after_id 之后新增的行。 */
 function Logs({ taskId, onClose }: { taskId: number; onClose: () => void }) {
   const [detail, setDetail] = useState<TaskDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -376,7 +374,6 @@ function Logs({ taskId, onClose }: { taskId: number; onClose: () => void }) {
   )
 }
 
-/** 审计日志。只追加，清理任务不删它。 */
 function Audit() {
   const { data, error, loading } = useAsync(() => api.audit(), [])
   if (loading) return <Loading what="审计日志" />

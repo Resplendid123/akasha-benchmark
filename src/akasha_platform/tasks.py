@@ -12,6 +12,7 @@ from akasha_benchmark.akasha_client import (
     validate_cancel_result,
 )
 from akasha_benchmark.config import load_config
+from akasha_benchmark import model_configs
 from akasha_benchmark.stages import STAGES, chain, clean_params
 from akasha_benchmark.store import compile_store, connect, query_store, task_store
 from akasha_benchmark.task import Paused, TaskContext, execute
@@ -20,8 +21,13 @@ from .settings import Settings
 
 # 这些阶段与任何在跑的任务互斥：它们改的是下游所有层的输入。
 EXCLUSIVE = frozenset({"download", "normalize"})
-# Akasha 模型配置是远端全局状态；编译任务串行，单任务内部仍可并发上传。
-STAGE_CONCURRENCY: dict[str, int] = {}
+# Akasha 模型配置是远端全局状态；相同配置的任务可并行，单任务内部仍可并发上传。
+STAGE_CONCURRENCY: dict[str, int] = {"compile": 16, "query": 16}
+UNLIMITED_CONCURRENCY = frozenset({"attribute"})
+TASK_MODEL_FEATURES: dict[str, tuple[str, ...]] = {
+    "compile": ("compiler", "embedding", "image"),
+    "query": ("answer",),
+}
 
 
 class TaskRejected(RuntimeError):
@@ -35,8 +41,6 @@ class TaskRunner:
         self.settings = settings
         self._pauses: dict[int, threading.Event] = {}
         self._lock = threading.Lock()
-
-    # --- 启动与恢复 ---
 
     def recover(self) -> int:
         """把上次进程留下的「运行中」标成暂停，返回处理了几条。
@@ -88,7 +92,7 @@ class TaskRunner:
         connection = connect(self.settings.db_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._require_free(connection, stage)
+            self._require_free(connection, stage, params)
             task_id = task_store.create_task(connection, stage=stage, params=params)
             connection.commit()
             record = task_store.get_task(connection, task_id) or {}
@@ -112,7 +116,7 @@ class TaskRunner:
             head, rest = steps[0], steps[1:]
             params = clean_params(head["stage"], head["params"])
             connection.execute("BEGIN IMMEDIATE")
-            self._require_free(connection, head["stage"])
+            self._require_free(connection, head["stage"], params)
             task_id = task_store.create_task(connection, stage=head["stage"], params=params)
             # 链首的 id 就是链号，四条任务凭它归到一起。
             task_store.set_task_chain(connection, task_id, chain=rest, chain_id=task_id)
@@ -175,7 +179,7 @@ class TaskRunner:
                 raise TaskRejected(f"任务 #{task_id} 不存在")
             if task["status"] not in (task_store.PAUSED, task_store.FAILED):
                 raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，无需继续")
-            self._require_free(connection, task["stage"])
+            self._require_free(connection, task["stage"], task.get("params") or {})
             task_store.transition(connection, task_id, task_store.QUEUED)
             connection.commit()
         finally:
@@ -264,8 +268,6 @@ class TaskRunner:
         finally:
             connection.close()
 
-    # --- 内部 ---
-
     def _cancel_remote_compile(
         self, connection, task: dict[str, Any], reason: str
     ) -> list[dict[str, str]]:
@@ -310,7 +312,9 @@ class TaskRunner:
             connection.rollback()
             raise TaskRejected(f"远端编译 Run 取消失败，本地状态未变：{exc}") from exc
 
-    def _require_free(self, connection, stage: str) -> None:
+    def _require_free(
+        self, connection, stage: str, params: dict[str, Any] | None = None
+    ) -> None:
         active = task_store.active_tasks(connection)
         for task in active:
             if stage in EXCLUSIVE or task["stage"] in EXCLUSIVE:
@@ -318,7 +322,35 @@ class TaskRunner:
                     f"{task['stage']} 任务 #{task['id']} 正在运行，请先等它结束或暂停"
                 )
         same_stage = [task for task in active if task["stage"] == stage]
+        if stage in UNLIMITED_CONCURRENCY:
+            return
         limit = STAGE_CONCURRENCY.get(stage, 1)
+        features = TASK_MODEL_FEATURES.get(stage, ())
+        incoming_configs = (params or {}).get("model_configs")
+        if features and not incoming_configs:
+            # 入队时锁定远端配置快照。
+            try:
+                config = load_config(connection)
+                config.require_credentials()
+                with AkashaClient(config) as client:
+                    client.login()
+                    incoming_configs = client.get_model_configs()
+                    if isinstance(params, dict):
+                        params["model_configs"] = incoming_configs
+            except (AkashaError, OSError, ValueError):
+                incoming_configs = None
+
+        for task in same_stage:
+            running_configs = (task.get("params") or {}).get("model_configs")
+            # 远端全局配置不同时禁止并行。
+            if incoming_configs and running_configs and any(
+                not model_configs.matches(incoming_configs, running_configs, feature)
+                for feature in features
+            ):
+                raise TaskRejected(
+                    f"{stage} 任务 #{task['id']} 使用了不同的远端模型配置；"
+                    "请等待该任务结束/暂停后再运行"
+                )
         if len(same_stage) >= limit:
             if limit == 1:
                 task = same_stage[0]
@@ -377,7 +409,7 @@ class TaskRunner:
         try:
             params = clean_params(step["stage"], params)
             connection.execute("BEGIN IMMEDIATE")
-            self._require_free(connection, step["stage"])
+            self._require_free(connection, step["stage"], params)
         except (ValueError, TaskRejected) as exc:
             task_store.log(
                 connection,

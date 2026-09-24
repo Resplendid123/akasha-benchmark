@@ -180,8 +180,6 @@ def delete_eval(request: Request, eval_id: int) -> dict[str, Any]:
     return {"deleted": removed}
 
 
-# ------------------------------------------------------------------ 归因层
-
 
 @router.get("/attributions/{attribution_id}")
 def attribution_detail(request: Request, attribution_id: int) -> dict[str, Any]:
@@ -228,7 +226,6 @@ def lineage(request: Request, page_id: str, question: str = "") -> dict[str, Any
         raise HTTPException(400, str(exc)) from exc
     return {
         **textdiff.build(chain, question),
-        "base_url": config.base_url,
         # 逐块原始数据，供前端分页并标注 artifact / chunk。
         "artifacts": chain["artifacts"],
         "chunks": chain["chunks"],

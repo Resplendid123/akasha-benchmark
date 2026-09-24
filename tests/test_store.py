@@ -56,7 +56,6 @@ def test_init_db_is_idempotent(db_path):
 
 @pytest.mark.usefixtures("sample_dataset")
 def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
-    """删除编译时级联删除下游记录与产物。"""
     compile_store.replace_compile_subset(
         db, compile_id, "d", ["d:1"], [{"doc_id": "0", "is_gold": True}]
     )
@@ -74,7 +73,6 @@ def test_foreign_keys_cascade(db, compile_id, query_id, eval_id):
 
 @pytest.mark.usefixtures("sample_dataset")
 def test_dataset_delete_refuses_when_compiled(db, compile_id):
-    """禁止删除已被编译引用的数据集。"""
     compile_store.replace_compile_subset(db, compile_id, "d", ["d:1"], [])
 
     with pytest.raises(ValueError, match="编译层"):
@@ -83,7 +81,6 @@ def test_dataset_delete_refuses_when_compiled(db, compile_id):
 
 @pytest.mark.usefixtures("sample_dataset")
 def test_pending_query_samples_drives_resume(db, query_id):
-    """续跑仅处理固化选择中尚无响应的样本。"""
     query_store.freeze_query_samples(
         db, query_id, [{"sample_id": "d:1"}, {"sample_id": "d:2"}]
     )
@@ -108,7 +105,6 @@ def test_pending_query_samples_drives_resume(db, query_id):
     pending = query_store.pending_query_samples(db, query_id)
     assert [p["sample_id"] for p in pending] == ["d:2"]
 
-    # 固化选择是幂等的：再冻结一次不会让待办回退。
     query_store.freeze_query_samples(db, query_id, [{"sample_id": "d:1", "dataset": "d"}])
     assert len(query_store.pending_query_samples(db, query_id)) == 1
     with pytest.raises(sqlite3.IntegrityError):
@@ -222,7 +218,6 @@ def test_delete_failed_responses_keeps_successes(db, query_id):
 
 
 def test_compile_ready_requires_quality_gate(db, compile_id):
-    """编译成功且质量检查通过后才允许查询。"""
     compile_store.replace_compile_subset(
         db, compile_id, "d", [], [{"doc_id": "0", "is_gold": True}]
     )
@@ -299,7 +294,6 @@ def test_providers_are_listed_by_most_recent_update(db):
 
 
 def test_task_tree_preserves_one_to_many_run_branches(db, compile_id, query_id, eval_id):
-    """任务树按产物外键分组，而不是把同一编译压成一条串行链。"""
     second_query = query_store.create_query_run(
         db,
         name="q2",
@@ -351,7 +345,6 @@ def test_connection_rejects_unknown_fields(db):
 
 
 def test_localhost_is_rewritten_to_ipv4():
-    """localhost 固定走 IPv4，显式 IPv6 和其他主机名保持原样。"""
     clean = config_store.sanitize_connection(
         {
             "base_url": "http://localhost:3000",
@@ -359,10 +352,8 @@ def test_localhost_is_rewritten_to_ipv4():
         }
     )
     assert clean["base_url"] == "http://127.0.0.1:3000"
-    # 凭据与端口不能在改写中丢掉。
     assert clean["database_url"] == "postgresql://u:p@127.0.0.1:5432/db"
 
-    # 显式写 IPv6 的是特意要 IPv6；别的主机名不动。
     untouched = config_store.sanitize_connection(
         {"base_url": "http://[::1]:3000", "database_url": "postgresql://localhostish/db"}
     )

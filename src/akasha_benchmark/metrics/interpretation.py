@@ -17,8 +17,8 @@ FAMILY_LABELS = {
 }
 
 COUNT_METRICS = {
-    "truncation_loss",
-    "truncated_gold",
+    "uncited_count",
+    "uncited_gold_count",
     "graph_neighbor_gold_snippets",
 }
 
@@ -149,7 +149,7 @@ def _evidence_for_metric(
     valid_citations = [row for row in citations if row["mapped"]]
     cited_gold = {row["doc_id"] for row in valid_citations if row["is_gold"]}
     evidence: dict[str, Any] = {"formula": None, "gold_documents": gold_documents}
-    if base in {"recall", "hit", "full_coverage", "ndcg"}:
+    if base in {"precision", "recall", "retrieval_f1", "hit", "full_coverage", "ndcg"}:
         top = retrieved[: k or 0]
         top_gold = {row["doc_id"] for row in top if row["is_gold"]}
         top_pages = {row["page_id"] for row in top}
@@ -158,7 +158,13 @@ def _evidence_for_metric(
             gold_documents=gold_documents,
             snippets=[row for row in snippets if set(row["page_ids"]) & top_pages],
         )
-        if base == "recall":
+        if base == "precision":
+            evidence["formula"] = f"前 {k} 条中命中 Gold（{len(top_gold)}）/ 实际返回文档（{len(top)}）"
+        elif base == "retrieval_f1":
+            precision = len(top_gold) / len(top) if top else 0.0
+            recall = len(top_gold) / gold_count if gold_count else 0.0
+            evidence["formula"] = f"2 × Precision（{precision:.4f}）× Recall（{recall:.4f}）/（Precision + Recall）"
+        elif base == "recall":
             evidence["formula"] = (
                 f"前 {k} 条中命中 Gold（{len(top_gold)}）/ 实际需要的 Gold（{gold_count}）"
             )
@@ -214,21 +220,21 @@ def _evidence_for_metric(
     elif base in {
         "citation_precision",
         "citation_recall",
-        "truncation_loss",
-        "truncated_gold",
+        "uncited_count",
+        "uncited_gold_count",
     }:
         uncited = [
             row
             for row in valid_retrieved
             if row["doc_id"] not in {c["doc_id"] for c in valid_citations}
         ]
-        truncated_gold = [row for row in uncited if row["is_gold"]]
+        uncited_gold = [row for row in uncited if row["is_gold"]]
         cited_ids = {doc["doc_id"] for doc in valid_citations}
         snippet_ids = (
-            {doc["doc_id"] for doc in truncated_gold}
-            if base == "truncated_gold"
+            {doc["doc_id"] for doc in uncited_gold}
+            if base == "uncited_gold_count"
             else {doc["doc_id"] for doc in uncited}
-            if base == "truncation_loss"
+            if base == "uncited_count"
             else cited_ids
         )
         evidence.update(
@@ -245,12 +251,12 @@ def _evidence_for_metric(
         formulas = {
             "citation_precision": f"实际引用中命中 Gold（{len(cited_gold)}）/ 实际引用（{len(valid_citations)}）",
             "citation_recall": f"实际引用中命中 Gold（{len(cited_gold)}）/ 实际需要的 Gold（{gold_count}）",
-            "truncation_loss": f"实际检索但未进入引用的文档（{len(uncited)}）",
-            "truncated_gold": f"实际检索但未进入引用的 Gold 文档（{len(truncated_gold)}）",
+            "uncited_count": f"已检索但未被引用的文档（{len(uncited)}）",
+            "uncited_gold_count": f"已检索但未被引用的 Gold 文档（{len(uncited_gold)}）",
         }
         evidence["formula"] = formulas[base]
-        if base in {"truncation_loss", "truncated_gold"}:
-            evidence["difference_documents"] = truncated_gold if base == "truncated_gold" else uncited
+        if base in {"uncited_count", "uncited_gold_count"}:
+            evidence["difference_documents"] = uncited_gold if base == "uncited_gold_count" else uncited
     elif base.startswith("graph_"):
         graph = [row for row in snippets if row["is_graph"]]
         graph_gold = [row for row in graph if row["is_gold"]]
@@ -469,6 +475,10 @@ def _score_reason(
     if base == "recall":
         hits = round(value * gold_count)
         return f"前 {k} 条检索结果命中 {hits}/{gold_count} 篇 gold 文档。"
+    if base == "precision":
+        return f"前 {k} 条实际返回文档中，命中 gold 的比例为 {_percent(value)}。"
+    if base == "retrieval_f1":
+        return f"前 {k} 条检索结果的 Precision 与 Recall 调和平均为 {_percent(value)}。"
     if base == "hit":
         return f"前 {k} 条内{'至少命中一篇' if value else '没有命中任何'} gold 文档。"
     if base == "full_coverage":
@@ -497,10 +507,10 @@ def _score_reason(
         return "去重后的有效引用中，属于 gold 文档的比例。下方列出本次计算使用的文档和片段。"
     if base == "citation_recall":
         return f"引用覆盖约 {round(value * gold_count)}/{gold_count} 篇 gold 文档。"
-    if base == "truncation_loss":
-        return f"有 {_count(value)} 篇已检索文档没有进入最终引用。"
-    if base == "truncated_gold":
-        return f"有 {_count(value)} 篇已检索到的 gold 文档没有进入最终引用。"
+    if base == "uncited_count":
+        return f"有 {_count(value)} 篇已检索文档未被引用。"
+    if base == "uncited_gold_count":
+        return f"有 {_count(value)} 篇已检索到的 gold 文档未被引用。"
     if base == "graph_exclusive_gold_share":
         return f"约 {round(value * gold_count)}/{gold_count} 篇 gold 只能靠图扩展获得。"
     if base == "graph_neighbor_precision":
@@ -532,7 +542,7 @@ def _score_reason(
 
 def _status(name: str, value: float, higher_is_better: bool) -> str:
     base = name.split("@", 1)[0]
-    if base in COUNT_METRICS and base not in {"truncation_loss", "truncated_gold"}:
+    if base in COUNT_METRICS and base not in {"uncited_count", "uncited_gold_count"}:
         return "neutral"
     if not higher_is_better:
         return "good" if value == 0 else "bad"

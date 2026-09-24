@@ -18,7 +18,6 @@ from akasha_benchmark.store import eval_store
 
 
 def test_all_judge_metrics_are_registered():
-    """判据模块与 registry 必须对齐，否则勾了却没实现，或实现了却勾不到。"""
     judge = {d.name for d in registry.METRIC_DEFINITIONS if d.kind == registry.KIND_JUDGE}
     assert judge == {
         "faithfulness",
@@ -29,7 +28,6 @@ def test_all_judge_metrics_are_registered():
 
 
 def test_answer_correctness_needs_reference_answers():
-    """只有这一条依赖参考答案，其余三条对 narrativeqa 也成立。"""
     from akasha_benchmark.datasets.models import DataDependency
 
     definition = registry.get_metric("answer_correctness")
@@ -38,93 +36,20 @@ def test_answer_correctness_needs_reference_answers():
         assert registry.get_metric(name).requires == frozenset()
 
 
-# --- answer_relevancy ---
 
 
-def test_answer_relevancy_is_the_relevant_share():
-    sentences = ["a", "b", "c"]
-    score, detail = answer_relevancy.parse_verdict(
-        {
-            "verdicts": [
-                {"index": 1, "verdict": "relevant"},
-                {"index": 2, "verdict": "relevant"},
-                {"index": 3, "verdict": "irrelevant"},
-            ]
-        },
-        sentences,
-    )
-    assert score == pytest.approx(2 / 3)
-    assert detail["relevant"] == 2
-    assert detail["sentence_count"] == 3
-
-
-def test_answer_relevancy_undefined_on_refusal():
-    """没有实质句子时无定义。记 0 会把拒答算成「答偏了」。"""
-    score, detail = answer_relevancy.parse_verdict(
-        {"verdicts": [{"index": 1, "verdict": "ignore"}]},
-        ["我无法回答。"],
-    )
-    assert score is None
-    assert detail["ignored"] == 1
-
-
-def test_answer_relevancy_rejects_unknown_verdict():
-    with pytest.raises(ValueError, match="unknown verdict"):
-        answer_relevancy.parse_verdict(
-            {"verdicts": [{"index": 1, "verdict": "maybe"}]}, ["a"]
-        )
-
-
-def test_answer_relevancy_rejects_missing_or_duplicate_indexes():
-    with pytest.raises(ValueError, match="expected 2 verdicts"):
-        answer_relevancy.parse_verdict(
-            {"verdicts": [{"index": 1, "verdict": "relevant"}]},
-            ["a", "b"],
-        )
-    with pytest.raises(ValueError, match="duplicate sentence index"):
-        answer_relevancy.parse_verdict(
-            {
-                "verdicts": [
-                    {"index": 1, "verdict": "relevant"},
-                    {"index": 1, "verdict": "irrelevant"},
-                ]
-            },
-            ["a", "b"],
-        )
-
-
-def test_answer_relevancy_does_not_echo_quoted_sentences_in_json():
-    built = answer_relevancy.build_prompt(
-        "怎么申请？",
-        '登录门户搜索"设备申请"。然后联系 IT。',
-        {},
-    )
+def test_answer_relevancy_generated_question_embedding_helpers():
+    assert answer_relevancy.build_prompt("") is None
+    built = answer_relevancy.build_prompt("Paris is the capital of France.")
     assert built is not None
-    system, user, sentences = built
-    assert sentences == ['登录门户搜索"设备申请"。', "然后联系 IT。"]
-    assert "Never copy sentence text" in system
-    assert '[1] 登录门户搜索"设备申请"。' in user
-
-    score, detail = answer_relevancy.parse_verdict(
-        {
-            "verdicts": [
-                {"index": 1, "verdict": "relevant"},
-                {"index": 2, "verdict": "irrelevant"},
-            ]
-        },
-        sentences,
-    )
-    assert score == pytest.approx(0.5)
-    assert detail["sentences"][0]["sentence"] == '登录门户搜索"设备申请"。'
+    assert "ANSWER" in built[1]
+    assert answer_relevancy.parse_generated_question({"question": "What is France's capital?"}) == "What is France's capital?"
+    with pytest.raises(ValueError):
+        answer_relevancy.parse_generated_question({"question": ""})
+    assert answer_relevancy.cosine_similarity([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+    assert answer_relevancy.cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
 
 
-def test_answer_relevancy_skips_empty_answer():
-    assert answer_relevancy.build_prompt("q", "", {}) is None
-    assert answer_relevancy.build_prompt("", "a", {}) is None
-    assert answer_relevancy.build_prompt("q", "a", {}) is not None
-
-
-# --- context_relevancy ---
 
 
 def test_context_relevancy_is_the_useful_share():
@@ -151,10 +76,8 @@ def test_context_relevancy_rejects_missing_verdicts():
 
 
 def test_context_relevancy_numbers_the_passages():
-    """上下文要编号，否则模型没法逐条对应。"""
     built = context_relevancy.build_prompt(
         "q",
-        "a",
         {"snippets": [{"title": "T1", "text": "x"}, {"title": "T2", "text": "y"}]},
     )
     assert built is not None
@@ -164,20 +87,10 @@ def test_context_relevancy_numbers_the_passages():
     assert "[2] T2" in user
 
 
-def test_context_relevancy_falls_back_to_titles():
-    """没有正文时退到 retrievedSources 的标题，仍然可判。"""
-    built = context_relevancy.build_prompt(
-        "q", "a", {"retrievedSources": [{"title": "Only a title"}]}
-    )
-    assert built is not None
-    assert built[2] == 1
-
-
 def test_context_relevancy_skips_when_nothing_retrieved():
-    assert context_relevancy.build_prompt("q", "a", {}) is None
+    assert context_relevancy.build_prompt("q", {}) is None
 
 
-# --- answer_correctness ---
 
 
 @pytest.mark.parametrize(
@@ -201,11 +114,9 @@ def test_answer_correctness_skips_without_reference():
     assert answer_correctness.build_prompt("q", "a", "ref") is not None
 
 
-# --- 存储：一个样本多条 judge 结论 ---
 
 
 def test_verdicts_are_stored_per_metric(db, eval_id):
-    """同一样本的不同指标独立保存。"""
     for name, score in (("faithfulness", 0.5), ("answer_relevancy", 1.0)):
         eval_store.record_judge_verdict(
             db,

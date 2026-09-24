@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from './api'
 import type { Metrics, RootCause, RunStatus, TaskStatus } from './types'
 
-/** 缺失指标显示为 `—`，与数值 0 区分开。 */
 export function metric(values: Metrics, name: string, digits = 4): string {
   return num(values[name], digits)
 }
@@ -26,7 +25,6 @@ export function duration(ms: number | null | undefined): string {
   return `${Math.floor(minutes / 60)}h${(minutes % 60).toString().padStart(2, '0')}m`
 }
 
-/** 两个时间戳之间的耗时。任务还在跑（没有 finished_at）时按当下算。 */
 function elapsed(startedAt: string | null, finishedAt: string | null): string {
   if (!startedAt) return '—'
   const start = Date.parse(startedAt)
@@ -35,7 +33,6 @@ function elapsed(startedAt: string | null, finishedAt: string | null): string {
   return Number.isNaN(end) ? '—' : duration(end - start)
 }
 
-/** 平均延迟 + 总耗时，如 ``2.6s/条 · 共 4.0s``。延迟缺失时只显示总耗时。 */
 export function Timing({
   startedAt,
   finishedAt,
@@ -90,7 +87,7 @@ export function useAsync<T>(
   const inFlight = useRef(false)
   const queued = useRef(false)
 
-  // 参数变了就回到加载态，手上的数据不再对应当前请求。
+  // 依赖变化后重新进入加载态。
   useEffect(() => {
     hasData.current = false
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -98,7 +95,7 @@ export function useAsync<T>(
 
   useEffect(() => {
     let alive = true
-    // 已有数据时刷新不翻转 loading，否则轮询会把整页反复换成加载态。
+    // 后台刷新时保留现有页面。
     if (!hasData.current) {
       setLoading(true)
       setError(null)
@@ -116,7 +113,6 @@ export function useAsync<T>(
         if (alive) setError(exc instanceof ApiError ? exc.message : String(exc))
       })
       .finally(() => {
-        // 被后一次请求接替时交给接替者收尾。
         if (!alive) return
         inFlight.current = false
         setLoading(false)
@@ -131,7 +127,7 @@ export function useAsync<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, nonce])
 
-  // 上一次没回来就只记一次待刷新，既不堆积请求也不丢掉刷新。
+  // 请求期间只排队一次刷新。
   const reload = useCallback(() => {
     if (inFlight.current) {
       queued.current = true
@@ -155,7 +151,6 @@ export function useAction<T>(): {
   const [result, setResult] = useState<T | null>(null)
   const alive = useRef(true)
   useEffect(() => {
-    // StrictMode 会重新执行 effect，每次挂载都要恢复异步更新标记。
     alive.current = true
     return () => {
       alive.current = false
@@ -228,7 +223,6 @@ export function StatusTag({ status }: { status: TaskStatus | RunStatus }) {
   return <span className={STATUS_CLASS[status] ?? 'tag'}>{STATUS_TEXT[status] ?? status}</span>
 }
 
-/** answerMode 的显示。非 knowledge 用警告色；general 也可能保留未采用的检索结果。 */
 export function ModeTag({ mode }: { mode: string | null }) {
   const label = mode ?? 'missing'
   return <span className={`tag ${label === 'knowledge' ? 'ok' : 'warn'}`}>{label}</span>
@@ -311,21 +305,23 @@ export function Bar({ value, kind }: { value: number; kind?: 'ok' | 'bad' }) {
   )
 }
 
-/** 根因的中文名与色档。generation_fallback 用警告色，它不是检索问题。 */
 const ROOT_CAUSE_LABELS: Record<RootCause, { text: string; kind: string }> = {
-  not_a_failure: { text: '答案正确', kind: 'ok' },
+  answer_incorrect: { text: '答案错误', kind: 'bad' },
+  retrieval_evidence_incomplete: { text: '证据链不完整', kind: 'bad' },
+  answer_correct: { text: '答案正确', kind: 'ok' },
   generation_ignored_retrieval: { text: '生成未采用检索', kind: 'warn' },
   generation_fallback: { text: '生成端兜底', kind: 'warn' },
   compiled_away: { text: '编译丢词', kind: 'bad' },
-  citation_dropped: { text: '引用被截断', kind: 'warn' },
+  citation_dropped: { text: '检索到但未被引用', kind: 'warn' },
   retrieval_miss: { text: '检索未命中', kind: 'bad' },
   graph_edge_missing: { text: '多跳缺跳', kind: 'bad' },
   unknown: { text: '未能定位', kind: '' },
 }
 
-export function CauseTag({ cause }: { cause: string | null }) {
+export function CauseTag({ cause, plain = false }: { cause: string | null; plain?: boolean }) {
   if (!cause) return <span className="muted small">未归因</span>
   const entry = ROOT_CAUSE_LABELS[cause as RootCause]
+  if (plain) return <>{entry?.text ?? cause}</>
   return <span className={`tag ${entry?.kind ?? ''}`}>{entry?.text ?? cause}</span>
 }
 
@@ -394,7 +390,6 @@ export function Pager({
   )
 }
 
-/** 分页记录详情导航。页内直接切换，到边界时先翻页再打开新页首/末项。 */
 export function usePagedRecordNavigation<T>({
   items,
   total,
@@ -566,7 +561,6 @@ export function ConfigPanel({
   )
 }
 
-/** 数据集多选。指标勾选范围由所选组合决定，所以是多选。 */
 export function DatasetPicker({
   all,
   selected,
@@ -607,7 +601,6 @@ export function Field({
   label: string
   children: React.ReactNode
   hint?: string
-  /** 在 form-grid 里独占一行。 */
   wide?: boolean
 }) {
   return (
@@ -690,7 +683,6 @@ export function SecretField({
   )
 }
 
-/** 清理按钮。二次确认写在这里一处，各层不各写一遍。 */
 export function CleanupButton({
   what,
   detail,

@@ -28,24 +28,20 @@ def to_doc_ids(entries: Sequence[dict[str, Any]], page_to_doc: dict[str, str]) -
 def evaluate_sample(
     citations: Sequence[dict[str, Any]],
     retrieved: Sequence[dict[str, Any]],
-    citation_evidence: Sequence[dict[str, Any]],
     gold: Sequence[str],
     page_to_doc: dict[str, str],
 ) -> dict[str, float]:
     """单条样本的归因指标。"""
-    del citation_evidence  # 原始证据仍供详情展示，不再生成独立指标。
     gold_set = set(gold)
     cited = to_doc_ids(citations, page_to_doc)
     retrieved_docs = to_doc_ids(retrieved, page_to_doc)
 
     cited_set, retrieved_set = set(cited), set(retrieved_docs)
-    truncated = retrieved_set - cited_set
+    uncited = retrieved_set - cited_set
 
     return {
         "citation_precision": len(cited_set & gold_set) / len(cited_set) if cited_set else 0.0,
         "citation_recall": len(cited_set & gold_set) / len(gold_set) if gold_set else 0.0,
-        # 被检索到但没进答案引用的文档数。
-        "truncation_loss": float(len(truncated)),
-        # 其中本来是 gold 的那些。
-        "truncated_gold": float(len(truncated & gold_set)),
+        "uncited_count": float(len(uncited)),
+        "uncited_gold_count": float(len(uncited & gold_set)),
     }

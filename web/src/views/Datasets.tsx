@@ -3,7 +3,6 @@ import { api } from '../api'
 import type { DatasetEntry } from '../types'
 import { DatasetPicker, Failed, Loading, Pager, RecordSearch, num, useAction, useAsync } from '../ui'
 
-/** 数据集层：原始文件的下载与校验，以及原始样例。 */
 export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
   const { data, error, loading, reload } = useAsync(() => api.datasets(), [])
   const [selected, setSelected] = useState<string[]>([])
@@ -15,7 +14,6 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
   if (error) return <Failed error={error} />
   if (!data) return null
 
-  // 本地数据集不在下载源里，选它没有意义，所以下载栏只列可下载的。
   const names = data.datasets.filter((d) => d.downloadable).map((d) => d.name)
   const targets = selected.length ? selected : names
   // 全部就绪时收起下载栏，由「重新下载」显式打开。
@@ -137,7 +135,6 @@ export function Datasets({ onOpenTasks }: { onOpenTasks: () => void }) {
   )
 }
 
-/** 原始样例，一页一条，不走适配器。 */
 function RawPreview({ dataset, kind }: { dataset: string; kind: 'qa' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
   const [term, setTerm] = useState('')

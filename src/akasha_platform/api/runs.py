@@ -32,8 +32,6 @@ DEFAULT_PAGE = 20
 MAX_PAGE = 200
 
 
-# ------------------------------------------------------------------ 编译层
-
 
 @router.get("/compiles")
 def list_compiles(request: Request) -> dict[str, Any]:
@@ -59,25 +57,22 @@ def compile_docs(
     with db(request) as connection:
         if compile_store.get_compile_run(connection, compile_id) is None:
             raise HTTPException(404, f"编译 #{compile_id} 不存在")
-        docs = compile_store.compile_docs(connection, compile_id, dataset)
-    if gold_only:
-        docs = [d for d in docs if d["is_gold"]]
-    needle = (q or "").strip().lower()
-    if needle:
-        docs = [
-            doc
-            for doc in docs
-            if needle in str(doc["doc_id"]).lower()
-            or needle in str(doc.get("title") or "").lower()
-            or needle in str(doc.get("page_id") or "").lower()
-        ]
+        total, imported, docs = compile_store.compile_doc_page(
+            connection,
+            compile_id,
+            dataset,
+            gold_only=gold_only,
+            search=(q or "").strip() or None,
+            limit=limit,
+            offset=offset,
+        )
     return {
         "compile_id": compile_id,
-        "total": len(docs),
-        "imported": sum(1 for d in docs if d["page_id"]),
+        "total": total,
+        "imported": imported,
         "offset": offset,
         "limit": limit,
-        "docs": docs[offset : offset + limit],
+        "docs": docs,
     }
 
 
@@ -115,8 +110,6 @@ def delete_compile(request: Request, compile_id: int) -> dict[str, Any]:
         "note": "数据库内容已清理，活动编译 Run 已取消；Akasha 空间没有删除。",
     }
 
-
-# ------------------------------------------------------------------ 查询层
 
 
 @router.get("/queries/{query_id}/responses")

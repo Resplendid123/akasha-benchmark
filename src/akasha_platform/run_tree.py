@@ -300,7 +300,7 @@ def _public_run(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if not key.endswith("_json")}
 
 
-def _remote_model_labels(configs: Any, features: tuple[str, ...]) -> str | None:
+def _remote_model_labels(configs: dict[str, Any], features: tuple[str, ...]) -> str | None:
     labels = [
         str(config["model"])
         for feature in features

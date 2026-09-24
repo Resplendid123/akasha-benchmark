@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type {
+  AttributionResult,
   AttributionRun,
   CompileRun,
+  EvidenceChain,
   EvalRun,
   Provider,
 } from '../types'
@@ -17,6 +19,7 @@ import {
   ModeTag,
   Pager,
   RecordNav,
+  RecordSearch,
   StatusTag,
   Timing,
   useAction,
@@ -27,10 +30,6 @@ import {
 import { AttributionChain } from './AttributionChain'
 import { MetricInterpretations } from './MetricInterpretations'
 
-/** 归因层：针对某次 编译->查询->评测 链路推出根因。
- *
- * 规则判据不需要模型就能逐样本分类，模型可选地生成整轮指标分析报告。
- */
 export function Attribution({
   activeEval,
   onSelectEval,
@@ -260,9 +259,11 @@ function NewAttribution({
 
 const PAGE = 5
 const ROOT_CAUSE_ORDER = [
-  'not_a_failure',
+  'answer_correct',
+  'answer_incorrect',
   'generation_ignored_retrieval',
   'generation_fallback',
+  'retrieval_evidence_incomplete',
   'compiled_away',
   'citation_dropped',
   'retrieval_miss',
@@ -292,10 +293,15 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
   const [openSample, setOpenSample] = useState<string | null>(null)
   const [offset, setOffset] = useState(0)
   const [rootCause, setRootCause] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
   const results = data?.results ?? []
-  const filteredResults = rootCause
-    ? results.filter((result) => result.root_cause === rootCause)
-    : results
+  const filteredResults = results.filter((result) => {
+    if (rootCause && result.root_cause !== rootCause) return false
+    if (!search.trim()) return true
+    const needle = search.trim().toLowerCase()
+    return [result.sample_id, result.dataset, result.root_cause, JSON.stringify(result.evidence)]
+      .some((value) => value.toLowerCase().includes(needle))
+  })
   const shown = filteredResults.slice(offset, offset + PAGE)
   const nav = usePagedRecordNavigation({
     items: shown,
@@ -339,6 +345,7 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
           key={openSample}
           evalId={evalId}
           sampleId={openSample}
+          attributionResult={results.find((result) => result.sample_id === openSample)}
         />
       </div>
     )
@@ -418,6 +425,16 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
       )}
 
       <div className="row tight" style={{ marginBottom: 10 }}>
+        <RecordSearch
+          placeholder="搜索 sample_id、数据集、根因或证据"
+          value={search}
+          onChange={setSearch}
+          onSearch={(value) => {
+            setSearch(value)
+            setOffset(0)
+            setOpenSample(null)
+          }}
+        />
         <button
           className={`action small ${rootCause === null ? 'primary' : ''}`}
           onClick={() => {
@@ -438,7 +455,7 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
               setOpenSample(null)
             }}
           >
-            <CauseTag cause={cause} /> <span className="small">{count}</span>
+            <CauseTag cause={cause} plain /> <span className="small">{count}</span>
           </button>
         ))}
       </div>
@@ -477,7 +494,6 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
         limit={PAGE}
         onChange={(next) => {
           setOffset(next)
-          // 翻页时收起展开的样本，它不在新页上。
           setOpenSample(null)
         }}
       />
@@ -485,13 +501,53 @@ function Conclusions({ attributionId, evalId }: { attributionId: number; evalId:
   )
 }
 
-/** 一条样本的完整链路：证据、指标、响应、每篇 gold 的编译 diff。 */
+function EvidenceChainPanel({ evidence }: { evidence: unknown }) {
+  if (!evidence || typeof evidence !== 'object') return null
+  const chain = evidence as EvidenceChain
+  if (!chain.steps?.length) return null
+  const statusKind = chain.status === 'complete' ? 'ok' : chain.status === 'incomplete' ? 'bad' : 'warn'
+  return (
+    <section className="evidence-chain-panel">
+      <div className="spread"><h4 style={{ margin: 0 }}>逐跳证据诊断</h4><span className={`tag ${statusKind}`}>{chain.status}</span></div>
+      <div className="small muted" style={{ marginTop: 5 }}>{chain.supported_step_count ?? 0} supported · {chain.partial_step_count ?? 0} partial · {chain.missing_step_count ?? 0} missing{chain.model_false_negative_candidate && ' · general 但证据链完整'}</div>
+      <div className="evidence-chain-steps">
+        {chain.steps.map((step) => {
+          const kind = step.status === 'supported' ? 'ok' : step.status === 'missing' ? 'bad' : 'warn'
+          return <div className="evidence-chain-step" key={step.position}>
+            <div className="spread"><strong>Step {step.position}</strong><span className={`tag ${kind}`}>{step.status}</span></div>
+            <div className="small" style={{ marginTop: 5 }}>{step.question || '（无子问题）'}</div>
+            <dl className="kv compact-kv"><dt>答案</dt><dd>{step.answer || '—'}</dd><dt>支持文档</dt><dd>{step.support_title || '—'} {step.support_doc_id && <span className="mono small muted">{step.support_doc_id}</span>}</dd><dt>答案出现</dt><dd>{step.answer_present ? '是' : '否'}</dd><dt>support 覆盖</dt><dd>{typeof step.support_token_recall === 'number' ? `${Math.round(step.support_token_recall * 100)}%` : '—'}</dd><dt>检索到相关论断</dt><dd>{step.claim_retrieved ? '是' : '否'}</dd></dl>
+            {step.retrieved_evidence?.length ? (
+              <div className="evidence-chain-claims">
+                <strong className="small">检索到的相关论断</strong>
+                {step.retrieved_evidence.map((evidence, index) => (
+                  <blockquote key={`${evidence.source_type}-${evidence.title}-${index}`}>
+                    <div className="row tight">
+                      <span className={`tag ${evidence.source_type === 'context' ? 'accent' : ''}`}>
+                        {evidence.source_type === 'context' ? 'Context' : '原文窗口'}
+                      </span>
+                      <span className="small muted">{evidence.title || '检索片段'}</span>
+                    </div>
+                    <div className="readable-text">{evidence.text || '（仅命中文档标题）'}</div>
+                  </blockquote>
+                ))}
+              </div>
+            ) : <div className="small muted" style={{ marginTop: 6 }}>未检索到可展示的相关论断。</div>}
+          </div>
+        })}
+      </div>
+    </section>
+  )
+}
+
 function SampleChain({
   evalId,
   sampleId,
+  attributionResult,
 }: {
   evalId: number
   sampleId: string
+  attributionResult?: AttributionResult
 }) {
   const { data, error, loading } = useAsync(
     () => api.evalSample(evalId, sampleId),
@@ -535,19 +591,7 @@ function SampleChain({
         </dd>
       </dl>
 
-      {data.judge_verdicts.length > 0 && (
-        <div className="row tight" style={{ marginTop: 8 }}>
-          {data.judge_verdicts.map((verdict) => (
-            <span
-              key={verdict.metric}
-              className={`tag ${verdict.failure_kind ? 'bad' : verdict.score === null ? '' : 'ok'}`}
-              title={verdict.failure_kind ?? JSON.stringify(verdict.detail)}
-            >
-              {verdict.metric} {verdict.failure_kind ?? verdict.score?.toFixed(2) ?? '无定义'}
-            </span>
-          ))}
-        </div>
-      )}
+      <EvidenceChainPanel evidence={attributionResult?.evidence?.evidence_chain} />
 
       <MetricInterpretations
         items={data.metric_interpretations}
@@ -555,17 +599,17 @@ function SampleChain({
       />
 
       <div className="full-chain-section">
-      <Collapsible title="完整链路">
-        <AttributionChain
-          question={question}
-          goldPages={goldPages}
-          response={data.response ?? {}}
-          goldDocIds={(data.detail.gold_doc_ids as string[] | undefined) ?? []}
-        />
-        <Collapsible title="完整响应">
-          <pre className="block tall">{JSON.stringify(data.response, null, 2)}</pre>
+        <Collapsible title="完整链路">
+          <AttributionChain
+            question={question}
+            goldPages={goldPages}
+            response={data.response ?? {}}
+            goldDocIds={(data.detail.gold_doc_ids as string[] | undefined) ?? []}
+          />
+          <Collapsible title="完整响应">
+            <pre className="block tall">{JSON.stringify(data.response, null, 2)}</pre>
+          </Collapsible>
         </Collapsible>
-      </Collapsible>
       </div>
 
       {data.judge_verdicts.length > 0 && (

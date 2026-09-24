@@ -22,7 +22,6 @@ import {
   usePoll,
 } from '../ui'
 
-/** 查询层：选一次编译的空间，配置查询参数，逐条跑 query。 */
 export function Query({
   activeCompile,
   activeQuery,
@@ -306,7 +305,6 @@ function Responses({ queryId }: { queryId: number }) {
     onOffsetChange: setOffset,
   })
 
-  // 完整响应覆盖整个列表框，带返回按钮。
   if (sampleId) {
     return (
       <div className="panel" style={{ marginTop: 14 }}>

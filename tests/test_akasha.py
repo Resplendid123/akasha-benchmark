@@ -55,7 +55,6 @@ CONFIGS = {
 
 
 class FakeClient:
-    """只实现阶段用到的那几个方法。"""
 
     def __init__(
         self,
@@ -72,9 +71,7 @@ class FakeClient:
         self.role = role
         self.accepted_runs = accepted_runs
         self.compile_submitted = False
-        # 逐页编译日志。闸门失败时阶段会读它问原因。
         self.page_log_items: list[dict[str, Any]] = page_log_items or []
-        # 编译 Run 明细，用于估算每篇耗时。
         self.run_items: list[dict[str, Any]] = (
             run_items
             if run_items is not None
@@ -88,7 +85,6 @@ class FakeClient:
             ]
         )
         self.configs = configs if configs is not None else CONFIGS
-        # query 时回哪些 page_id。空表示回空 retrievedSources（生成端拒答的形状）。
         self.retrieved = retrieved or []
         self.imported: list[str] = []
         self.quality: dict[str, Any] = {
@@ -188,15 +184,11 @@ def ready_connection(normalized):
     return normalized
 
 
-# ------------------------------------------------------------ 客户端契约
 
 
 def test_envelope_is_unwrapped_only_when_it_is_an_envelope():
-    """全局拦截器给每个端点套了 {data, success, status}。不剥会静默读空。"""
     assert unwrap_envelope({"data": {"id": 1}, "success": True, "status": 200}) == {"id": 1}
-    # login 的 handler 没有返回值，信封里没有 data 键。
     assert unwrap_envelope({"success": True, "status": 201}) is None
-    # 正常载荷里恰好有一个叫 data 的字段时不能动。
     payload = {"data": 1, "success": True, "status": 200, "extra": "x"}
     assert unwrap_envelope(payload) == payload
     assert unwrap_envelope([1, 2]) == [1, 2]
@@ -254,7 +246,6 @@ def test_clients_share_jwt_in_memory_and_from_local_cache(tmp_path, monkeypatch)
         for client in clients
     )
 
-    # 模拟进程重启：清空内存后仍从本地暂存读取，不再请求 login。
     akasha_client._AUTH_TOKENS.clear()
     restarted = AkashaClient(config)
     restarted._client.close()
@@ -362,7 +353,6 @@ def test_client_collects_failed_run_pages_across_pages(monkeypatch):
 
 
 def test_retryable_pages_use_latest_status_across_runs(monkeypatch):
-    """旧 Run 失败但新 Run 已成功的页面不能再次提交 retry-pages。"""
     client = AkashaClient(AkashaConfig())
     pages = {
         "original": [
@@ -433,11 +423,9 @@ def test_normalize_model_configs_is_order_stable():
     assert model_configs.normalize(CONFIGS) == model_configs.normalize(reversed_configs)
 
 
-# ------------------------------------------------------------ 编译闸门
 
 
 def test_compile_requires_owner(ready_connection, monkeypatch):
-    """非 owner 会在授权闸门静默丢弃 chunk，症状看起来像召回质量差。"""
     monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config, role="member"))
     ctx = context(ready_connection, {"datasets": ["hotpotqa"], "qa_limit": 2})
     with pytest.raises(RuntimeError, match="owner"):
@@ -445,7 +433,6 @@ def test_compile_requires_owner(ready_connection, monkeypatch):
 
 
 def test_compile_fails_when_quality_gate_reports_nothing(ready_connection, monkeypatch):
-    """四项计数取不到值时不算通过 —— all() 对空集合返回 True，那会让半成品过闸。"""
 
     def factory(config):
         client = FakeClient(config)
@@ -462,7 +449,6 @@ def test_compile_fails_when_quality_gate_reports_nothing(ready_connection, monke
 
 
 def test_compile_records_pace_estimate(ready_connection, monkeypatch):
-    """每篇耗时按 Run 墙钟时长 ÷ 页数估算。"""
 
     def factory(config):
         return FakeClient(
@@ -491,7 +477,6 @@ def test_compile_records_pace_estimate(ready_connection, monkeypatch):
 
 
 def test_compile_reports_page_failure_reason(ready_connection, monkeypatch):
-    """闸门只报后果，报错里要带上逐页日志给出的 errorCode。"""
     pages = [
         {
             "status": "failed",
@@ -516,7 +501,6 @@ def test_compile_reports_page_failure_reason(ready_connection, monkeypatch):
 
 
 def test_query_can_use_partially_successful_compile(ready_connection, monkeypatch):
-    """单篇失败不应封死同一空间里已经编译成功的其余语料。"""
 
     class Partial(FakeClient):
         def run_diagnostics(self, space_ids, *, limit=50):
@@ -570,7 +554,6 @@ def test_query_can_use_partially_successful_compile(ready_connection, monkeypatc
 
 
 def test_compile_fails_when_no_run_was_accepted(ready_connection, monkeypatch):
-    """一个编译 Run 都没有算没编译，不算编译好了（两者的 active 都是 0）。"""
 
     def factory(config):
         return FakeClient(config, accepted_runs=0, run_items=[])
@@ -585,7 +568,6 @@ def test_compile_fails_when_no_run_was_accepted(ready_connection, monkeypatch):
 
 
 def test_compile_waits_when_runs_are_still_active(ready_connection, monkeypatch):
-    """有 Run 在跑就得等 —— 别把「进行中」当成「没有 Run」提前放行。"""
     seen: list[dict[str, int]] = []
 
     class Slow(FakeClient):
@@ -615,10 +597,8 @@ def test_compile_waits_when_runs_are_still_active(ready_connection, monkeypatch)
 
 
 def test_compile_progress_uses_current_run_not_space_history(ready_connection, monkeypatch):
-    """同一空间有历史 Run 时，进度与节奏只统计本次新 Run。"""
     from akasha_benchmark.config import AkashaConfig
     monkeypatch.setattr(compile, "POLL_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(compile, "POLL_TIMEOUT_SECONDS", 1)
 
     class Runs(FakeClient):
         def __init__(self, config):
@@ -856,10 +836,8 @@ def test_retry_batches_reject_inconsistent_remote_run_count(ready_connection):
 def test_compile_does_not_finish_on_historical_run_before_new_run_appears(
     ready_connection, monkeypatch
 ):
-    """accepted Run 尚未出现在诊断列表时，不能拿历史 succeeded 冒充本次完成。"""
     from akasha_benchmark.config import AkashaConfig
     monkeypatch.setattr(compile, "POLL_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(compile, "POLL_TIMEOUT_SECONDS", 1)
 
     class Delayed(FakeClient):
         def __init__(self, config):
@@ -1311,7 +1289,6 @@ def test_compile_retries_then_pauses_and_resume_only_imports_pending(
     assert compile_calls == 1
 
 
-# ------------------------------------------------------------ 查询闸门
 
 
 def _compiled(connection, monkeypatch) -> int:
@@ -1323,7 +1300,6 @@ def _compiled(connection, monkeypatch) -> int:
 
 
 def test_query_blocks_embedding_model_change(ready_connection, monkeypatch):
-    """查询 embedding 与索引 embedding 不一致时必须重新编译。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     changed = {
         "configs": [
@@ -1343,7 +1319,6 @@ def test_query_blocks_embedding_model_change(ready_connection, monkeypatch):
 def test_query_allows_endpoint_and_other_config_changes(
     ready_connection, monkeypatch
 ):
-    """compiler、answer、image 变化可形成新查询；embedding 必须保持一致。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     changed = {
         "configs": [
@@ -1443,14 +1418,11 @@ def test_query_refuses_on_workspace_mismatch(ready_connection, monkeypatch):
     monkeypatch.setattr(query, "AkashaClient", lambda config: OtherWorkspace(config))
     with pytest.raises(RuntimeError, match="workspace"):
         execute(query.run, context(ready_connection, {"compile_id": compile_id}))
-    # 拒绝执行时不该留下一条查询记录。
     assert query_store.list_query_runs(ready_connection, compile_id) == []
 
 
 def test_compile_resume_refuses_on_workspace_mismatch(ready_connection, monkeypatch):
-    """续跑往一个解析不到的空间导入，会让已记下的 page_id 全部失效。"""
     compile_id = _compiled(ready_connection, monkeypatch)
-    # 造一篇没导入成功的文档，让续跑确实有活要干。
     ready_connection.execute(
         "UPDATE compile_doc SET page_id = NULL WHERE compile_id = ?", (compile_id,)
     )
@@ -1473,18 +1445,18 @@ def test_compile_resume_refuses_on_workspace_mismatch(ready_connection, monkeypa
     monkeypatch.setattr(compile, "AkashaClient", factory)
     with pytest.raises(RuntimeError, match="workspace"):
         execute(compile.run, context(ready_connection, {}, task_id=1))
-    # 必须在发出任何写入之前拦住。
     assert clients[-1].imported == []
 
 
-def test_workspace_mismatch_tolerates_missing_record(ready_connection, monkeypatch):
-    """编译时没记下 workspace（历史数据）时不拦：没有可比的东西。"""
+def test_workspace_mismatch_rejects_missing_record(ready_connection, monkeypatch):
     compile_id = _compiled(ready_connection, monkeypatch)
     ready_connection.execute(
         "UPDATE compile_run SET workspace_id = NULL WHERE id = ?", (compile_id,)
     )
     ready_connection.commit()
-    assert compile_store.workspace_mismatch(ready_connection, compile_id, "w-other") is None
+    assert "没有记录 workspace" in compile_store.workspace_mismatch(
+        ready_connection, compile_id, "w-other"
+    )
 
 
 def test_query_refuses_unready_compile(ready_connection, monkeypatch):
@@ -1522,7 +1494,6 @@ def test_query_records_responses_and_resumes(ready_connection, monkeypatch):
     assert len(responses) == 2
     assert all(r["answer_mode"] == "knowledge" for r in responses)
 
-    # 续跑：已有响应的样本不再发请求。
     execute(query.run, ctx)
     assert clients[-1].queries == []
 
@@ -1571,7 +1542,6 @@ def test_query_refuses_embedding_drift_from_compile_snapshot(ready_connection, m
 
 
 def test_query_uses_frozen_selection(ready_connection, monkeypatch):
-    """固化选择让续跑不受后续抽样改动影响。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     monkeypatch.setattr(query, "AkashaClient", lambda config: FakeClient(config))
     execute(
@@ -1601,7 +1571,6 @@ def test_query_rejects_name_from_another_compile(ready_connection, monkeypatch):
 
 
 def test_compile_snapshot_is_frozen_on_the_run(ready_connection, monkeypatch):
-    """run_id 上固化模型快照 —— 查询前拿现在的配置与它比对靠这一份。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     run = compile_store.get_compile_run(ready_connection, compile_id)
     assert run["model_configs_json"] == dumps(CONFIGS)
@@ -1638,7 +1607,6 @@ def test_compile_resume_keeps_resolved_defaults(ready_connection, monkeypatch):
     execute(compile.run, ctx)
     original = task_store.get_task(ready_connection, ctx.task_id)
     monkeypatch.setattr(compile, "default_seed", lambda: 99)
-    # 传入新参数也不能改变原任务的配置。
     resumed = context(ready_connection, {"seed": 99, "qa_limit": 1}, task_id=ctx.task_id)
     execute(compile.run, resumed)
     task = task_store.get_task(ready_connection, ctx.task_id)

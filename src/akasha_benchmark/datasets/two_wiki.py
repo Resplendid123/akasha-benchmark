@@ -21,7 +21,6 @@ SENTENCE_JOINER = " "
 
 class TwoWikiMultihopQAAdapter(DatasetAdapter):
     name: ClassVar[str] = "2wikimultihopqa"
-    aliases: ClassVar[tuple[str, ...]] = ("2wiki", "twowiki", "2wikimultihop", "two_wiki")
     qa_filename: ClassVar[str] = "2wikimultihopqa.json"
     corpus_filename: ClassVar[str] = "2wikimultihopqa_corpus.json"
     provides: ClassVar[frozenset[DataDependency]] = frozenset(

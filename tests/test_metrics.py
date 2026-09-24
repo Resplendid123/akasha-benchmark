@@ -15,7 +15,6 @@ from akasha_benchmark.metrics import multihop, qa, registry, retrieval
 
 
 def test_unmapped_pages_keep_their_rank():
-    """丢掉未映射的 page 会让后面的结果整体前移，把对排名敏感的指标都算高。"""
     retrieved = [{"sourcePageId": "unknown"}, {"sourcePageId": "p1"}]
     ranked = retrieval.ranked_doc_ids(retrieved, {"p1": "d1"})
     assert len(ranked) == 2
@@ -25,12 +24,20 @@ def test_unmapped_pages_keep_their_rank():
 
 
 def test_full_coverage_differs_from_recall():
-    """多跳少一跳就答不对，所以「凑齐全部 gold」比 recall 均值更贴近实际需求。"""
     ranked = ["d1", "x"]
     gold = ["d1", "d2"]
     assert retrieval.recall_at_k(ranked, gold, 2) == pytest.approx(0.5)
     assert retrieval.full_coverage(ranked, gold, 2) == pytest.approx(0.0)
     assert retrieval.full_coverage(["d1", "d2"], gold, 2) == pytest.approx(1.0)
+
+
+def test_retrieval_precision_and_f1_at_k_use_actual_result_count():
+    ranked = ["d1", "other"]
+    gold = ["d1", "d2"]
+    assert retrieval.precision_at_k(ranked, gold, 5) == pytest.approx(0.5)
+    assert retrieval.recall_at_k(ranked, gold, 5) == pytest.approx(0.5)
+    assert retrieval.retrieval_f1_at_k(ranked, gold, 5) == pytest.approx(0.5)
+    assert retrieval.precision_at_k([], gold, 5) == 0.0
 
 
 def test_ndcg_rewards_earlier_gold():
@@ -41,46 +48,32 @@ def test_ndcg_rewards_earlier_gold():
 
 
 def test_retrieval_refuses_without_gold():
-    """没有 gold 时拒绝计算，不返回 0.0。"""
     with pytest.raises(ValueError):
         retrieval.recall_at_k(["d1"], [], 2)
 
 
 def test_registry_gate_is_set_comparison():
-    """判据是 provides 与 requires 的集合比对，不是数据集名字。"""
     gold = frozenset({DataDependency.GOLD_DOCS, DataDependency.REFERENCE_ANSWERS})
     assert registry.require("hotpotqa", gold, "recall").name == "recall"
     with pytest.raises(DependencyError):
         registry.require("narrativeqa", frozenset({DataDependency.REFERENCE_ANSWERS}), "recall")
-    # faithfulness 的依赖是空集，所以它对任何数据集都成立。
     assert registry.require("narrativeqa", frozenset(), "faithfulness").kind == "judge"
 
 
-def test_truncation_loss_separates_retrieval_from_citation():
-    """召回到了但没被引用 —— 那是引用过滤太严，不是检索没找到。要调的地方不同。"""
+def test_uncited_documents_separate_retrieval_from_citation():
     page_to_doc = {"p1": "gold", "p2": "other"}
     result = citation.evaluate_sample(
         citations=[{"sourcePageId": "p2"}],
         retrieved=[{"sourcePageId": "p1"}, {"sourcePageId": "p2"}],
-        citation_evidence=[{"excerpts": ["x"]}],
         gold=["gold"],
         page_to_doc=page_to_doc,
     )
-    assert result["truncation_loss"] == pytest.approx(1.0)
-    assert result["truncated_gold"] == pytest.approx(1.0)
+    assert result["uncited_count"] == pytest.approx(1.0)
+    assert result["uncited_gold_count"] == pytest.approx(1.0)
     assert result["citation_recall"] == pytest.approx(0.0)
-    assert "evidence_verifiable_rate" not in result
-    assert "evidence_verifiable_rate" not in registry.METRIC_REGISTRY
-    assert "citation_count" not in result
-    assert "citation_count" not in registry.METRIC_REGISTRY
-    assert "retrieved_count" not in result
-    assert "retrieved_count" not in registry.METRIC_REGISTRY
-    assert "evidence_entries" not in result
-    assert "evidence_entries" not in registry.METRIC_REGISTRY
 
 
 def test_graph_exclusive_gold_is_net_contribution():
-    """图扩展的净价值 = 只有它才拿到的 gold，不含语义召回本来就能找到的。"""
     page_to_doc = {"p1": "g1", "p2": "g2"}
     snippets = [
         {"retrievalReasons": ["semantic"], "sourceWindows": [{"sourcePageId": "p1"}]},
@@ -88,14 +81,6 @@ def test_graph_exclusive_gold_is_net_contribution():
     ]
     result = multihop.evaluate_sample(snippets, ["g1", "g2"], page_to_doc)
     assert result["graph_exclusive_gold_share"] == pytest.approx(0.5)
-    assert "graph_exclusive_gold_count" not in result
-    assert "graph_exclusive_gold_count" not in registry.METRIC_REGISTRY
-    assert "graph_neighbor_share" not in result
-    assert "graph_neighbor_share" not in registry.METRIC_REGISTRY
-    assert "snippet_count" not in result
-    assert "snippet_count" not in registry.METRIC_REGISTRY
-    assert "graph_neighbor_snippets" not in result
-    assert "graph_neighbor_snippets" not in registry.METRIC_REGISTRY
 
 
 def test_direct_and_graph_hit_is_not_graph_exclusive():
@@ -153,9 +138,9 @@ def test_answer_mode_distribution():
 
 def test_sample_metric_interpretations_explain_values_with_sample_counts():
     rows = interpret_sample_metrics(
-        ["recall", "mrr", "truncated_gold", "faithfulness"],
+        ["recall", "mrr", "uncited_gold_count", "faithfulness"],
         [5],
-        {"recall@5": 0.5, "mrr": 0.5, "truncated_gold": 1.0, "faithfulness": 2 / 3},
+        {"recall@5": 0.5, "mrr": 0.5, "uncited_gold_count": 1.0, "faithfulness": 2 / 3},
         {"gold_doc_ids": ["g1", "g2"]},
         [
             {
@@ -170,7 +155,7 @@ def test_sample_metric_interpretations_explain_values_with_sample_counts():
     by_name = {row["name"]: row for row in rows}
     assert by_name["recall@5"]["reason"] == "前 5 条检索结果命中 1/2 篇 gold 文档。"
     assert by_name["mrr"]["reason"] == "首个 gold 文档约位于第 2 名。"
-    assert by_name["truncated_gold"]["status"] == "bad"
+    assert by_name["uncited_gold_count"]["status"] == "bad"
     assert by_name["faithfulness"]["reason"] == "2/3 条事实陈述有检索证据支持。"
 
 
@@ -230,7 +215,6 @@ def test_every_registered_metric_has_structured_evidence_and_formula():
     assert all(row.get("formula") for row in evidence.values())
 
 
-# ------------------------------------------------------------ 归因判据
 
 
 def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
@@ -242,15 +226,23 @@ def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
     }
 
 
-def test_correct_answer_is_not_a_failure():
-    """全量归因包含正确答案，应排除这些样本的失败归因。"""
-    # 检索一条 gold 都没命中，但答案 EM 命中：系统没依赖那篇 gold。
+def test_correct_answer_has_an_explicit_root_cause():
     ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 1.0}), [])
-    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+    assert ruling["root_cause"] == attribution.CAUSE_ANSWER_CORRECT
+
+
+def test_answer_correct_uses_reference_token_coverage():
+    sample = _sample({"hit@5": 1.0}, mode="knowledge")
+    sample["answer"] = "You would not see the Brooklyn Nets play there."
+    sample["detail"]["reference_answers"] = ["Brooklyn Nets"]
+    assert attribution.classify(sample, []) ["root_cause"] == attribution.CAUSE_ANSWER_CORRECT
+
+    sample["answer"] = "This is a complete explanation."
+    sample["detail"]["reference_answers"] = ["in"]
+    assert attribution.classify(sample, []) ["root_cause"] == attribution.CAUSE_ANSWER_INCORRECT
 
 
 def test_rule_attribution_ignores_judge_metrics():
-    """规则归因不能因评测是否配置 Judge 而改变。"""
     ruling = attribution.classify(
         _sample(
             {
@@ -267,33 +259,31 @@ def test_rule_attribution_ignores_judge_metrics():
     assert "faithfulness" not in ruling["evidence"]
 
 
-def test_not_a_failure_outranks_every_failure_cause():
-    """答案明确正确时，不再追究回答模式、检索或引用信号。"""
+def test_answer_correct_outranks_every_failure_cause():
     for metrics, lineage, mode in (
         ({"hit@5": 0.0, "em": 1.0}, [{"question_terms_lost": ["grammy"]}], "knowledge"),
-        ({"hit@5": 0.0, "em": 1.0, "truncated_gold": 1.0}, [], "knowledge"),
+        ({"hit@5": 0.0, "em": 1.0, "uncited_gold_count": 1.0}, [], "knowledge"),
         ({"hit@5": 0.0, "em": 1.0}, None, "general"),
     ):
         ruling = attribution.classify(_sample(metrics, mode=mode), lineage)
-        assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+        expected = attribution.CAUSE_GENERATION_FALLBACK if mode == "general" else attribution.CAUSE_ANSWER_CORRECT
+        assert ruling["root_cause"] == expected
 
 
-def test_correct_general_answer_is_not_a_failure():
-    """general 回答明确正确时，同样优先归入正常样本。"""
+def test_correct_general_answer_is_answer_correct():
     em_hit = attribution.classify(
         _sample({"hit@5": 1.0, "em": 1.0}, mode="general"), None
     )
-    assert em_hit["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+    assert em_hit["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
 
     contained = _sample({"hit@5": 1.0, "em": 0.0}, mode="general")
     contained["answer"] = "The answer is Rita Moreno."
     contained["detail"]["reference_answers"] = ["Rita Moreno"]
     ruling = attribution.classify(contained, None)
-    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
 
 
-def test_fully_supported_answer_is_not_a_failure_even_with_long_context():
-    """解释性答案完整包含参考答案时，不应因严格 EM 落到 unknown。"""
+def test_fully_supported_answer_is_correct_even_with_long_context():
     sample = _sample(
         {
             "em": 0.0,
@@ -301,7 +291,7 @@ def test_fully_supported_answer_is_not_a_failure_even_with_long_context():
             "faithfulness": 1.0,
             "hit@5": 1.0,
             "full_coverage@5": 1.0,
-            "truncated_gold": 1.0,
+            "uncited_gold_count": 1.0,
         }
     )
     sample["answer"] = (
@@ -310,16 +300,16 @@ def test_fully_supported_answer_is_not_a_failure_even_with_long_context():
     )
     sample["detail"]["reference_answers"] = ["the Allies and Nazi Germany"]
     ruling = attribution.classify(sample, [])
-    assert ruling["root_cause"] == attribution.CAUSE_NOT_A_FAILURE
+    assert ruling["root_cause"] == attribution.CAUSE_ANSWER_CORRECT
     assert ruling["evidence"]["reference_answer_contained"] is True
 
 
 @pytest.mark.parametrize(
     "metrics,expected",
     [
-        ({"faithfulness": 1.0, "hit@5": 1.0, "full_coverage@5": 1.0}, attribution.CAUSE_UNKNOWN),
+        ({"faithfulness": 1.0, "hit@5": 1.0, "full_coverage@5": 1.0}, attribution.CAUSE_ANSWER_INCORRECT),
         ({"hit@5": 0.0, "em": 0.0, "f1": 0.9}, attribution.CAUSE_RETRIEVAL_MISS),
-        ({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}, attribution.CAUSE_UNKNOWN),
+        ({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}, attribution.CAUSE_ANSWER_INCORRECT),
     ],
 )
 def test_weak_answer_metrics_do_not_drive_rule_attribution(metrics, expected):
@@ -329,7 +319,6 @@ def test_weak_answer_metrics_do_not_drive_rule_attribution(metrics, expected):
 
 
 def test_fallback_is_judged_before_retrieval():
-    """生成端兜底必须最先判，否则它的检索信号会被解释成检索失败。"""
     ruling = attribution.classify(_sample({"hit@5": 0.0}, mode="general"), None)
     assert ruling["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
 
@@ -340,7 +329,6 @@ def test_compiled_away_needs_lineage():
         attribution.classify(_sample({"hit@5": 0.0}), lineage)["root_cause"]
         == attribution.CAUSE_COMPILED_AWAY
     )
-    # 链路不可用时判不了 compiled_away，退到 retrieval_miss 并记下这一点。
     ruling = attribution.classify(_sample({"hit@5": 0.0}), None)
     assert ruling["root_cause"] == attribution.CAUSE_RETRIEVAL_MISS
     assert ruling["evidence"]["lineage_available"] is False
@@ -352,7 +340,7 @@ def test_compiled_away_requires_a_complete_retrieval_miss():
     fully_retrieved = attribution.classify(
         _sample({"hit@10": 1.0, "full_coverage@10": 1.0}), lineage
     )
-    assert fully_retrieved["root_cause"] == attribution.CAUSE_UNKNOWN
+    assert fully_retrieved["root_cause"] == attribution.CAUSE_ANSWER_INCORRECT
 
     partially_retrieved = attribution.classify(
         _sample({"hit@10": 1.0, "full_coverage@10": 0.0}), lineage
@@ -360,13 +348,13 @@ def test_compiled_away_requires_a_complete_retrieval_miss():
     assert partially_retrieved["root_cause"] != attribution.CAUSE_COMPILED_AWAY
 
 
-def test_citation_drop_outranks_lost_question_terms():
+def test_uncited_gold_outranks_lost_question_terms():
     ruling = attribution.classify(
         _sample(
             {
                 "hit@10": 1.0,
                 "full_coverage@10": 1.0,
-                "truncated_gold": 1.0,
+                "uncited_gold_count": 1.0,
             }
         ),
         [{"question_terms_lost": ["access"]}],
@@ -374,8 +362,8 @@ def test_citation_drop_outranks_lost_question_terms():
     assert ruling["root_cause"] == attribution.CAUSE_CITATION_DROPPED
 
 
-def test_citation_dropped_outranks_retrieval_miss():
-    ruling = attribution.classify(_sample({"hit@5": 0.0, "truncated_gold": 1.0}), [])
+def test_uncited_gold_outranks_retrieval_miss():
+    ruling = attribution.classify(_sample({"hit@5": 0.0, "uncited_gold_count": 1.0}), [])
     assert ruling["root_cause"] == attribution.CAUSE_CITATION_DROPPED
 
 
@@ -388,13 +376,132 @@ def test_graph_edge_missing_when_coverage_incomplete():
 
 def test_general_with_retrieval_is_not_classified_as_no_evidence_fallback():
     ruling = attribution.classify(
-        _sample({"hit@5": 1.0, "full_coverage@5": 1.0}, mode="general"), []
+        _sample({"hit@5": 1.0, "recall@5": 1.0, "full_coverage@5": 1.0}, mode="general"), []
     )
     assert ruling["root_cause"] == attribution.CAUSE_GENERATION_IGNORED_RETRIEVAL
+
+def test_general_partial_recall_is_evidence_incomplete():
+    ruling = attribution.classify(
+        _sample({"hit@5": 1.0, "recall@5": 0.5}, mode="general"), []
+    )
+    assert ruling["root_cause"] == attribution.CAUSE_RETRIEVAL_EVIDENCE_INCOMPLETE
 
 
 def test_general_retrieval_uses_full_detail_when_hit_metric_was_not_selected():
     sample = _sample({}, mode="general")
-    sample["detail"]["retrieval"] = {"hit@5": 1.0, "full_coverage@5": 1.0}
+    sample["detail"]["retrieval"] = {"hit@5": 1.0, "recall@5": 1.0, "full_coverage@5": 1.0}
     ruling = attribution.classify(sample, [])
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_IGNORED_RETRIEVAL
+
+
+def test_musique_evidence_chain_marks_complete_context_as_false_negative_candidate():
+    sample = _sample({"hit@10": 1.0}, mode="general")
+    sample["dataset"] = "musique"
+    sample["detail"]["metadata"] = {
+        "question_decomposition": [
+            {
+                "id": 1,
+                "question": "Who made X?",
+                "answer": "Acme",
+                "support_doc_id": "d1",
+                "support_title": "X",
+                "support_text": "X was made by Acme in 2020.",
+            },
+            {
+                "id": 2,
+                "question": "When?",
+                "answer": "2020",
+                "support_doc_id": "d2",
+                "support_title": "X history",
+                "support_text": "X was made by Acme in 2020.",
+            },
+        ]
+    }
+    response = {
+        "answerMode": "general",
+        "snippets": [
+            {
+                "title": "X",
+                "text": "X was made by Acme in 2020.",
+                "sourceWindows": [
+                    {"title": "X", "text": "X was made by Acme in 2020."},
+                ],
+            }
+        ],
+    }
+    chain = attribution.analyze_evidence_chain(sample, response)
+    assert chain["status"] == "complete"
+    assert chain["model_false_negative_candidate"] is True
+    assert all(step["status"] == "supported" for step in chain["steps"])
+    assert all(step["claim_retrieved"] for step in chain["steps"])
+    assert chain["steps"][0]["retrieved_evidence"]
+    assert {row["source_type"] for row in chain["steps"][0]["retrieved_evidence"]} == {
+        "context",
+        "source_window",
+    }
+
+
+def test_musique_evidence_chain_marks_missing_step():
+    sample = _sample({}, mode="general")
+    sample["dataset"] = "musique"
+    sample["detail"]["metadata"] = {
+        "question_decomposition": [
+            {
+                "answer": "Acme",
+                "support_title": "X",
+                "support_text": "X was made by Acme.",
+            },
+            {
+                "answer": "2020",
+                "support_title": "X history",
+                "support_text": "The year was 2020.",
+            },
+        ]
+    }
+    chain = attribution.analyze_evidence_chain(
+        sample,
+        {"snippets": [{"title": "X", "text": "X was made by Acme."}]},
+    )
+    assert chain["status"] == "incomplete"
+    assert chain["missing_step_count"] == 1
+    assert chain["steps"][1]["claim_retrieved"] is False
+
+
+def test_evidence_chain_does_not_treat_retrieved_source_title_as_claim():
+    sample = _sample({}, mode="general")
+    sample["dataset"] = "musique"
+    sample["detail"]["metadata"] = {
+        "question_decomposition": [
+            {"answer": "Acme", "support_title": "X", "support_text": "X was made by Acme."}
+        ]
+    }
+    chain = attribution.analyze_evidence_chain(
+        sample,
+        {"retrievedSources": [{"title": "X was made by Acme."}]},
+    )
+    assert chain["steps"][0]["claim_retrieved"] is False
+
+
+def test_general_routing_uses_evidence_chain_before_answer_correctness():
+    sample = _sample({"hit@10": 1.0, "em": 0.0}, mode="general")
+    sample["dataset"] = "musique"
+    sample["answer"] = "The answer is Acme."
+    sample["detail"]["reference_answers"] = ["Acme"]
+    incomplete = {
+        "status": "partial",
+        "steps": [],
+    }
+    ruling = attribution.classify(sample, [], incomplete)
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
+    assert ruling["evidence"]["answer_correct"] is True
+
+
+def test_general_complete_evidence_is_generation_ignored_retrieval():
+    sample = _sample({"hit@10": 1.0, "recall@10": 1.0}, mode="general")
+    sample["dataset"] = "musique"
+    ruling = attribution.classify(
+        sample,
+        [],
+        {"status": "complete", "steps": []},
+    )
     assert ruling["root_cause"] == attribution.CAUSE_GENERATION_IGNORED_RETRIEVAL

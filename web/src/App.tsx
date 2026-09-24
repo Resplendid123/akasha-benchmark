@@ -9,7 +9,6 @@ import { Settings } from './views/Settings'
 import { Tasks } from './views/Tasks'
 import { Testing } from './views/Testing'
 
-// 顺序即流水线顺序。
 const LAYERS = [
   { key: 'datasets', step: '1', label: '数据集', hint: '下载与校验原始数据' },
   { key: 'normalize', step: '2', label: '归一化', hint: '入 SQLite，不入 Akasha' },

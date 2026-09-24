@@ -48,8 +48,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def require_token(request: Request, call_next):  # type: ignore[no-untyped-def]
         """设了令牌就逐请求校验。``compare_digest`` 避免时序泄露。"""
         token = request.app.state.settings.auth_token
-        # 浏览器的 CORS 预检不会携带业务令牌，交给 CORSMiddleware 校验
-        # Origin、方法和请求头；真正的 API 请求仍必须通过下方鉴权。
+        # CORS 预检不校验业务令牌。
         if token and request.method != "OPTIONS":
             provided = request.headers.get("X-Auth-Token", "")
             if not secrets.compare_digest(provided, token):

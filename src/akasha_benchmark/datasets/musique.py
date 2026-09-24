@@ -41,7 +41,6 @@ def hop_count(prefix: str) -> int:
 
 class MusiqueAdapter(DatasetAdapter):
     name: ClassVar[str] = "musique"
-    aliases: ClassVar[tuple[str, ...]] = ("musique_ans", "musique-ans")
     qa_filename: ClassVar[str] = "musique.json"
     corpus_filename: ClassVar[str] = "musique_corpus.json"
     provides: ClassVar[frozenset[DataDependency]] = frozenset(
@@ -69,6 +68,7 @@ class MusiqueAdapter(DatasetAdapter):
 
         gold_ids: dict[str, None] = {}
         ambiguous_titles = 0
+        support_doc_ids: dict[int, str] = {}
         for para in paragraphs:
             if not para.get("is_supporting"):
                 continue
@@ -81,6 +81,7 @@ class MusiqueAdapter(DatasetAdapter):
             if len(corpus.title_to_ids.get(title, ())) > 1:
                 ambiguous_titles += 1
             gold_ids.setdefault(doc_id, None)
+            support_doc_ids[int(para["idx"])] = doc_id
 
         if not gold_ids:
             raise ValueError(f"{self.name}: row {row_index} has no is_supporting paragraph")
@@ -92,6 +93,23 @@ class MusiqueAdapter(DatasetAdapter):
                 answers.setdefault(alias, None)
 
         prefix = hop_prefix(native_id)
+        decomposition = []
+        for step in row.get("question_decomposition") or []:
+            support_idx = step.get("paragraph_support_idx")
+            support = (
+                paragraphs[support_idx]
+                if isinstance(support_idx, int) and 0 <= support_idx < len(paragraphs)
+                else None
+            )
+            decomposition.append(
+                {
+                    "id": step.get("id"),
+                    "question": step.get("question"),
+                    "answer": step.get("answer"),
+                    "support_doc_id": support_doc_ids.get(support_idx),
+                    "support_title": support.get("title") if support else None,
+                }
+            )
         return CanonicalSample(
             dataset=self.name,
             sample_id=make_sample_id(self.name, native_id),
@@ -107,5 +125,6 @@ class MusiqueAdapter(DatasetAdapter):
                 "alias_count": len(answers) - 1,
                 "decomposition_steps": len(row.get("question_decomposition") or []),
                 "gold_with_ambiguous_title": ambiguous_titles,
+                "question_decomposition": decomposition,
             },
         )

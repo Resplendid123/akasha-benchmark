@@ -16,11 +16,6 @@ from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample
 
 class NarrativeQAAdapter(DatasetAdapter):
     name: ClassVar[str] = "narrativeqa"
-    aliases: ClassVar[tuple[str, ...]] = (
-        "narrative_qa",
-        "narrativeqa_dev_10_doc",
-        "narrativeqa_dev",
-    )
     qa_filename: ClassVar[str] = "narrativeqa.json"
     corpus_filename: ClassVar[str] = "narrativeqa_corpus.json"
     provides: ClassVar[frozenset[DataDependency]] = frozenset({DataDependency.REFERENCE_ANSWERS})

@@ -15,7 +15,6 @@ SENTENCE_JOINER = ""
 
 class HotpotQAAdapter(DatasetAdapter):
     name: ClassVar[str] = "hotpotqa"
-    aliases: ClassVar[tuple[str, ...]] = ("hotpot", "hotpot_qa", "hotpotqa_dev")
     qa_filename: ClassVar[str] = "hotpotqa.json"
     corpus_filename: ClassVar[str] = "hotpotqa_corpus.json"
     provides: ClassVar[frozenset[DataDependency]] = frozenset(
@@ -50,9 +49,7 @@ class HotpotQAAdapter(DatasetAdapter):
             metadata={
                 "type": row.get("type"),
                 "level": row.get("level"),
-                # 去重后的 gold 篇数；本集实测恒为 2。
                 "gold_count": len(gold_doc_ids),
-                # 去重前的支撑句条数，与 gold_count 的差值即句子级冗余。
                 "supporting_fact_count": len(row["supporting_facts"]),
             },
         )

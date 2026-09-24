@@ -21,7 +21,6 @@ import {
   usePoll,
 } from '../ui'
 
-/** 当天日期作为种子初值，与后端 default_seed() 一致。 */
 function todaySeed(): number {
   const now = new Date()
   const month = `${now.getMonth() + 1}`.padStart(2, '0')
@@ -29,7 +28,6 @@ function todaySeed(): number {
   return Number(`${now.getFullYear()}${month}${day}`)
 }
 
-/** 编译层：抽子集 + 入 Akasha 库。一次编译一个随机创建的空间。 */
 export function Compile({
   activeCompile,
   onSelect,
@@ -113,7 +111,6 @@ export function Compile({
                     {num(run.compiled_pages)}
                   </td>
                   <td>
-                    {/* 每篇耗时是估算，不是实测。 */}
                     <Timing
                       startedAt={run.created_at}
                       finishedAt={run.finished_at}
@@ -468,7 +465,6 @@ function CompileDetail({ run }: { run: CompileRun }) {
   )
 }
 
-/** 原文 vs 编译产物并排。编译产物才是被检索的文本。 */
 export function LineageView({
   pageId,
   question = '',
@@ -478,6 +474,7 @@ export function LineageView({
   question?: string
   title?: string
 }) {
+  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null)
   const { data, error, loading } = useAsync(
     () => api.lineage(pageId, question),
     [pageId, question],
@@ -487,10 +484,16 @@ export function LineageView({
   if (error) return <Failed error={error} />
   if (!data) return null
 
+  const selectedArtifact = data.artifacts.find((artifact) => artifact.id === selectedArtifactId)
+  const compiledChunks = selectedArtifactId
+    ? data.chunks.filter((chunk) => chunk.knowledge_page_id === selectedArtifactId)
+    : data.chunks
+
   return (
     <div className="panel flat" style={{ marginTop: 12 }}>
       <div className={title ? 'small muted' : 'note plain small'}>
         {title && <><strong>{title}</strong> · </>}
+        {selectedArtifact && <>当前 artifact：<strong>{selectedArtifact.title || selectedArtifact.id}</strong> · </>}
         编译扩写比 {data.diff.expansion_ratio?.toFixed(2) ?? '—'}，
         实词留存 {data.diff.retention ? `${(data.diff.retention * 100).toFixed(1)}%` : '—'}，
         编译丢掉的实词 {data.diff.dropped_total} 个。
@@ -524,15 +527,26 @@ export function LineageView({
           {data.artifacts.length > 0 && (
             <div className="row tight" style={{ marginBottom: 6 }}>
               {data.artifacts.map((a, i) => (
-                <span key={i} className="tag accent">
+                <button
+                  key={a.id || i}
+                  className={`tag accent${selectedArtifactId === a.id ? ' selected' : ''}`}
+                  type="button"
+                  onClick={() => setSelectedArtifactId(a.id)}
+                  title="切换到该编译产物"
+                >
                   {a.title || '（无标题）'}
                   {a.page_type && <span className="muted"> · {a.page_type}</span>}
-                </span>
+                </button>
               ))}
+              {selectedArtifactId && (
+                <button className="tag" type="button" onClick={() => setSelectedArtifactId(null)}>
+                  显示全部
+                </button>
+              )}
             </div>
           )}
           <ChunkPager
-            items={data.chunks.map((c) => ({
+            items={compiledChunks.map((c) => ({
               text: c.text,
               label: [c.title, c.chunk_role].filter(Boolean).join(' · '),
             }))}
@@ -554,7 +568,6 @@ export function LineageView({
   )
 }
 
-/** 逐块翻页展示。一页一块，块上方标注它的 artifact / 角色。 */
 function ChunkPager({ items, empty }: { items: { text: string; label?: string }[]; empty: string }) {
   const [i, setI] = useState(0)
   if (items.length === 0) return <p className="small muted">{empty}</p>

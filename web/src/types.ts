@@ -51,8 +51,6 @@ export interface TaskTree {
   unlinked_tasks: Task[]
 }
 
-// --- 配置 ---
-
 export interface Connection {
   base_url: string
   email: string
@@ -84,7 +82,7 @@ export interface ModelConfig {
 
 export interface ModelConfigsView {
   features: string[]
-  live: { configs?: ModelConfig[] } | ModelConfig[]
+  live: { configs: ModelConfig[] }
   compiles: { id: number; run_id: string; drift: Record<string, boolean> }[]
 }
 
@@ -125,8 +123,6 @@ export interface ProviderProbe {
   detail: string | null
   provider: { base_url: string; model: string; api_key_set: boolean }
 }
-
-// --- 数据集层与归一化层 ---
 
 export interface DatasetFile {
   dataset: string
@@ -193,8 +189,6 @@ export interface RawSamples extends Paged {
   rows: Record<string, unknown>[]
 }
 
-// --- 指标 ---
-
 export interface MetricDefinition {
   name: string
   family: string
@@ -211,8 +205,6 @@ export interface MetricsView {
   computable_for_all: string[]
   computable_for_some: string[]
 }
-
-// --- 编译 / 查询 / 评测 / 归因 ---
 
 export interface AttributionRun {
   id: number
@@ -498,7 +490,6 @@ export interface JudgeVerdict {
   detail: Record<string, unknown> | null
 }
 
-/** 响应体里检索回来的一条 chunk。 */
 export interface Snippet {
   title?: string
   text?: string
@@ -508,9 +499,11 @@ export interface Snippet {
 }
 
 export type RootCause =
-  | 'not_a_failure'
+  | 'answer_incorrect'
+  | 'answer_correct'
   | 'generation_ignored_retrieval'
   | 'generation_fallback'
+  | 'retrieval_evidence_incomplete'
   | 'compiled_away'
   | 'citation_dropped'
   | 'retrieval_miss'
@@ -522,6 +515,36 @@ export interface AttributionResult {
   dataset: string
   root_cause: RootCause
   evidence: Record<string, unknown>
+}
+
+export interface EvidenceChainStep {
+  position: number
+  question?: string
+  answer?: string
+  support_doc_id?: string
+  support_title?: string
+  status: 'supported' | 'partial' | 'missing' | string
+  answer_present?: boolean
+  support_title_present?: boolean
+  support_token_recall?: number
+  claim_retrieved?: boolean
+  retrieved_evidence?: Array<{
+    source_type: 'context' | 'source_window'
+    title: string
+    text: string
+    support_overlap: number
+    answer_match: boolean
+  }>
+}
+
+export interface EvidenceChain {
+  status: 'complete' | 'partial' | 'incomplete' | 'unavailable' | string
+  step_count?: number
+  supported_step_count?: number
+  partial_step_count?: number
+  missing_step_count?: number
+  model_false_negative_candidate?: boolean
+  steps?: EvidenceChainStep[]
 }
 
 export interface AttributionDetail extends AttributionRun {
@@ -543,8 +566,7 @@ export interface Lineage {
   }
   question_terms_lost: string[]
   verdict: string
-  base_url: string
-  artifacts: { title: string | null; page_type: string | null }[]
-  chunks: { title: string | null; chunk_role: string | null; text: string }[]
+  artifacts: { id: string; title: string | null; page_type: string | null }[]
+  chunks: { knowledge_page_id: string; title: string | null; chunk_role: string | null; text: string }[]
   source_chunks: { text: string }[]
 }

@@ -8,8 +8,7 @@ from uuid import UUID
 # artifact：一个原始 page 贡献给了哪些编译产物。
 # page_type 取 entity / source_summary；canonical_key 是实体合并的键。
 ARTIFACTS_OF_SOURCE = """
-SELECT DISTINCT kp.id, kp.title, kp.page_type, kp.compile_scope,
-       kp.canonical_key, kp.stale_at
+SELECT DISTINCT kp.id, kp.title, kp.page_type
 FROM knowledge_page_sources kps
 JOIN knowledge_pages kp ON kp.id = kps.knowledge_page_id
 WHERE kps.source_page_id = %(page)s
@@ -159,9 +158,7 @@ class LineageReader:
         return {
             "source_page_id": page_id,
             "artifacts": artifacts,
-            # 参与召回的文本。
             "chunks": chunks,
-            # 原文块，仅用于证据追溯。
             "source_chunks": source_chunks,
             "edges": edges,
             "counts": {

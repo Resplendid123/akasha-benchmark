@@ -5,13 +5,12 @@ import type {
   AkashaModelProvider,
   Connection,
   ConnectionTest,
-  ModelConfig,
+  ModelConfigsView,
   Provider,
   ProviderProbe,
 } from '../types'
 import { Failed, Field, Loading, Pass, SecretField, useAction, useAsync } from '../ui'
 
-/** 配置层：Akasha 连接、它那边的模型配置、本地 judge / 归因端点。 */
 export function Settings() {
   return (
     <>
@@ -25,13 +24,12 @@ export function Settings() {
       <AccessToken />
       <ConnectionForm />
       <ModelConfigs />
-      <Providers role="judge" title="评估模型 judge" />
-      <Providers role="attribution" title="归因模型 attribute" />
+      <Providers role="judge" title="评估模型" />
+      <Providers role="attribution" title="归因模型" />
     </>
   )
 }
 
-/** 把全部配置（含明文密钥）导出为一份 JSON 文件。 */
 function ExportButton() {
   const save = useAction<unknown>()
   return (
@@ -57,7 +55,6 @@ function ExportButton() {
   )
 }
 
-/** 从一份导出的 JSON 回填全部配置。导入后刷新页面让各面板重取。 */
 function ImportButton() {
   const load = useAction<unknown>()
 
@@ -86,7 +83,6 @@ function ImportButton() {
   )
 }
 
-/** 访问令牌。health 返回 401 时也要显示这一段，否则没有地方改它。 */
 function AccessToken() {
   const [saved, setSaved] = useState(getToken())
   const [value, setValue] = useState(saved)
@@ -131,7 +127,6 @@ function AccessToken() {
   )
 }
 
-// 各数值字段的下限。间隔可以是 0，超时不行；模型调用并发由各运行层选择。
 const NUMBER_FIELDS = [
   ['timeout_seconds', '模型请求超时（秒）', 1],
   ['request_interval_seconds', '模型请求间隔（秒）', 0],
@@ -139,7 +134,6 @@ const NUMBER_FIELDS = [
 
 type Form = Record<string, string>
 
-/** 数值也按字符串存，这样清空输入框能留着空而不变成 0。 */
 function toForm(data: Connection): Form {
   const { compiles: _compiles, updated_at: _updated, ...rest } = data
   return Object.fromEntries(Object.entries(rest).map(([key, value]) => [key, String(value)]))
@@ -163,7 +157,6 @@ function ConnectionForm() {
   if (error) return <Failed error={error} />
   if (!data) return null
 
-  // 表单一改就清掉旧的保存结果与测试结论，它们不再对应当前表单。
   const set = (key: string, value: string) => {
     setForm((f) => ({ ...f, [key]: value }))
     save.reset()
@@ -299,7 +292,6 @@ function ConnectionForm() {
   )
 }
 
-/** 四项配置各自的标题。 */
 const FEATURE_LABELS: Record<string, { title: string }> = {
   compiler: { title: '编译模型' },
   embedding: { title: '嵌入模型' },
@@ -307,7 +299,6 @@ const FEATURE_LABELS: Record<string, { title: string }> = {
   image: { title: '图像模型' },
 }
 
-/** 远端 live 配置只读展示，编辑改在本地组里做。 */
 function ModelConfigs() {
   const { data, error, loading } = useAsync(() => api.modelConfigs(), [])
 
@@ -332,11 +323,8 @@ function ModelConfigs() {
   )
 }
 
-function LiveTable({ data }: { data: { features: string[]; live: unknown } }) {
-  const live: ModelConfig[] = Array.isArray(data.live)
-    ? data.live
-    : ((data.live as { configs?: ModelConfig[] }).configs ?? [])
-  const byFeature = new Map(live.map((entry) => [entry.feature, entry]))
+function LiveTable({ data }: { data: ModelConfigsView }) {
+  const byFeature = new Map(data.live.configs.map((entry) => [entry.feature, entry]))
   return (
     <table>
       <thead>
@@ -388,7 +376,6 @@ const emptyAkashaModel = (feature: AkashaFeature): AkashaModelForm => ({
   feature, label: '', base_url: '', model: '', api_key: '', dimension: '', parameters: {},
 })
 
-/** 四类 Akasha 模型分开保存，编译与查询在各自页面自由组合。 */
 function AkashaModels() {
   const { data, error, loading, reload } = useAsync(() => api.akashaModels(), [])
   const [editing, setEditing] = useState<number | 'new' | null>(null)
@@ -455,21 +442,21 @@ function AkashaModels() {
             <thead><tr><th>标签</th><th>模型</th><th>base_url(/v1)</th>{feature === 'embedding' && <th>维度</th>}<th>密钥</th><th /></tr></thead>
             <tbody>
               {models.filter((item) => item.feature === feature).map((item) => (
-                <tr key={item.id} className={item.id === editing ? 'selected' : ''}>
-                  <td>{item.label}</td>
-                  <td className="mono small">{item.model}</td>
-                  <td className="mono small muted truncate">{item.base_url}</td>
-                  {feature === 'embedding' && <td className="mono small">{String(item.parameters.dimension ?? '—')}</td>}
-                  <td><Pass ok={item.api_key_set} yes="已设置" no="缺失" /></td>
-                  <td className="table-actions-cell"><div className="table-actions">
-                    <button className="action small" onClick={() => edit(item)}>编辑</button>
-                    <button className="action small" disabled={apply.busy} onClick={() => apply.run(() => api.applyAkashaModel(item.id))}>应用</button>
-                    <button className="action small danger" disabled={remove.busy} onClick={() => {
-                      if (!window.confirm(`删除「${item.label}」？`)) return
-                      remove.run(async () => { const result = await api.deleteAkashaModel(item.id); reload(); return result })
-                    }}>删除</button>
-                  </div></td>
-                </tr>
+                <AkashaModelRow
+                  key={item.id}
+                  model={item}
+                  embedding={feature === 'embedding'}
+                  selected={item.id === editing}
+                  applyBusy={apply.busy}
+                  removeBusy={remove.busy}
+                  onEdit={() => edit(item)}
+                  onApply={() => apply.run(() => api.applyAkashaModel(item.id))}
+                  onDeleted={() => remove.run(async () => {
+                    const result = await api.deleteAkashaModel(item.id)
+                    reload()
+                    return result
+                  })}
+                />
               ))}
             </tbody>
           </table>
@@ -516,7 +503,63 @@ function AkashaModels() {
   )
 }
 
-/** 一行端点。探测与删除的状态逐行独立，所以拆成组件。 */
+function AkashaModelRow({
+  model,
+  embedding,
+  selected,
+  applyBusy,
+  removeBusy,
+  onEdit,
+  onApply,
+  onDeleted,
+}: {
+  model: AkashaModelProvider
+  embedding: boolean
+  selected: boolean
+  applyBusy: boolean
+  removeBusy: boolean
+  onEdit: () => void
+  onApply: () => void
+  onDeleted: () => void
+}) {
+  const probe = useAction<ProviderProbe>()
+
+  return (
+    <>
+      <tr className={selected ? 'selected' : ''}>
+        <td>{model.label}</td>
+        <td className="mono small">{model.model}</td>
+        <td className="mono small muted truncate">{model.base_url}</td>
+        {embedding && <td className="mono small">{String(model.parameters.dimension ?? '—')}</td>}
+        <td><Pass ok={model.api_key_set} yes="已设置" no="缺失" /></td>
+        <td className="table-actions-cell"><div className="table-actions">
+          <button className="action small" onClick={onEdit}>编辑</button>
+          <button
+            className="action small"
+            disabled={probe.busy}
+            title={embedding ? '发送最小 embedding 请求 hi' : '发送最小 hi 请求'}
+            onClick={() => probe.run(() => api.probeAkashaModel(model.id))}
+          >
+            {probe.busy ? '探测中…' : '探测'}
+          </button>
+          <button className="action small" disabled={applyBusy} onClick={onApply}>应用</button>
+          <button className="action small danger" disabled={removeBusy} onClick={() => {
+            if (window.confirm(`删除「${model.label}」？`)) onDeleted()
+          }}>删除</button>
+        </div></td>
+      </tr>
+      {(probe.result || probe.error) && (
+        <tr>
+          <td colSpan={embedding ? 6 : 5}>
+            {probe.error && <Failed error={probe.error} />}
+            {probe.result && <ProbeResult result={probe.result} onClose={probe.reset} />}
+          </td>
+        </tr>
+      )}
+    </>
+  )
+}
+
 function ProviderRow({
   provider,
   selected,
@@ -541,7 +584,7 @@ function ProviderRow({
           <Pass ok={provider.api_key_set} yes="已设置" no="缺失" />
         </td>
         <td>
-          <div className="row tight">
+          <div className="table-actions">
             <button className="action small" onClick={onEdit}>
               编辑
             </button>
@@ -588,7 +631,6 @@ function ProviderRow({
   )
 }
 
-/** 探测结果。失败时摊开 provider 回的原文。 */
 function ProbeResult({ result, onClose }: { result: ProviderProbe; onClose: () => void }) {
   return (
     <div className={`note ${result.ok ? 'ok' : 'bad'}`}>
@@ -616,13 +658,8 @@ function ProbeResult({ result, onClose }: { result: ProviderProbe; onClose: () =
   )
 }
 
-/** 表单默认收起，由「新增端点」或表格里的「编辑」打开。
- *
- * 编辑时提交 id：后端按 (role, label) upsert，不带 id 会把改名变成新增。
- */
 function Providers({ role, title }: { role: 'judge' | 'attribution'; title: string }) {
   const { data, error, loading, reload } = useAsync<Provider[]>(() => api.providers(role), [role])
-  // null 是收起来，'new' 是新建，数字是在改那一条。
   const [mode, setMode] = useState<number | 'new' | null>(null)
   const [form, setForm] = useState(BLANK)
   const save = useAction<{ id: number }>()
@@ -654,7 +691,6 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
     save.reset()
   }
 
-  // 新建时标签不能撞已有的，否则会覆盖那一条。
   const label = form.label.trim() || 'default'
   const taken = providers.some((p) => p.label === label && p.id !== editing)
 
@@ -665,8 +701,7 @@ function Providers({ role, title }: { role: 'judge' | 'attribution'; title: stri
       <div className="panel-head">
         <h3>{title}</h3>
         <div className="row tight">
-          <span className="small muted">{providers.length} 个端点</span>
-          <button className="action small" disabled={save.busy} onClick={create}>
+        <button className="action small" disabled={save.busy} onClick={create}>
             新增端点
           </button>
         </div>

@@ -22,7 +22,6 @@ from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample
 
 class ITFaqAdapter(DatasetAdapter):
     name: ClassVar[str] = "itfaq"
-    aliases: ClassVar[tuple[str, ...]] = ("it_faq", "itfaq_zh")
     qa_filename: ClassVar[str] = "itfaq.json"
     corpus_filename: ClassVar[str] = "itfaq_corpus.json"
     provides: ClassVar[frozenset[DataDependency]] = frozenset({DataDependency.REFERENCE_ANSWERS})

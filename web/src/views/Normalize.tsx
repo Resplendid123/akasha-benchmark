@@ -14,7 +14,6 @@ import {
   usePagedRecordNavigation,
 } from '../ui'
 
-/** 归一化层：入 SQLite，不入 Akasha 库。 */
 export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
   const { data, error, loading, reload } = useAsync(() => api.datasets(), [])
   const [selected, setSelected] = useState<string[]>([])
@@ -174,7 +173,6 @@ export function Normalize({ onOpenTasks }: { onOpenTasks: () => void }) {
   )
 }
 
-/** 归一化后的样本与语料。样本一页五条，语料一页一条。 */
 function Browser({ dataset, tab }: { dataset: string; tab: 'samples' | 'corpus' }) {
   const [offset, setOffset] = useState(0)
   const [term, setTerm] = useState('')

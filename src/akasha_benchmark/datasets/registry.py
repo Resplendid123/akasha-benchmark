@@ -1,4 +1,4 @@
-"""各适配器的名称与别名注册表。"""
+"""数据集适配器注册表。"""
 
 from __future__ import annotations
 
@@ -17,31 +17,14 @@ ADAPTER_CLASSES: tuple[type[DatasetAdapter], ...] = (
     ITFaqAdapter,
 )
 
-DATASET_NAMES: tuple[str, ...] = tuple(cls.name for cls in ADAPTER_CLASSES)
-
-
-def _build_lookup() -> dict[str, type[DatasetAdapter]]:
-    """名字和别名统一转小写建表；两个适配器抢同一个键就直接报错。"""
-    lookup: dict[str, type[DatasetAdapter]] = {}
-    for cls in ADAPTER_CLASSES:
-        for key in (cls.name, *cls.aliases):
-            normalized = key.lower()
-            if normalized in lookup:
-                raise RuntimeError(
-                    f"dataset key {normalized!r} claimed by both "
-                    f"{lookup[normalized].__name__} and {cls.__name__}"
-                )
-            lookup[normalized] = cls
-    return lookup
-
-
-_LOOKUP = _build_lookup()
+_LOOKUP = {cls.name: cls for cls in ADAPTER_CLASSES}
+DATASET_NAMES: tuple[str, ...] = tuple(_LOOKUP)
 
 
 def get_adapter(name: str) -> DatasetAdapter:
-    """按数据集名或别名取一个新的适配器实例。"""
+    """按规范数据集名取一个新的适配器实例。"""
     try:
-        return _LOOKUP[name.strip().lower()]()
+        return _LOOKUP[name]()
     except KeyError:
         raise KeyError(
             f"unknown dataset {name!r}. Known: {', '.join(sorted(_LOOKUP))}"

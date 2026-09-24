@@ -1,12 +1,9 @@
 """faithfulness：答案里的每条陈述能否由检索到的上下文支撑。
 
-依赖是空集，所以对四组都成立 —— narrativeqa 无 gold 标注、检索族指标全省略，
-这一项能填上那个洞。
-
 口径：把答案拆成原子陈述，逐条判上下文是否支撑，得分 = 被支撑数 / 总条数。
 拆句与判定在同一次调用里做完。
 
-上下文取 ``snippets`` 与 ``retrievedSources`` 而不取 ``citations``：后者已被裁剪，
+上下文取 ``snippets`` 而不取 ``citations``：后者已被裁剪，
 拿它当上下文会把「引用漏了但检索到了」误判成不忠实。
 """
 
@@ -52,8 +49,7 @@ MAX_SNIPPETS = 20
 def build_context(response: dict[str, Any]) -> str:
     """从响应体拼出判定用的上下文。
 
-    优先用 ``snippets``（带正文），退到 ``retrievedSources``（只有标题）。
-    都空时返回空串，此时这个指标无定义，调用方应跳过而不是记 0。
+    没有 snippet 时返回空串，此时这个指标无定义，调用方应跳过而不是记 0。
     """
     parts: list[str] = []
     for snippet in (response.get("snippets") or [])[:MAX_SNIPPETS]:
@@ -61,11 +57,6 @@ def build_context(response: dict[str, Any]) -> str:
         text = (snippet.get("text") or "")[:MAX_SNIPPET_CHARS]
         if text:
             parts.append(f"[{title}]\n{text}")
-    if not parts:
-        for source in (response.get("retrievedSources") or [])[:MAX_SNIPPETS]:
-            title = source.get("title")
-            if title:
-                parts.append(f"[{title}]")
     return "\n\n".join(parts)
 
 

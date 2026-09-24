@@ -135,6 +135,58 @@ def compile_docs(
     return [dict(r) for r in connection.execute(sql + " ORDER BY cd.dataset, cd.doc_id", params)]
 
 
+def compile_doc_page(
+    connection: sqlite3.Connection,
+    compile_id: int,
+    dataset: str | None = None,
+    *,
+    gold_only: bool = False,
+    search: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[int, int, list[dict[str, Any]]]:
+    """在 SQLite 中过滤并分页编译文档，避免把整次编译读进 Python。"""
+    where = ["cd.compile_id = ?"]
+    params: list[Any] = [compile_id]
+    if dataset:
+        where.append("cd.dataset = ?")
+        params.append(dataset)
+    if gold_only:
+        where.append("cd.is_gold = 1")
+    if search:
+        needle = f"%{search.lower()}%"
+        where.append(
+            "(LOWER(cd.doc_id) LIKE ? OR LOWER(COALESCE(corpus_doc.title, '')) LIKE ? "
+            "OR LOWER(COALESCE(cd.page_id, '')) LIKE ?)"
+        )
+        params.extend((needle, needle, needle))
+    scope = " AND ".join(where)
+    from_sql = (
+        "FROM compile_doc cd "
+        "LEFT JOIN corpus_doc ON corpus_doc.dataset = cd.dataset AND corpus_doc.doc_id = cd.doc_id"
+    )
+    summary = connection.execute(
+        f"SELECT COUNT(*) AS total, "
+        f"SUM(CASE WHEN cd.page_id IS NOT NULL THEN 1 ELSE 0 END) AS imported "
+        f"{from_sql} WHERE {scope}",
+        params,
+    ).fetchone()
+    total = int(summary["total"] or 0)
+    imported = int(summary["imported"] or 0)
+    rows = connection.execute(
+        f"""
+        SELECT cd.*, COALESCE(corpus_doc.title, '') AS title
+        {from_sql}
+        WHERE {scope}
+        ORDER BY cd.dataset, cd.doc_id
+        LIMIT ? OFFSET ?
+        """,
+        (*params, limit, offset),
+    )
+    page = [dict(row) for row in rows]
+    return total, imported, page
+
+
 def record_page(
     connection: sqlite3.Connection,
     compile_id: int,
@@ -197,8 +249,10 @@ def workspace_mismatch(
         return f"编译 #{compile_id} 不存在"
     recorded = run["workspace_id"]
 
-    if not recorded or not resolved_workspace_id:
-        return None
+    if not recorded:
+        return f"编译 {run['run_id']!r} 没有记录 workspace，不能确认远端空间归属"
+    if not resolved_workspace_id:
+        return "当前连接没有解析出 workspace，不能确认远端空间归属"
     if recorded == resolved_workspace_id:
         return None
     return (

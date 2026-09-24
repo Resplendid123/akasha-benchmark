@@ -10,7 +10,6 @@ const REASONS: Record<string, { text: string; kind: string }> = {
   'sidecar-prefiltered': { text: '预筛', kind: '' },
 }
 
-/** 一条样本的原文 → 编译产物 → 检索 chunk → 引用链路。 */
 export function AttributionChain({
   question,
   goldPages,

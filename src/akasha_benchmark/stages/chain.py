@@ -101,6 +101,13 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
     if sample is None or sample["dataset"] != dataset:
         raise ValueError(f"{dataset} 里没有样本 {sample_id!r}")
 
+    gold_count = len(sample["gold_doc_ids"])
+    if gold_count > 5:
+        raise ValueError(
+            f"所选问题有 {gold_count} 篇 gold 文档，无法补成固定 5 篇测试语料"
+        )
+    negatives_ratio = (5 - gold_count) / gold_count if gold_count else 0.0
+
     run_id = f"smoke{uuid.uuid4().hex[:8]}"
     available_metrics = registry.available(get_adapter(dataset).provides)
     with_judge = bool(params.get("with_judge", False))
@@ -112,7 +119,7 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
     evaluate_params: dict[str, Any] = {
         "name": f"{run_id}-e",
         "metrics": metrics,
-        "ks": [2, 5],
+        "ks": [2],
     }
     if params.get("judge_provider_id"):
         evaluate_params["judge_provider_id"] = params["judge_provider_id"]
@@ -125,7 +132,7 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
                 "datasets": [dataset],
                 "qa_limit": 1,
                 "sample_ids": [sample_id],
-                "negatives_ratio": 1.0,
+                "negatives_ratio": negatives_ratio,
                 "seed": params.get("seed") or compile.default_seed(),
             },
         },
