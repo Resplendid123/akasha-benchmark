@@ -189,7 +189,13 @@ def test_response_mode_is_derived_from_current_body(db, query_id, body, mode):
 
 def test_delete_failed_responses_keeps_successes(db, query_id):
     for sample_id, status in (("a", 200), ("b", 500), ("c", 0)):
-        _respond(db, query_id, sample_id, http_status=status)
+        _respond(
+            db,
+            query_id,
+            sample_id,
+            http_status=status,
+            response={"answer": "ok"} if status == 200 else None,
+        )
 
     assert query_store.delete_retryable_responses(db, query_id) == 2
     assert [r["sample_id"] for r in query_store.responses_of(db, query_id)] == ["a"]
@@ -198,6 +204,8 @@ def test_delete_failed_responses_keeps_successes(db, query_id):
 def test_generation_unavailable_answer_is_retryable_despite_http_200(db, query_id):
     for sample_id, answer in (
         ("good", "A real answer"),
+        ("empty", ""),
+        ("missing", None),
         ("empty-en", query_store.ANSWER_GENERATION_UNAVAILABLE),
         ("empty-zh", query_store.ANSWER_GENERATION_UNAVAILABLE_ZH),
     ):
@@ -207,10 +215,10 @@ def test_generation_unavailable_answer_is_retryable_despite_http_200(db, query_i
         )
 
     stats = query_store.query_stats(db, query_id)["d"]
-    assert stats["responses"] == 3
-    assert stats["failures"] == 2
-    assert query_store.retryable_response_count(db, query_id) == 2
-    assert query_store.delete_retryable_responses(db, query_id) == 2
+    assert stats["responses"] == 5
+    assert stats["failures"] == 4
+    assert query_store.retryable_response_count(db, query_id) == 4
+    assert query_store.delete_retryable_responses(db, query_id) == 4
     assert [row["sample_id"] for row in query_store.responses_of(db, query_id)] == ["good"]
 
 

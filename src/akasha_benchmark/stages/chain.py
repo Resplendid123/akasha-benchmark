@@ -18,7 +18,7 @@ from . import compile
 DATASETS = ("hotpotqa", "2wikimultihopqa", "musique")
 
 
-def _check_query(connection, query_id: int) -> None:
+def verify_query(connection, query_id: int) -> None:
 
     run = query_store.get_query_run(connection, query_id)
     if run is None:
@@ -43,7 +43,7 @@ def _check_query(connection, query_id: int) -> None:
         raise RuntimeError(f"knowledge 响应没有 retrievedSources：{unmapped[:3]}")
 
 
-def _check_evaluate(connection, eval_id: int) -> None:
+def verify_evaluate(connection, eval_id: int) -> None:
     run = eval_store.get_eval_run(connection, eval_id)
     if run is None:
         raise RuntimeError("评测记录丢失")
@@ -58,7 +58,7 @@ def _check_evaluate(connection, eval_id: int) -> None:
         raise RuntimeError("评测没有覆盖全部样本")
 
 
-def _check_attribute(connection, attribution_id: int) -> None:
+def verify_attribute(connection, attribution_id: int) -> None:
     run = attribution_store.get_attribution_run(connection, attribution_id)
     if run is None:
         raise RuntimeError("归因记录不存在")
@@ -72,9 +72,9 @@ def _check_attribute(connection, attribution_id: int) -> None:
 
 
 VERIFY = {
-    "query": _check_query,
-    "evaluate": _check_evaluate,
-    "attribute": _check_attribute,
+    "query": verify_query,
+    "evaluate": verify_evaluate,
+    "attribute": verify_attribute,
 }
 
 

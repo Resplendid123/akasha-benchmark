@@ -53,7 +53,7 @@ def reject_if_busy(connection: sqlite3.Connection, kind: str, target_id: int) ->
     affected = run_store.descendants(connection, kind, target_id)
     for task in task_store.active_tasks(connection):
         references = {(task["target_kind"], task["target_id"])}
-        if source := run_store.STAGE_INPUTS.get(task["stage"]):
+        if source := run_store.stage_input(task["stage"]):
             parent, param = source
             references.add((parent, task["params"].get(param)))
         if references & affected:

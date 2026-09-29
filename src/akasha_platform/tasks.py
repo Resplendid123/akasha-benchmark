@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
-from akasha_benchmark.akasha_client import (
-    ACTIVE_RUN_STATUSES,
-    AkashaClient,
-    AkashaError,
-    validate_cancel_result,
-)
+from akasha_benchmark.akasha_client import AkashaClient, AkashaError
 from akasha_benchmark.config import load_config
 from akasha_benchmark import model_configs
 from akasha_benchmark.stages import STAGES, chain, clean_params
-from akasha_benchmark.store import compile_store, connect, query_store, task_store
+from akasha_benchmark.store import connect, query_store, task_store
 from akasha_benchmark.task import Paused, TaskContext, execute
 
+from .compile_control import CompileRemoteService
 from .settings import Settings
 
 
@@ -26,6 +23,8 @@ TASK_MODEL_FEATURES: dict[str, tuple[str, ...]] = {
     "compile": ("compiler", "embedding", "image"),
     "query": ("answer",),
 }
+BEIJING = timezone(timedelta(hours=8), name="Asia/Shanghai")
+MAX_TIMER_DELAY_SECONDS = 24 * 60 * 60
 
 
 class TaskRejected(RuntimeError):
@@ -36,14 +35,26 @@ class TaskRunner:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._pauses: dict[int, threading.Event] = {}
+        self._timers: dict[int, threading.Timer] = {}
         self._lock = threading.Lock()
+        self._compile_remote = CompileRemoteService()
 
     def recover(self) -> int:
 
         connection = connect(self.settings.db_path)
         try:
             active = task_store.active_tasks(connection)
+            recovered = 0
             for task in active:
+                scheduled_at = self._scheduled_at(task)
+                if (
+                    task["stage"] == "compile"
+                    and task["status"] == task_store.QUEUED
+                    and scheduled_at is not None
+                ):
+                    self._arm_schedule(int(task["id"]), scheduled_at)
+                    continue
+                recovered += 1
                 try:
                     self._cancel_remote_compile(
                         connection, task, "Akasha-Benchmark backend restarted"
@@ -69,7 +80,7 @@ class TaskRunner:
                     message="后端重启，任务已标为暂停；点击继续可接着跑",
                 )
             connection.commit()
-            return len(active)
+            return recovered
         finally:
             connection.close()
 
@@ -81,18 +92,45 @@ class TaskRunner:
             params = clean_params(stage, args)
         except ValueError as exc:
             raise TaskRejected(str(exc)) from exc
+        if stage != "compile" and args.get("schedule_at") not in (None, ""):
+            raise TaskRejected("只有 compile 任务支持定时启动")
+        if stage == "compile" and args.get("schedule_at") not in (None, ""):
+            try:
+                params["schedule_at"] = self._normalize_schedule(args["schedule_at"])
+            except ValueError as exc:
+                raise TaskRejected(str(exc)) from exc
+        scheduled_at = self._scheduled_at({"params": params})
 
         connection = connect(self.settings.db_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._require_free(connection, stage, params)
+            if scheduled_at is None:
+                self._require_free(connection, stage, params)
             task_id = task_store.create_task(connection, stage=stage, params=params)
+            if scheduled_at is not None:
+                task_store.update_progress(
+                    connection,
+                    task_id,
+                    done=0,
+                    total=None,
+                    note=f"计划于 {params['schedule_at']} 启动（北京时间）",
+                )
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage=stage,
+                    level="info",
+                    message=f"已创建单次定时任务：{params['schedule_at']}（北京时间）",
+                )
             connection.commit()
             record = task_store.get_task(connection, task_id) or {}
         finally:
             connection.close()
 
-        self._spawn(task_id, stage, params)
+        if scheduled_at is None:
+            self._spawn(task_id, stage, params)
+        else:
+            self._arm_schedule(task_id, scheduled_at)
         return record
 
     def start_chain(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -175,7 +213,11 @@ class TaskRunner:
         finally:
             connection.close()
 
-        self._spawn(task_id, task["stage"], task["params"])
+        scheduled_at = self._scheduled_at(task)
+        if scheduled_at is None or scheduled_at <= datetime.now(UTC):
+            self._spawn(task_id, task["stage"], task["params"])
+        else:
+            self._arm_schedule(task_id, scheduled_at)
         connection = connect(self.settings.db_path)
         try:
             return task_store.get_task(connection, task_id) or {}
@@ -191,6 +233,7 @@ class TaskRunner:
                 raise TaskRejected(f"任务 #{task_id} 不存在")
             if task["status"] not in task_store.ACTIVE:
                 raise TaskRejected(f"任务 #{task_id} 当前是 {task['status']}，不在运行")
+            self._cancel_schedule(task_id)
             remote_results = self._cancel_remote_compile(
                 connection, task, "Akasha-Benchmark task paused"
             )
@@ -261,51 +304,32 @@ class TaskRunner:
     def _cancel_remote_compile(
         self, connection, task: dict[str, Any], reason: str
     ) -> list[dict[str, str]]:
-        if task.get("stage") != "compile":
-            return []
-        run_ids = task.get("params", {}).get("remote_compile_run_ids") or []
-        remote_results: list[dict[str, str]] = []
         try:
-            with AkashaClient(load_config(connection)) as client:
-                client.login()
-                if not run_ids and task.get("target_kind") == "compile":
-                    compile_run = compile_store.get_compile_run(
-                        connection, int(task.get("target_id") or 0)
-                    )
-                    space_id = (compile_run or {}).get("space_id")
-                    if space_id:
-                        diagnostics = client.run_diagnostics([space_id], limit=50)
-                        run_ids = [
-                            str(run["runId"])
-                            for run in diagnostics.get("items") or []
-                            if run.get("runId")
-                            and str(run.get("status")) in ACTIVE_RUN_STATUSES
-                        ]
-                for run_id in run_ids:
-                    result = client.cancel_compile_run(str(run_id), reason)
-                    remote = validate_cancel_result(str(run_id), result)
-                    remote_results.append(remote)
-                    task_store.log(
-                        connection,
-                        task_id=int(task["id"]),
-                        stage="compile",
-                        level="info",
-                        message=(
-                            f"远端编译 Run {run_id} 已处理：{remote['disposition']} / "
-                            f"{remote['status']}，"
-                            f"清理 BullMQ job {result.get('removedJobCount', 0)} 个"
-                        ),
-                    )
-            connection.commit()
-            return remote_results
+            return self._compile_remote.cancel_task(
+                connection, task, reason, client_factory=AkashaClient
+            )
         except (AkashaError, ValueError) as exc:
             connection.rollback()
             raise TaskRejected(f"远端编译 Run 取消失败，本地状态未变：{exc}") from exc
 
     def _require_free(
-        self, connection, stage: str, params: dict[str, Any] | None = None
+        self,
+        connection,
+        stage: str,
+        params: dict[str, Any] | None = None,
+        *,
+        exclude_task_id: int | None = None,
     ) -> None:
-        active = task_store.active_tasks(connection)
+        active = [
+            task
+            for task in task_store.active_tasks(connection)
+            if int(task["id"]) != exclude_task_id
+            and not (
+                task["stage"] == "compile"
+                and task["status"] == task_store.QUEUED
+                and self._scheduled_at(task) is not None
+            )
+        ]
         for task in active:
             if stage in EXCLUSIVE or task["stage"] in EXCLUSIVE:
                 raise TaskRejected(
@@ -351,10 +375,152 @@ class TaskRunner:
                 f"{stage} 任务已达到并发上限 {limit}，请先等其中一个结束或暂停"
             )
 
+    @staticmethod
+    def _normalize_schedule(value: Any) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("schedule_at 不能为空")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("schedule_at 需要使用有效的 ISO 时间") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING)
+        return parsed.astimezone(BEIJING).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _scheduled_at(task: dict[str, Any]) -> datetime | None:
+        value = (task.get("params") or {}).get("schedule_at")
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING)
+        return parsed.astimezone(UTC)
+
+    def _arm_schedule(self, task_id: int, scheduled_at: datetime | None) -> None:
+        if scheduled_at is None:
+            return
+        delay = min(
+            MAX_TIMER_DELAY_SECONDS,
+            max(0.0, (scheduled_at - datetime.now(UTC)).total_seconds()),
+        )
+        timer = threading.Timer(delay, self._fire_schedule, args=(task_id,))
+        timer.daemon = True
+        with self._lock:
+            previous = self._timers.pop(task_id, None)
+            if previous is not None:
+                previous.cancel()
+            self._timers[task_id] = timer
+        timer.start()
+
+    def _cancel_schedule(self, task_id: int) -> None:
+        with self._lock:
+            timer = self._timers.pop(task_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _fire_schedule(self, task_id: int) -> None:
+        try:
+            connection = connect(self.settings.db_path)
+            try:
+                task = task_store.get_task(connection, task_id)
+            finally:
+                connection.close()
+            scheduled_at = self._scheduled_at(task or {})
+            if (
+                task is not None
+                and task["stage"] == "compile"
+                and task["status"] == task_store.QUEUED
+            ):
+                if scheduled_at is not None and scheduled_at > datetime.now(UTC):
+                    self._arm_schedule(task_id, scheduled_at)
+                else:
+                    self._start_scheduled(task)
+        finally:
+            with self._lock:
+                if self._timers.get(task_id) is threading.current_thread():
+                    self._timers.pop(task_id, None)
+
+    def _start_scheduled(self, task: dict[str, Any]) -> None:
+        task_id = int(task["id"])
+        connection = connect(self.settings.db_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = task_store.get_task(connection, task_id)
+            if not current or current["status"] != task_store.QUEUED:
+                connection.rollback()
+                return
+            params = current.get("params") or {}
+            try:
+                self._require_free(
+                    connection,
+                    "compile",
+                    params,
+                    exclude_task_id=task_id,
+                )
+            except TaskRejected as exc:
+                task_store.transition(connection, task_id, task_store.FAILED, error=str(exc))
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage="compile",
+                    level="error",
+                    message=f"定时启动失败：{exc}",
+                )
+                connection.commit()
+                return
+            task_store.update_progress(
+                connection,
+                task_id,
+                done=0,
+                total=None,
+                note="定时时间已到，正在启动",
+            )
+            task_store.transition(connection, task_id, task_store.RUNNING)
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            try:
+                task_store.transition(connection, task_id, task_store.FAILED, error=str(exc))
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage="compile",
+                    level="error",
+                    message=f"定时启动失败：{type(exc).__name__}: {exc}",
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+            return
+        finally:
+            connection.close()
+        try:
+            self._spawn(task_id, "compile", params, True)
+        except Exception as exc:
+            connection = connect(self.settings.db_path)
+            try:
+                task_store.transition(connection, task_id, task_store.FAILED, error=str(exc))
+                task_store.log(
+                    connection,
+                    task_id=task_id,
+                    stage="compile",
+                    level="error",
+                    message=f"定时启动失败：{type(exc).__name__}: {exc}",
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
     def _verify(self, connection, task_id: int, stage: str) -> None:
 
         chain_id, _ = task_store.task_chain(connection, task_id)
-        check = chain.VERIFY.get(stage)
+        definition = STAGES.get(stage)
+        check = definition.verify if definition else None
         if chain_id is None or check is None:
             return
         task = task_store.get_task(connection, task_id) or {}
@@ -420,21 +586,35 @@ class TaskRunner:
         connection.commit()
         self._spawn(next_id, step["stage"], params)
 
-    def _spawn(self, task_id: int, stage: str, params: dict[str, Any]) -> None:
+    def _spawn(
+        self,
+        task_id: int,
+        stage: str,
+        params: dict[str, Any],
+        already_running: bool = False,
+    ) -> None:
         event = threading.Event()
         with self._lock:
             self._pauses[task_id] = event
         threading.Thread(
-            target=self._run, args=(task_id, stage, params, event), daemon=True
+            target=self._run,
+            args=(task_id, stage, params, event, already_running),
+            daemon=True,
         ).start()
 
     def _run(
-        self, task_id: int, stage: str, params: dict[str, Any], event: threading.Event
+        self,
+        task_id: int,
+        stage: str,
+        params: dict[str, Any],
+        event: threading.Event,
+        already_running: bool = False,
     ) -> None:
         connection = connect(self.settings.db_path)
         try:
             task = task_store.get_task(connection, task_id)
-            if task is None or task["status"] != task_store.QUEUED:
+            expected_status = task_store.RUNNING if already_running else task_store.QUEUED
+            if task is None or task["status"] != expected_status:
                 return
             ctx = TaskContext(
                 task_id=task_id,

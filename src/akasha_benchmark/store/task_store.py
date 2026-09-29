@@ -115,18 +115,17 @@ def count_inactive_tasks(connection: sqlite3.Connection) -> int:
 
 
 def task_tree(connection: sqlite3.Connection) -> dict[str, Any]:
+    from ..stages import STAGES
 
-    from .run_store import STAGE_INPUTS
-
-    specs = (
-        ("compile", "compile_run", "run_id", None, None),
-        ("query", "query_run", "name", "compile", "compile_id"),
-        ("eval", "eval_run", "name", "query", "query_id"),
-        ("attribution", "attribution_run", "name", "eval", "eval_id"),
-    )
     nodes: dict[tuple[str, int], dict[str, Any]] = {}
     roots: list[dict[str, Any]] = []
-    for kind, table, name_column, parent_kind, parent_column in specs:
+    for definition in STAGES.values():
+        kind = definition.run_kind
+        if kind is None:
+            continue
+        table = f"{kind}_run"
+        name_column = "run_id" if kind == "compile" else "name"
+        parent_kind, parent_column = definition.input or (None, None)
         for row in connection.execute(f"SELECT * FROM {table} ORDER BY id DESC"):
             record = dict(row)
             node = {
@@ -162,7 +161,8 @@ def task_tree(connection: sqlite3.Connection) -> dict[str, Any]:
             target["tasks"].append(task)
             continue
 
-        input_spec = STAGE_INPUTS.get(str(task["stage"]))
+        definition = STAGES.get(str(task["stage"]))
+        input_spec = definition.input if definition else None
         parent = None
         if target_kind is None and input_spec is not None:
             parent_kind, parameter = input_spec

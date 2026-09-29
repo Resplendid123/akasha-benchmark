@@ -4,22 +4,18 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from akasha_benchmark.akasha_client import (
-    ACTIVE_RUN_STATUSES,
-    AkashaClient,
-    AkashaError,
-    validate_cancel_result,
-)
-from akasha_benchmark.config import load_config
+from akasha_benchmark.akasha_client import AkashaClient, AkashaError
 from akasha_benchmark.store import (
     compile_store,
     query_store,
 )
 
 from ..run_tree import build_compile_tree
+from ..compile_control import CompileRemoteService
 from ._common import db, reject_if_busy, writable
 
 router = APIRouter(prefix="/api")
+compile_remote = CompileRemoteService()
 
 DEFAULT_PAGE = 20
 MAX_PAGE = 200
@@ -72,29 +68,21 @@ def delete_compile(request: Request, compile_id: int) -> dict[str, Any]:
         if row is None:
             raise HTTPException(404, f"编译 #{compile_id} 不存在")
         reject_if_busy(connection, "compile", compile_id)
-        cancelled = 0
-        removed_jobs = 0
-        if row.get("space_id"):
-            try:
-                with AkashaClient(load_config(connection)) as client:
-                    client.login()
-                    runs = client.run_diagnostics([row["space_id"]], limit=50).get("items") or []
-                    for run in runs:
-                        if run.get("runId") and str(run.get("status")) in ACTIVE_RUN_STATUSES:
-                            result = client.cancel_compile_run(
-                                str(run["runId"]), "Akasha-Benchmark compile cleaned up"
-                            )
-                            remote = validate_cancel_result(str(run["runId"]), result)
-                            cancelled += remote["disposition"] == "cancelled"
-                            removed_jobs += int(result.get("removedJobCount") or 0)
-            except (AkashaError, ValueError) as exc:
-                raise HTTPException(502, f"远端编译取消失败，本地记录未删除：{exc}") from exc
+        try:
+            remote = compile_remote.cancel_compile(
+                connection,
+                compile_id,
+                "Akasha-Benchmark compile cleaned up",
+                client_factory=AkashaClient,
+            )
+        except (AkashaError, ValueError) as exc:
+            raise HTTPException(502, f"远端编译取消失败，本地记录未删除：{exc}") from exc
         removed = compile_store.delete_compile_run(connection, compile_id)
     return {
         "deleted": removed,
         "space_id": row["space_id"],
-        "cancelled_runs": cancelled,
-        "removed_bullmq_jobs": removed_jobs,
+        "cancelled_runs": remote["cancelled"],
+        "removed_bullmq_jobs": remote["removed_jobs"],
         "note": "数据库内容已清理，活动编译 Run 已取消；Akasha 空间没有删除。",
     }
 

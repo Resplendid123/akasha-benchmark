@@ -7,6 +7,7 @@ from collections import Counter
 from typing import Any
 
 from .metrics import qa, registry
+from .store import query_store
 
 CAUSE_ANSWER_CORRECT = "answer_correct"
 CAUSE_ANSWER_INCORRECT = "answer_incorrect"
@@ -431,11 +432,14 @@ def classify(
     compilation_lost_answer = bool(
         (compiled_answers or {}).get("compiled_missing_count", 0)
     )
-    answer_text = str(sample.get("answer") or "").strip().lower()
+    answer_value = sample.get("answer")
     generation_empty = (
         decision_reason == "generation_empty"
-        or not answer_text
-        or "did not produce a response" in answer_text
+        or query_store.is_generation_unavailable_answer(answer_value)
+        or (
+            isinstance(answer_value, str)
+            and "did not produce a response" in answer_value.lower()
+        )
     )
     reference_in_context = (reference_grounding or {}).get("grounded")
     retrieval_missed = hit is not None and hit == 0

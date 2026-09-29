@@ -46,28 +46,7 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             """
         )
     }
-    query_stats = _grouped(
-        [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT qr.query_id, qr.dataset, COUNT(*) AS responses,
-                       SUM(
-                           NOT (qr.http_status BETWEEN 200 AND 299)
-                           OR TRIM(COALESCE(json_extract(qr.response_json, '$.answer'), '')) IN (?, ?)
-                       ) AS failures,
-                       AVG(qr.latency_ms) AS latency_mean, MAX(qr.latency_ms) AS latency_max
-                FROM query_response qr
-                GROUP BY qr.query_id, qr.dataset
-                """,
-                (
-                    query_store.ANSWER_GENERATION_UNAVAILABLE,
-                    query_store.ANSWER_GENERATION_UNAVAILABLE_ZH,
-                ),
-            )
-        ],
-        "query_id",
-    )
+    query_stats = _grouped(query_store.all_query_stats(connection), "query_id")
     query_sample_counts = {
         int(row["query_id"]): int(row["samples"])
         for row in connection.execute(

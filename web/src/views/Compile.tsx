@@ -174,6 +174,7 @@ function NewCompile({
   const [fullCorpus, setFullCorpus] = useState(true)
   const [ratio, setRatio] = useState(1)
   const [importConcurrency, setImportConcurrency] = useState(10)
+  const [scheduleAt, setScheduleAt] = useState('')
   const start = useAction<unknown>()
   const selectedQaMax = Math.max(
     0,
@@ -252,6 +253,13 @@ function NewCompile({
             onChange={(e) => setImportConcurrency(Number(e.target.value))}
           />
         </Field>
+        <Field label="定时启动" hint="留空则立即开始">
+          <input
+            type="datetime-local"
+            value={scheduleAt}
+            onChange={(e) => setScheduleAt(e.target.value)}
+          />
+        </Field>
       </div>
 
       <div className="panel-actions">
@@ -274,6 +282,7 @@ function NewCompile({
                 import_concurrency: importConcurrency,
                 ...(fullCorpus ? {} : { negatives_ratio: ratio }),
                 ...(runId.trim() ? { run_id: runId.trim() } : {}),
+                ...(scheduleAt ? { schedule_at: scheduleAt } : {}),
               })
               onStarted()
               return task

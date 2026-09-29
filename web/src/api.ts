@@ -35,7 +35,9 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const apiBase = import.meta.env.BASE_URL.replace(/\/$/, '')
+  const requestPath = path.startsWith('/api') ? `${apiBase}${path}` : path
+  const response = await fetch(requestPath, {
     ...init,
     headers: {
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),

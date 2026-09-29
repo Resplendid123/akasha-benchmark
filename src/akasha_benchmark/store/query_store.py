@@ -21,13 +21,20 @@ GENERATION_UNAVAILABLE_ANSWERS = {
 }
 
 
+def is_generation_unavailable_answer(answer: Any) -> bool:
+    if not isinstance(answer, str):
+        return True
+    text = answer.strip()
+    return not text or text in GENERATION_UNAVAILABLE_ANSWERS
+
+
 def response_is_retryable(row: dict[str, Any]) -> bool:
     status = int(row.get("http_status") or 0)
     if not 200 <= status < 300:
         return True
     response = row.get("response")
     answer = response.get("answer") if isinstance(response, dict) else None
-    return isinstance(answer, str) and answer.strip() in GENERATION_UNAVAILABLE_ANSWERS
+    return is_generation_unavailable_answer(answer)
 
 
 def create_query_run(
@@ -271,21 +278,39 @@ def delete_retryable_responses(connection: sqlite3.Connection, query_id: int) ->
 
 
 def query_stats(connection: sqlite3.Connection, query_id: int) -> dict[str, Any]:
+    return {
+        row["dataset"]: {key: value for key, value in row.items() if key != "query_id"}
+        for row in all_query_stats(connection, query_id=query_id)
+    }
+
+
+def all_query_stats(
+    connection: sqlite3.Connection, *, query_id: int | None = None
+) -> list[dict[str, Any]]:
+    where = "WHERE query_id = ?" if query_id is not None else ""
+    params: tuple[Any, ...] = (
+        ANSWER_GENERATION_UNAVAILABLE,
+        ANSWER_GENERATION_UNAVAILABLE_ZH,
+    )
+    if query_id is not None:
+        params += (query_id,)
     rows = connection.execute(
-        """
-        SELECT dataset, COUNT(*) AS responses,
+        f"""
+        SELECT query_id, dataset, COUNT(*) AS responses,
                SUM(CASE
                    WHEN http_status NOT BETWEEN 200 AND 299 THEN 1
+                   WHEN TRIM(COALESCE(json_extract(response_json, '$.answer'), '')) = '' THEN 1
                    WHEN TRIM(COALESCE(json_extract(response_json, '$.answer'), '')) IN (?, ?) THEN 1
                    ELSE 0
                END) AS failures,
                AVG(latency_ms) AS latency_mean,
                MAX(latency_ms) AS latency_max
-        FROM query_response WHERE query_id = ? GROUP BY dataset ORDER BY dataset
+        FROM query_response {where}
+        GROUP BY query_id, dataset ORDER BY query_id, dataset
         """,
-        (ANSWER_GENERATION_UNAVAILABLE, ANSWER_GENERATION_UNAVAILABLE_ZH, query_id),
+        params,
     )
-    return {row["dataset"]: dict(row) for row in rows}
+    return [dict(row) for row in rows]
 
 
 def response_datasets(connection: sqlite3.Connection, query_id: int) -> list[str]:

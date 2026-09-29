@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from akasha_benchmark.datasets import DATASET_NAMES
-from akasha_benchmark.stages import STAGES, StageSpec
+from akasha_benchmark.stages import STAGES, StageDefinition
 from akasha_benchmark.store import (
     attribution_store,
     compile_store,
@@ -104,7 +104,7 @@ class _AkashaStub:
 
 def _register(monkeypatch, name: str, run) -> None:
     monkeypatch.setitem(
-        STAGES, name, StageSpec(label=name, run=run, params={"marker": str})
+        STAGES, name, StageDefinition(label=name, run=run, params={"marker": str})
     )
 
 
@@ -146,6 +146,98 @@ def test_failure_is_recorded_on_the_task(settings, monkeypatch):
     task = runner.start("unit", {})
     failed = _wait(settings, int(task["id"]), {task_store.FAILED})
     assert "炸了" in (failed["error"] or "")
+
+
+def _scheduled_task(db, schedule_at="2020-01-01T00:00:00Z"):
+    task_id = task_store.create_task(
+        db,
+        stage="compile",
+        params={"datasets": ["hotpotqa"], "schedule_at": schedule_at},
+    )
+    db.commit()
+    return task_store.get_task(db, task_id)
+
+
+def test_scheduled_compile_is_stored_in_beijing_time_without_starting(
+    settings, monkeypatch
+):
+    runner = TaskRunner(settings)
+    spawned: list[tuple] = []
+    monkeypatch.setattr(runner, "_spawn", lambda *args: spawned.append(args))
+    monkeypatch.setattr(runner, "_arm_schedule", lambda *args: None)
+
+    task = runner.start(
+        "compile",
+        {
+            "datasets": ["hotpotqa"],
+            "schedule_at": "2099-01-02T08:30",
+        },
+    )
+
+    assert task["status"] == task_store.QUEUED
+    assert task["params"]["schedule_at"] == "2099-01-02T08:30:00+08:00"
+    assert spawned == []
+
+
+def test_only_compile_can_be_scheduled(settings):
+    runner = TaskRunner(settings)
+    with pytest.raises(TaskRejected, match="compile"):
+        runner.start(
+            "query",
+            {"compile_id": 1, "schedule_at": "2099-01-02T08:30"},
+        )
+
+
+def test_due_scheduled_compile_is_claimed_once(settings, db, monkeypatch):
+    runner = TaskRunner(settings)
+    spawned: list[tuple] = []
+    monkeypatch.setattr(runner, "_spawn", lambda *args: spawned.append(args))
+    monkeypatch.setattr(runner, "_require_free", lambda *args, **kwargs: None)
+    task = _scheduled_task(db)
+    task_id = int(task["id"])
+
+    runner._start_scheduled(task)
+    runner._start_scheduled(task)
+
+    assert task_store.get_task(db, task_id)["status"] == task_store.RUNNING
+    assert len(spawned) == 1
+
+
+def test_due_scheduled_compile_is_failed_when_it_cannot_start(
+    settings, db, monkeypatch
+):
+    runner = TaskRunner(settings)
+
+    def reject(*args, **kwargs):
+        raise TaskRejected("capacity unavailable")
+
+    monkeypatch.setattr(runner, "_require_free", reject)
+    task = _scheduled_task(db)
+    task_id = int(task["id"])
+
+    runner._start_scheduled(task)
+
+    failed = task_store.get_task(db, task_id)
+    assert failed["status"] == task_store.FAILED
+    assert failed["error"] == "capacity unavailable"
+
+
+def test_recover_rearms_scheduled_compile_instead_of_pausing(
+    settings, db, monkeypatch
+):
+    task = _scheduled_task(db, "2099-01-01T08:00:00+08:00")
+    task_id = int(task["id"])
+    runner = TaskRunner(settings)
+    armed: list[int] = []
+    monkeypatch.setattr(
+        runner,
+        "_arm_schedule",
+        lambda scheduled_task_id, scheduled_at: armed.append(scheduled_task_id),
+    )
+
+    assert runner.recover() == 0
+    assert task_store.get_task(db, task_id)["status"] == task_store.QUEUED
+    assert armed == [task_id]
 
 
 def test_failed_query_can_create_retry_task_without_original_task(settings, db, monkeypatch):
@@ -1283,7 +1375,7 @@ def test_cleanup_protects_active_descendants(
     )
     ids = {"compile": compile_id, "query": query_id, "eval": eval_id, "attribution": attribution_id}
     kind = {"query": "query", "evaluate": "eval", "attribute": "attribution"}[stage]
-    input_kind, param = run_store.STAGE_INPUTS[stage]
+    input_kind, param = run_store.stage_input(stage)
     task_id = task_store.create_task(db, stage=stage, params={param: ids[input_kind]})
     if bound:
         task_store.set_task_target(db, task_id, kind, ids[kind])

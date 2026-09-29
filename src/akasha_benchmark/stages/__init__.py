@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
 
 from ..task import Stage
@@ -8,27 +9,31 @@ from . import attribute, chain, compile, download, evaluate, normalize, query
 
 
 @dataclass(frozen=True)
-class StageSpec:
+class StageDefinition:
     label: str
     run: Stage
 
     params: dict[str, type] = field(default_factory=dict)
+    run_kind: str | None = None
+    input: tuple[str, str] | None = None
+    verify: Callable[..., None] | None = None
 
 
-STAGES: dict[str, StageSpec] = {
-    "download": StageSpec(
+STAGES: dict[str, StageDefinition] = {
+    "download": StageDefinition(
         label="下载数据集",
         run=download.run,
         params={"datasets": list},
     ),
-    "normalize": StageSpec(
+    "normalize": StageDefinition(
         label="归一化",
         run=normalize.run,
         params={"datasets": list},
     ),
-    "compile": StageSpec(
+    "compile": StageDefinition(
         label="编译",
         run=compile.run,
+        run_kind="compile",
         params={
             "run_id": str,
             "datasets": list,
@@ -38,11 +43,15 @@ STAGES: dict[str, StageSpec] = {
             "negatives_ratio": float,
             "full_corpus": bool,
             "import_concurrency": int,
+            "schedule_at": str,
         },
     ),
-    "query": StageSpec(
+    "query": StageDefinition(
         label="查询",
         run=query.run,
+        run_kind="query",
+        input=("compile", "compile_id"),
+        verify=chain.verify_query,
         params={
             "compile_id": int,
             "name": str,
@@ -52,9 +61,12 @@ STAGES: dict[str, StageSpec] = {
             "retry_failed": bool,
         },
     ),
-    "evaluate": StageSpec(
+    "evaluate": StageDefinition(
         label="评测",
         run=evaluate.run,
+        run_kind="eval",
+        input=("query", "query_id"),
+        verify=chain.verify_evaluate,
         params={
             "query_id": int,
             "name": str,
@@ -65,9 +77,12 @@ STAGES: dict[str, StageSpec] = {
             "concurrency": int,
         },
     ),
-    "attribute": StageSpec(
+    "attribute": StageDefinition(
         label="归因",
         run=attribute.run,
+        run_kind="attribution",
+        input=("eval", "eval_id"),
+        verify=chain.verify_attribute,
         params={
             "eval_id": int,
             "name": str,
@@ -107,4 +122,4 @@ def clean_params(stage: str, args: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-__all__ = ["STAGES", "StageSpec", "chain", "clean_params"]
+__all__ = ["STAGES", "StageDefinition", "chain", "clean_params"]

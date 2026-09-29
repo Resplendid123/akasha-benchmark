@@ -250,6 +250,20 @@ def test_answer_correct_uses_reference_token_coverage():
     assert attribution.classify(sample, [])["root_cause"] == attribution.CAUSE_ANSWER_INCORRECT
 
 
+@pytest.mark.parametrize(
+    "answer",
+    ["", None, attribution.query_store.ANSWER_GENERATION_UNAVAILABLE_ZH],
+)
+def test_empty_answers_use_the_same_rule_attribution(answer):
+    sample = _sample({"hit@5": 1.0}, mode="knowledge")
+    sample["answer"] = answer
+    sample["detail"]["reference_answers"] = ["expected answer"]
+
+    ruling = attribution.classify(sample, [])
+
+    assert ruling["root_cause"] == attribution.CAUSE_GENERATION_EMPTY
+
+
 def test_token_matching_survives_smart_quotes_and_hyphens():
     steps = [{"answer": "``Hey Jude ''", "support_doc_id": "g1"}]
     lineage = [{
