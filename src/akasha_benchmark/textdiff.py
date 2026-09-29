@@ -51,7 +51,14 @@ def build(
     lineage: dict[str, Any], question: str = "", *, top_terms: int = 40
 ) -> dict[str, Any]:
     source_text = "\n\n".join(c["text"] or "" for c in lineage.get("source_chunks") or [])
-    compiled_text = "\n\n".join(c["text"] or "" for c in lineage.get("chunks") or [])
+    compiled_text = "\n\n".join(
+        part
+        for part in (
+            *(a.get("title") or "" for a in lineage.get("artifacts") or []),
+            *(c["text"] or "" for c in lineage.get("chunks") or []),
+        )
+        if part
+    )
     diff = diff_vocabulary(source_text, compiled_text)
     lost = question_terms_lost(question, diff) if question else []
 

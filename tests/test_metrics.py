@@ -213,12 +213,17 @@ def test_every_registered_metric_has_structured_evidence_and_formula():
     assert all(row.get("formula") for row in evidence.values())
 
 
-def _sample(metrics: dict, mode: str = "knowledge", gold=("g1",)) -> dict:
+def _sample(
+    metrics: dict, mode: str = "knowledge", gold=("g1",), correct: bool = False
+) -> dict:
+    detail = {"gold_doc_ids": list(gold), "question": "q"}
+    if correct:
+        detail["reference_answers"] = ["Rita Moreno"]
     return {
         "answer_mode": mode,
         "metrics": metrics,
-        "answer": "x",
-        "detail": {"gold_doc_ids": list(gold), "question": "q"},
+        "answer": "The answer is Rita Moreno." if correct else "x",
+        "detail": detail,
     }
 
 
@@ -230,7 +235,7 @@ def _musique(metrics: dict, steps: list[dict], mode: str = "general") -> dict:
 
 
 def test_correct_answer_has_an_explicit_root_cause():
-    ruling = attribution.classify(_sample({"hit@5": 0.0, "em": 1.0}), [])
+    ruling = attribution.classify(_sample({"hit@5": 0.0}, correct=True), [])
     assert ruling["root_cause"] == attribution.CAUSE_ANSWER_CORRECT
 
 
@@ -243,6 +248,23 @@ def test_answer_correct_uses_reference_token_coverage():
     sample["answer"] = "This is a complete explanation."
     sample["detail"]["reference_answers"] = ["in"]
     assert attribution.classify(sample, [])["root_cause"] == attribution.CAUSE_ANSWER_INCORRECT
+
+
+def test_token_matching_survives_smart_quotes_and_hyphens():
+    steps = [{"answer": "``Hey Jude ''", "support_doc_id": "g1"}]
+    lineage = [{
+        "doc_id": "g1",
+        "source_text": "``Hey Jude '' is a Beatles song.",
+        "compiled_text": "“Hey Jude” is a Beatles song.",
+    }]
+    report = attribution.analyze_compiled_answers(_musique({}, steps), lineage)
+    assert report["steps"][0]["status"] == "preserved"
+
+    hyphen = [{"answer": "fleur - de-lis", "support_doc_id": "g1"}]
+    lineage[0]["source_text"] = "the fleur - de-lis symbol"
+    lineage[0]["compiled_text"] = "the fleur-de-lis is a symbol of New Orleans"
+    report = attribution.analyze_compiled_answers(_musique({}, hyphen), lineage)
+    assert report["steps"][0]["status"] == "preserved"
 
 
 def test_rule_attribution_ignores_judge_metrics():
@@ -264,24 +286,17 @@ def test_rule_attribution_ignores_judge_metrics():
 
 def test_answer_correct_outranks_every_failure_cause():
     for metrics, lineage, mode in (
-        ({"hit@5": 0.0, "em": 1.0}, [{"question_terms_lost": ["grammy"]}], "knowledge"),
-        ({"hit@5": 0.0, "em": 1.0, "uncited_gold_count": 1.0}, [], "knowledge"),
-        ({"hit@5": 0.0, "em": 1.0}, None, "general"),
+        ({"hit@5": 0.0}, [{"question_terms_lost": ["grammy"]}], "knowledge"),
+        ({"hit@5": 0.0, "uncited_gold_count": 1.0}, [], "knowledge"),
+        ({"hit@5": 0.0}, None, "general"),
     ):
-        ruling = attribution.classify(_sample(metrics, mode=mode), lineage)
+        ruling = attribution.classify(_sample(metrics, mode=mode, correct=True), lineage)
         expected = attribution.CAUSE_GENERATION_FALLBACK if mode == "general" else attribution.CAUSE_ANSWER_CORRECT
         assert ruling["root_cause"] == expected
 
 
 def test_correct_general_answer_is_answer_correct():
-    em_hit = attribution.classify(
-        _sample({"hit@5": 1.0, "em": 1.0}, mode="general"), None
-    )
-    assert em_hit["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
-
-    contained = _sample({"hit@5": 1.0, "em": 0.0}, mode="general")
-    contained["answer"] = "The answer is Rita Moreno."
-    contained["detail"]["reference_answers"] = ["Rita Moreno"]
+    contained = _sample({"hit@5": 1.0}, mode="general", correct=True)
     ruling = attribution.classify(contained, None)
     assert ruling["root_cause"] == attribution.CAUSE_GENERATION_FALLBACK
 
@@ -289,7 +304,6 @@ def test_correct_general_answer_is_answer_correct():
 def test_fully_supported_answer_is_correct_even_with_long_context():
     sample = _sample(
         {
-            "em": 0.0,
             "f1": 0.35,
             "faithfulness": 1.0,
             "hit@5": 1.0,
@@ -311,7 +325,7 @@ def test_fully_supported_answer_is_correct_even_with_long_context():
     "metrics,expected",
     [
         ({"faithfulness": 1.0, "hit@5": 1.0, "full_coverage@5": 1.0}, attribution.CAUSE_ANSWER_INCORRECT),
-        ({"hit@5": 0.0, "em": 0.0, "f1": 0.9}, attribution.CAUSE_RETRIEVAL_MISS),
+        ({"hit@5": 0.0, "f1": 0.9}, attribution.CAUSE_RETRIEVAL_MISS),
         ({"hit@5": 1.0, "full_coverage@5": 1.0, "f1": 0.1}, attribution.CAUSE_ANSWER_INCORRECT),
     ],
 )
@@ -602,7 +616,7 @@ def test_evidence_chain_keeps_all_matching_retrieved_evidence():
 
 
 def test_general_routing_uses_evidence_chain_before_answer_correctness():
-    sample = _sample({"hit@10": 1.0, "em": 0.0}, mode="general")
+    sample = _sample({"hit@10": 1.0}, mode="general")
     sample["dataset"] = "musique"
     sample["answer"] = "The answer is Acme."
     sample["detail"]["reference_answers"] = ["Acme"]

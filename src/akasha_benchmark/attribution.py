@@ -23,9 +23,13 @@ CAUSE_UNKNOWN = "unknown"
 
 EVIDENCE_CHAIN_SUPPORTED_OVERLAP = 0.8
 EVIDENCE_CHAIN_PARTIAL_OVERLAP = 0.35
-COMPILED_ANSWER_TOKEN_RECALL = 0.8
-REFERENCE_WINDOW_FACTOR = 2
+COMPILED_ANSWER_TOKEN_RECALL = 0.5
+REFERENCE_ANSWER_TOKEN_RECALL = 0.5
 REFERENCE_STOPWORDS = {"a", "an", "and", "in", "of", "on", "the", "to"}
+SMART_QUOTES = str.maketrans(
+    "‘’‚‛′“”„‟″",
+    "'''''" + '"""""',
+)
 TITLE_ABBREVIATIONS = {
     "gen": "general",
     "lt": "lieutenant",
@@ -42,10 +46,10 @@ TITLE_ABBREVIATIONS = {
 
 
 def _normalized_tokens(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKC", text or "")
-    normalized = re.sub(r"[\'’]s\b", "", normalized, flags=re.IGNORECASE)
-    normalized = re.sub(r"(?<=s)[\'’](?=\W|$)", "", normalized, flags=re.IGNORECASE)
-    normalized = normalized.replace("’", "'")
+    normalized = unicodedata.normalize("NFKC", text or "").translate(SMART_QUOTES)
+    normalized = re.sub(r"'s\b", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"(?<=s)'(?=\W|$)", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"[-–—_*`]+", " ", normalized)
     return [TITLE_ABBREVIATIONS.get(token, token) for token in qa.tokenize(normalized)]
 
 
@@ -280,19 +284,11 @@ def _usable_references(references: list[str]) -> list[list[str]]:
 
 
 def _reference_covered(answer_tokens: list[str], reference_tokens: list[str]) -> bool:
-
-    if _contains_tokens(answer_tokens, reference_tokens):
-        return True
-
-    window = len(reference_tokens) * REFERENCE_WINDOW_FACTOR
-    needed = set(reference_tokens)
-    positions = [
-        index for index, token in enumerate(answer_tokens) if token in needed
-    ]
-    return any(
-        needed <= set(answer_tokens[start : start + window])
-        for start in positions
-    )
+    if not reference_tokens:
+        return False
+    answer_set = set(answer_tokens)
+    hit = sum(1 for t in reference_tokens if t in answer_set)
+    return hit / len(reference_tokens) >= REFERENCE_ANSWER_TOKEN_RECALL
 
 
 def _contains_reference(answer: str, references: list[str]) -> bool:
@@ -389,7 +385,7 @@ def classify(
         lost_terms.extend(entry.get("question_terms_lost") or [])
     lost_terms = sorted(set(lost_terms))
 
-    answer_correct = float(metrics.get("em", 0.0)) >= 1.0 or reference_contained
+    answer_correct = reference_contained
     evidence: dict[str, Any] = {
         "answer_mode": answer_mode,
         "has_retrieval": has_retrieval,
