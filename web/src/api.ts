@@ -78,13 +78,6 @@ const query = (params: Record<string, string | number | boolean | undefined>) =>
 }
 
 export const api = {
-  health: () =>
-    request<{
-      ok: boolean
-      settings: Record<string, unknown>
-      startup: { recovered_tasks: number }
-    }>('/api/health'),
-
   connection: () => request<Connection>('/api/connection'),
   saveConnection: (payload: Record<string, unknown>) =>
     put<{ updated: string[]; connection: Connection }>('/api/connection', payload),

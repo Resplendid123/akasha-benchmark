@@ -11,9 +11,11 @@ import {
   Loading,
   ModeTag,
   Pager,
+  Pass,
   RecordNav,
   RecordSearch,
-  StatusTag,
+  RunCells,
+  RunCountCells,
   Timing,
   num,
   useAction,
@@ -28,14 +30,12 @@ export function Query({
   onSelectCompile,
   onOpenCompile,
   onEvaluate,
-  onOpenTasks,
 }: {
   activeCompile: number | null
   activeQuery: number | null
   onSelectCompile: (id: number) => void
   onOpenCompile: (compileId: number) => void
   onEvaluate: (queryId: number) => void
-  onOpenTasks: () => void
 }) {
   const compiles = useAsync(() => api.compiles(), [])
   const [openQuery, setOpenQuery] = useState<number | null>(activeQuery)
@@ -85,14 +85,7 @@ export function Query({
             </select>
           </Field>
           {compile && (
-            <NewQuery
-              key={compile.id}
-              compile={compile}
-              onStarted={() => {
-                compiles.reload()
-                onOpenTasks()
-              }}
-            />
+            <NewQuery key={compile.id} compile={compile} onStarted={compiles.reload} />
           )}
         </ConfigPanel>
       )}
@@ -106,6 +99,7 @@ export function Query({
                 <th>名称</th>
                 <th>Answer 模型</th>
                 <th>状态</th>
+                <th>质量阀门</th>
                 <th className="num">样本数</th>
                 <th className="num">成功</th>
                 <th className="num">并发</th>
@@ -122,16 +116,14 @@ export function Query({
                   : null
                 return (
                   <tr key={run.id} className={openQuery === run.id ? 'selected' : ''}>
-                  <td className="mono small">
-                      {run.name} <span className="muted">#{run.id}</span>
-                  </td>
-                  <td className="small">{run.model_label ?? '—'}</td>
+                    <RunCells run={run} />
                     <td>
-                      <StatusTag status={run.status} />
+                      {run.status === 'succeeded' ? <Pass ok /> :
+                        run.status === 'failed' ? <Pass ok={false} /> :
+                          <span className="tag">进行中</span>}
                     </td>
-                  <td className="num">{run.sample_count}</td>
-                  <td className="num">{run.success_count}</td>
-                  <td className="num mono">{run.concurrency}</td>
+                    <RunCountCells run={run} />
+                    <td className="num mono">{run.concurrency}</td>
                     <td>
                       <Timing
                         startedAt={run.created_at}
@@ -166,7 +158,6 @@ export function Query({
                               retry.run(async () => {
                                 const task = await api.retryFailedQuery(run.id)
                                 compiles.reload()
-                                onOpenTasks()
                                 return task
                               })
                             }
@@ -212,7 +203,7 @@ function NewQuery({
   const [selected, setSelected] = useState<string[]>(compile.datasets)
   const [name, setName] = useState('')
   const [limit, setLimit] = useState<number | ''>('')
-  const [concurrency, setConcurrency] = useState(1)
+  const [concurrency, setConcurrency] = useState(5)
   const start = useAction<unknown>()
 
   const available = Object.keys(compile.stats)

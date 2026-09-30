@@ -19,10 +19,12 @@ import {
   Field,
   Loading,
   ModeTag,
+  downloadText,
   Pager,
   RecordNav,
   RecordSearch,
-  StatusTag,
+  RunCells,
+  RunCountCells,
   Timing,
   useAction,
   useAsync,
@@ -37,13 +39,11 @@ export function Attribution({
   onSelectEval,
   onOpenEval,
   onOpenSettings,
-  onOpenTasks,
 }: {
   activeEval: number | null
   onSelectEval: (id: number) => void
   onOpenEval: (queryId: number, evalId: number) => void
   onOpenSettings: () => void
-  onOpenTasks: () => void
 }) {
   const compiles = useAsync(() => api.compiles(), [])
   const [open, setOpen] = useState<number | null>(null)
@@ -83,14 +83,7 @@ export function Attribution({
             </select>
           </Field>
           {current && (
-            <NewAttribution
-              evalRun={current}
-              onOpenSettings={onOpenSettings}
-              onStarted={() => {
-                compiles.reload()
-                onOpenTasks()
-              }}
-            />
+            <NewAttribution evalRun={current} onOpenSettings={onOpenSettings} onStarted={compiles.reload} />
           )}
         </ConfigPanel>
       )}
@@ -114,15 +107,8 @@ export function Attribution({
             <tbody>
               {current.attributions.map((run: AttributionRun) => (
                 <tr key={run.id} className={open === run.id ? 'selected' : ''}>
-                  <td className="mono small">
-                    {run.name} <span className="muted">#{run.id}</span>
-                  </td>
-                  <td className="small">{run.model_label ?? '—'}</td>
-                  <td>
-                    <StatusTag status={run.status} />
-                  </td>
-                  <td className="num">{run.sample_count}</td>
-                  <td className="num">{run.success_count}</td>
+                  <RunCells run={run} />
+                  <RunCountCells run={run} />
                   <td>
                     <span className={`tag ${run.report_provider_id !== null ? 'ok' : ''}`}>
                       {run.report_provider_id !== null ? '已请求' : '未使用模型'}
@@ -276,18 +262,6 @@ const ROOT_CAUSE_ORDER = [
 function exportFilename(name: string): string {
   const cleaned = name.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').replace(/\s+/g, '-')
   return cleaned || 'attribution'
-}
-
-function downloadText(content: string, filename: string, type: string): void {
-  const blob = new Blob([content], { type })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = filename
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  URL.revokeObjectURL(url)
 }
 
 function Conclusions({ attributionId, evalId }: { attributionId: number; evalId: number }) {
@@ -602,69 +576,20 @@ function QueryAuditPanel({ evidence }: { evidence: unknown }) {
     )
   }
   const audit = evidence as QueryAuditSnapshot
-  if (!audit.decisionReason && !audit.generalAnswerReason && !audit.answerMode) return null
-  const drops = audit.retrieval?.dropped ?? []
-  const dropCounts = drops.reduce<Record<string, number>>((counts, drop) => {
-    const reason = drop.reason || 'unknown'
-    counts[reason] = (counts[reason] ?? 0) + 1
-    return counts
-  }, {})
-  const contextRatio = audit.packContextLength && audit.answerContextLength
-    ? audit.answerContextLength / audit.packContextLength
-    : null
+  if (!audit.budget) return null
   return (
-    <section className="query-audit-panel">
-      <header className="query-audit-header">
-        <div>
-          <div className="query-audit-eyebrow">PostgreSQL query trace</div>
-          <h4>PG Query Audit</h4>
-        </div>
-        <div className="query-audit-status">
-          <ModeTag mode={audit.answerMode ?? null} />
-          {audit.decisionReason && <span className="tag accent">{audit.decisionReason}</span>}
-        </div>
-      </header>
-
-      <div className="query-audit-stats">
-        <div className="query-audit-stat">
-          <span>授权 chunks</span>
-          <strong>{audit.authorizedChunkCount ?? '—'}</strong>
-        </div>
-        <div className="query-audit-stat">
-          <span>最终 sources</span>
-          <strong>{audit.finalAuthorizedSourceCount ?? '—'}</strong>
-        </div>
-        <div className="query-audit-stat">
-          <span>Graph selected</span>
-          <strong>{audit.graph?.selectedCount ?? '—'}</strong>
-        </div>
-        <div className="query-audit-stat context-size">
-          <span>上下文字符</span>
-          <strong>
-            {audit.packContextLength?.toLocaleString() ?? '—'}
-            <span className="query-audit-arrow">→</span>
-            {audit.answerContextLength?.toLocaleString() ?? '—'}
-          </strong>
-          {contextRatio !== null && <small>{contextRatio.toFixed(1)}× expansion</small>}
-        </div>
-      </div>
-
-      <div className="query-audit-drops">
-        <span className="query-audit-label">Retrieval drops</span>
-        <div className="metric-tags">
-          {Object.keys(dropCounts).length ? Object.entries(dropCounts).map(([reason, count]) => (
-            <span className="tag warn" key={reason}>{reason}{count > 1 ? ` ×${count}` : ''}</span>
-          )) : <span className="muted small">无</span>}
-        </div>
-      </div>
-
-      {audit.generalAnswerReason && (
-        <div className="query-audit-reason">
-          <div className="query-audit-reason-title">模型选择 General 的理由</div>
-          <p>{audit.generalAnswerReason}</p>
-        </div>
+    <div className="query-audit-inline">
+      {audit.budget && (
+        <Collapsible title="上下文预算">
+          <div className="query-audit-budget">
+            <div><span>includedItemCount</span><strong>{audit.budget.includedItemCount ?? '—'}</strong></div>
+            <div><span>omittedItemCount</span><strong>{audit.budget.omittedItemCount ?? '—'}</strong></div>
+            <div><span>maxContextLength</span><strong>{audit.budget.maxContextLength?.toLocaleString() ?? '—'}</strong></div>
+            <div><span>usedContextLength</span><strong>{audit.budget.usedContextLength?.toLocaleString() ?? '—'}</strong></div>
+          </div>
+        </Collapsible>
       )}
-    </section>
+    </div>
   )
 }
 
@@ -691,6 +616,9 @@ function SampleChain({
   const goldDocuments = data.metric_interpretations.find(
     (item) => item.evidence?.gold_documents,
   )?.evidence?.gold_documents ?? []
+  const audit = attributionResult?.evidence?.query_audit as QueryAuditSnapshot | undefined
+  const generalReason =
+    data.answer_mode === 'general' ? audit?.generalAnswerReason : undefined
 
   return (
     <div className="panel flat sample-chain" style={{ marginTop: 12 }}>
@@ -702,9 +630,18 @@ function SampleChain({
         <dt>系统答案</dt>
         <dd>{data.answer || '—'}</dd>
         <dt>回答模式</dt>
-        <dd>
+        <dd className="row tight">
           <ModeTag mode={data.answer_mode} />
+          {audit?.decisionReason && (
+            <span className="tag accent">决策：{audit.decisionReason}</span>
+          )}
         </dd>
+        {generalReason && (
+          <>
+            <dt className="general-reason-term">General 理由</dt>
+            <dd className="general-reason-text">{generalReason}</dd>
+          </>
+        )}
         <dt>Gold 文档</dt>
         <dd className="gold-documents-cell">
           <div className="gold-document-list">
@@ -719,9 +656,10 @@ function SampleChain({
         </dd>
       </dl>
 
+      <QueryAuditPanel evidence={attributionResult?.evidence?.query_audit} />
+
       <CompiledAnswersPanel evidence={attributionResult?.evidence?.compiled_answers} />
       <EvidenceChainPanel evidence={attributionResult?.evidence?.evidence_chain} />
-      <QueryAuditPanel evidence={attributionResult?.evidence?.query_audit} />
 
       <MetricInterpretations
         items={data.metric_interpretations}
@@ -736,9 +674,6 @@ function SampleChain({
             response={data.response ?? {}}
             goldDocIds={(data.detail.gold_doc_ids as string[] | undefined) ?? []}
           />
-          <Collapsible title="完整响应">
-            <pre className="block tall">{JSON.stringify(data.response, null, 2)}</pre>
-          </Collapsible>
         </Collapsible>
       </div>
 

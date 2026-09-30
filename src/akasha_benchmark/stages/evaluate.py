@@ -394,7 +394,7 @@ def _judge(
             if pending
             else []
         )
-        for (metric, parse, _), reply in zip(pending, replies):
+        for (metric, parse, _), reply in zip(pending, replies, strict=True):
             _record_reply(ctx, eval_id, metric, row, parse, reply)
 
         ctx.db.commit()

@@ -419,6 +419,11 @@ def classify(
                 "finalAuthorizedSourceCount",
                 "packContextLength",
                 "answerContextLength",
+                "contextBudget",
+                "packContextBudget",
+                "answerContextBudget",
+                "truncatedCount",
+                "budget",
                 "graph",
                 "retrieval",
             )

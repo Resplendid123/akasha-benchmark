@@ -71,13 +71,6 @@ def verify_attribute(connection, attribution_id: int) -> None:
         raise RuntimeError("归因没有覆盖评测的全部样本")
 
 
-VERIFY = {
-    "query": verify_query,
-    "evaluate": verify_evaluate,
-    "attribute": verify_attribute,
-}
-
-
 def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
 
     dataset = str(params.get("dataset") or DATASETS[0])

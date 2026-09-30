@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from .base import DatasetAdapter
+from .common import require_native_id
 from .corpus import CorpusIndex
 from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample_id
 
@@ -37,9 +38,7 @@ class MusiqueAdapter(DatasetAdapter):
     def parse_row(
         self, row: dict[str, Any], row_index: int, corpus: CorpusIndex
     ) -> CanonicalSample:
-        native_id = row.get("id")
-        if not isinstance(native_id, str) or not native_id:
-            raise ValueError(f"{self.name}: row {row_index} has no usable 'id'")
+        native_id = require_native_id(row, row_index, self.name, "id")
 
         answer = row.get("answer")
         if not isinstance(answer, str) or not answer:

@@ -527,8 +527,28 @@ export interface QueryAuditSnapshot {
   finalAuthorizedSourceCount?: number
   packContextLength?: number
   answerContextLength?: number
+  contextBudget?: number
+  packContextBudget?: number
+  answerContextBudget?: number
+  truncatedCount?: number
+  budget?: {
+    includedItemCount?: number
+    omittedItemCount?: number
+    maxContextLength?: number
+    usedContextLength?: number
+  }
   graph?: { candidateCount?: number; selectedCount?: number; gatedOutCount?: number }
-  retrieval?: { topK?: number; threshold?: number; dropped?: Array<{ reason?: string; pageId?: string; chunkId?: string }> }
+  retrieval?: {
+    topK?: number
+    threshold?: number
+    dropped?: Array<{
+      reason?: string
+      pageId?: string
+      chunkId?: string
+      title?: string
+      text?: string
+    }>
+  }
 }
 
 export interface EvidenceChainStep {

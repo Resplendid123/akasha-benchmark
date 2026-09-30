@@ -179,9 +179,15 @@ def task_tree(connection: sqlite3.Connection) -> dict[str, Any]:
     return {
         "total_tasks": len(tasks),
         "inactive_total": count_inactive_tasks(connection),
-        "compiles": roots,
+        "compiles": [node for node in roots if _prune_empty(node)],
         "unlinked_tasks": unlinked,
     }
+
+
+def _prune_empty(node: dict[str, Any]) -> bool:
+    """剪掉任务记录已清理的运行节点，保留仍有任务的子树。"""
+    node["children"] = [child for child in node["children"] if _prune_empty(child)]
+    return bool(node["tasks"] or node["pending_tasks"] or node["children"])
 
 
 def active_tasks(connection: sqlite3.Connection) -> list[dict[str, Any]]:

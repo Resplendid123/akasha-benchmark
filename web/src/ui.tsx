@@ -191,6 +191,17 @@ export function usePoll(active: boolean, reload: () => void, ms = 3000) {
   }, [active, reload, ms])
 }
 
+export function downloadText(content: string, filename: string, type: string): void {
+  const url = URL.createObjectURL(new Blob([content], { type }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
 export function Loading({ what }: { what: string }) {
   return <p className="muted">正在加载{what}…</p>
 }
@@ -290,6 +301,38 @@ export function AnswerModeFilter({
         </button>
       ))}
     </div>
+  )
+}
+
+type RunIdentity = {
+  id: number
+  name: string
+  model_label: string | null
+  status: RunStatus
+  sample_count: number
+  success_count: number
+}
+
+export function RunCells({ run }: { run: RunIdentity }) {
+  return (
+    <>
+      <td className="mono small">
+        {run.name} <span className="muted">#{run.id}</span>
+      </td>
+      <td className="small">{run.model_label ?? '—'}</td>
+      <td>
+        <StatusTag status={run.status} />
+      </td>
+    </>
+  )
+}
+
+export function RunCountCells({ run }: { run: RunIdentity }) {
+  return (
+    <>
+      <td className="num">{run.sample_count}</td>
+      <td className="num">{run.success_count}</td>
+    </>
   )
 }
 
@@ -500,18 +543,20 @@ export function Collapsible({
   title,
   children,
   open = false,
+  compact = false,
 }: {
   title: React.ReactNode
   children: React.ReactNode
   open?: boolean
+  compact?: boolean
 }) {
   const [shown, setShown] = useState(open)
   return (
-    <div style={{ marginBottom: 10 }}>
+    <div className={compact ? 'collapsible compact' : 'collapsible'} style={{ marginBottom: compact ? 3 : 10 }}>
       <button
         className="action small"
         onClick={() => setShown((s) => !s)}
-        style={{ marginBottom: shown ? 8 : 0 }}
+        style={{ marginBottom: shown ? (compact ? 3 : 8) : 0 }}
       >
         {shown ? '▾' : '▸'} {title}
       </button>

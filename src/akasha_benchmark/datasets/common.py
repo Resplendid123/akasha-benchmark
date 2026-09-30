@@ -5,6 +5,13 @@ from typing import Any
 from .corpus import CorpusIndex
 
 
+def require_native_id(row: dict[str, Any], row_index: int, dataset: str, key: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{dataset}: row {row_index} has no usable {key!r}")
+    return value
+
+
 def gold_titles_from_supporting_facts(
     row: dict[str, Any], row_index: int, dataset: str
 ) -> tuple[str, ...]:

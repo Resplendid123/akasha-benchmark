@@ -29,7 +29,7 @@ def parse_generated_question(payload: dict[str, Any]) -> str:
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if not left or not right or len(left) != len(right):
         raise ValueError("embedding vectors must be non-empty and have equal dimensions")
-    dot = sum(a * b for a, b in zip(left, right))
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
     norm_left = math.sqrt(sum(a * a for a in left))
     norm_right = math.sqrt(sum(b * b for b in right))
     if not norm_left or not norm_right:

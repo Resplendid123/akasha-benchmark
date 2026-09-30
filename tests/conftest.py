@@ -92,25 +92,24 @@ def itfaq_dataset_dir(tmp_path: Path) -> Path:
     return directory
 
 
-@pytest.fixture
-def itfaq_normalized(db, itfaq_dataset_dir: Path, monkeypatch):
-    from akasha_benchmark.datasets.itfaq import ITFaqAdapter
+def _normalize(db, name: str, directory: Path, monkeypatch):
+    from akasha_benchmark.datasets.registry import get_adapter
     from akasha_benchmark.stages import normalize
 
-    monkeypatch.setattr(ITFaqAdapter, "expected_qa_rows", lambda self: None)
-    normalize.normalize_dataset(db, "itfaq", None, itfaq_dataset_dir)
+    monkeypatch.setattr(type(get_adapter(name)), "expected_qa_rows", lambda self: None)
+    normalize.normalize_dataset(db, name, None, directory)
+    assert data_store.get_dataset(db, name) is not None
     return db
+
+
+@pytest.fixture
+def itfaq_normalized(db, itfaq_dataset_dir: Path, monkeypatch):
+    return _normalize(db, "itfaq", itfaq_dataset_dir, monkeypatch)
 
 
 @pytest.fixture
 def normalized(db, dataset_dir: Path, monkeypatch):
-    from akasha_benchmark.datasets.hotpotqa import HotpotQAAdapter
-    from akasha_benchmark.stages import normalize
-
-    monkeypatch.setattr(HotpotQAAdapter, "expected_qa_rows", lambda self: None)
-    normalize.normalize_dataset(db, "hotpotqa", None, dataset_dir)
-    assert data_store.get_dataset(db, "hotpotqa") is not None
-    return db
+    return _normalize(db, "hotpotqa", dataset_dir, monkeypatch)
 
 
 def make_compile_run(connection, run_id="r", datasets=("d",), **overrides) -> int:

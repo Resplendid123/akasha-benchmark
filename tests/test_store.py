@@ -314,15 +314,28 @@ def test_task_tree_preserves_one_to_many_run_branches(db, compile_id, query_id, 
         metrics=["em"],
         judge_provider_id=None,
     )
-    for evaluation, suffix in ((eval_id, "a1"), (eval_id, "a2"), (second_eval, "a3")):
+    attributions = [
         attribution_store.create_attribution_run(
             db, name=suffix, eval_id=evaluation, report_provider_id=None
         )
+        for evaluation, suffix in ((eval_id, "a1"), (eval_id, "a2"), (second_eval, "a3"))
+    ]
 
     compile_task = task_store.create_task(db, stage="compile", params={})
     task_store.set_task_target(db, compile_task, "compile", compile_id)
     query_task = task_store.create_task(db, stage="query", params={"compile_id": compile_id})
     task_store.set_task_target(db, query_task, "query", query_id)
+    for evaluation in (eval_id, second_eval):
+        task_store.set_task_target(
+            db, task_store.create_task(db, stage="evaluate", params={}), "eval", evaluation
+        )
+    for attribution in attributions:
+        task_store.set_task_target(
+            db,
+            task_store.create_task(db, stage="attribute", params={}),
+            "attribution",
+            attribution,
+        )
     pending_eval = task_store.create_task(db, stage="evaluate", params={"query_id": second_query})
     unlinked = task_store.create_task(db, stage="normalize", params={})
     db.commit()

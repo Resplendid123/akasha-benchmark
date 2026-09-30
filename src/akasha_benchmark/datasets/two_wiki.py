@@ -3,12 +3,13 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from .base import DatasetAdapter
-from .common import gold_titles_from_supporting_facts, resolve_gold_doc_ids
+from .common import (
+    gold_titles_from_supporting_facts,
+    require_native_id,
+    resolve_gold_doc_ids,
+)
 from .corpus import CorpusIndex
 from .models import CanonicalSample, DataDependency, SubsetStrategy, make_sample_id
-
-
-SENTENCE_JOINER = " "
 
 
 class TwoWikiMultihopQAAdapter(DatasetAdapter):
@@ -26,9 +27,7 @@ class TwoWikiMultihopQAAdapter(DatasetAdapter):
     def parse_row(
         self, row: dict[str, Any], row_index: int, corpus: CorpusIndex
     ) -> CanonicalSample:
-        native_id = row.get("_id")
-        if not isinstance(native_id, str) or not native_id:
-            raise ValueError(f"{self.name}: row {row_index} has no usable '_id'")
+        native_id = require_native_id(row, row_index, self.name, "_id")
 
         answer = row.get("answer")
         if not isinstance(answer, str) or not answer:

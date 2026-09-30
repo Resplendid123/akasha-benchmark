@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 from akasha_benchmark.metrics import registry
@@ -16,12 +17,24 @@ from akasha_benchmark.store import (
 _MISSING = object()
 
 
+@dataclass(frozen=True, slots=True)
+class _Lookups:
+    compile_stats: dict[int, list[dict[str, Any]]]
+    compile_samples: dict[tuple[int, str], int]
+    queries_by_compile: dict[int, list[dict[str, Any]]]
+    evals_by_query: dict[int, list[dict[str, Any]]]
+    attributions_by_eval: dict[int, list[dict[str, Any]]]
+    query_stats: dict[int, list[dict[str, Any]]]
+    query_sample_counts: dict[int, int]
+    eval_samples: dict[int, list[dict[str, Any]]]
+    verdicts: dict[tuple[int, str, str], str | None]
+    attribution_counts: dict[int, dict[str, Any]]
+    provider_labels: dict[int, str]
+
+
 def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
     compile_rows = compile_store.list_compile_runs(connection)
-    query_rows = query_store.list_query_runs(connection)
-    eval_rows = eval_store.list_eval_runs(connection)
-    attribution_rows = attribution_store.list_attribution_runs(connection)
     compile_stats = _grouped(
         [
             dict(row)
@@ -87,49 +100,31 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         for row in connection.execute("SELECT id, label FROM model_provider")
     }
 
-    queries_by_compile = _grouped(query_rows, "compile_id")
-    evals_by_query = _grouped(eval_rows, "query_id")
-    attributions_by_eval = _grouped(attribution_rows, "eval_id")
-    return [
-        _compile_view(
-            row,
-            compile_stats=compile_stats,
-            compile_samples=compile_samples,
-            queries=queries_by_compile.get(int(row["id"]), []),
-            evals_by_query=evals_by_query,
-            attributions_by_eval=attributions_by_eval,
-            query_stats=query_stats,
-            query_sample_counts=query_sample_counts,
-            eval_samples=eval_samples,
-            verdicts=verdicts,
-            attribution_counts=attribution_counts,
-            provider_labels=provider_labels,
-        )
-        for row in compile_rows
-    ]
+    lookups = _Lookups(
+        compile_stats=compile_stats,
+        compile_samples=compile_samples,
+        queries_by_compile=_grouped(query_store.list_query_runs(connection), "compile_id"),
+        evals_by_query=_grouped(eval_store.list_eval_runs(connection), "query_id"),
+        attributions_by_eval=_grouped(
+            attribution_store.list_attribution_runs(connection), "eval_id"
+        ),
+        query_stats=query_stats,
+        query_sample_counts=query_sample_counts,
+        eval_samples=eval_samples,
+        verdicts=verdicts,
+        attribution_counts=attribution_counts,
+        provider_labels=provider_labels,
+    )
+    return [_compile_view(row, lookups) for row in compile_rows]
 
 
-def _compile_view(
-    row: dict[str, Any],
-    *,
-    compile_stats: dict[int, list[dict[str, Any]]],
-    compile_samples: dict[tuple[int, str], int],
-    queries: list[dict[str, Any]],
-    evals_by_query: dict[int, list[dict[str, Any]]],
-    attributions_by_eval: dict[int, list[dict[str, Any]]],
-    query_stats: dict[int, list[dict[str, Any]]],
-    query_sample_counts: dict[int, int],
-    eval_samples: dict[int, list[dict[str, Any]]],
-    verdicts: dict[tuple[int, str, str], str | None],
-    attribution_counts: dict[int, dict[str, Any]],
-    provider_labels: dict[int, str],
-) -> dict[str, Any]:
+def _compile_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
     compile_id = int(row["id"])
     stats = {
         item["dataset"]: {key: value for key, value in item.items() if key != "compile_id"}
-        for item in compile_stats.get(compile_id, [])
+        for item in lookups.compile_stats.get(compile_id, [])
     }
-    for (sample_compile_id, dataset), count in compile_samples.items():
+    for (sample_compile_id, dataset), count in lookups.compile_samples.items():
         if sample_compile_id == compile_id:
             stats.setdefault(dataset, {"dataset": dataset})["samples"] = count
     missing = sum(
@@ -139,7 +134,7 @@ def _compile_view(
         **_public_run(row),
         "model_label": _remote_model_labels(
             loads(row.get("model_configs_json"), {}),
-            ("compiler", "embedding", "image"),
+            ("compiler",),
         ),
         "datasets": loads(row["datasets_json"], []),
         "stats": stats,
@@ -149,38 +144,17 @@ def _compile_view(
         "compiled_pages": _compiled_pages(row, stats),
         "compiled_pages_error": None,
         "queries": [
-            _query_view(
-                query,
-                evals=evals_by_query.get(int(query["id"]), []),
-                attributions_by_eval=attributions_by_eval,
-                query_stats=query_stats,
-                query_sample_counts=query_sample_counts,
-                eval_samples=eval_samples,
-                verdicts=verdicts,
-                attribution_counts=attribution_counts,
-                provider_labels=provider_labels,
-            )
-            for query in queries
+            _query_view(query, lookups)
+            for query in lookups.queries_by_compile.get(compile_id, [])
         ],
     }
 
 
-def _query_view(
-    row: dict[str, Any],
-    *,
-    evals: list[dict[str, Any]],
-    attributions_by_eval: dict[int, list[dict[str, Any]]],
-    query_stats: dict[int, list[dict[str, Any]]],
-    query_sample_counts: dict[int, int],
-    eval_samples: dict[int, list[dict[str, Any]]],
-    verdicts: dict[tuple[int, str, str], str | None],
-    attribution_counts: dict[int, dict[str, Any]],
-    provider_labels: dict[int, str],
-) -> dict[str, Any]:
+def _query_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
     query_id = int(row["id"])
     stats = {
         item["dataset"]: {key: value for key, value in item.items() if key != "query_id"}
-        for item in query_stats.get(query_id, [])
+        for item in lookups.query_stats.get(query_id, [])
     }
     response_count = sum(int(item["responses"] or 0) for item in stats.values())
     return {
@@ -188,36 +162,22 @@ def _query_view(
         "model_label": _remote_model_labels(
             loads(row.get("model_configs_json"), {}), ("answer",)
         ),
-        "sample_count": query_sample_counts.get(query_id, 0) or response_count,
+        "sample_count": lookups.query_sample_counts.get(query_id, 0) or response_count,
         "success_count": sum(
             int(item["responses"] or 0) - int(item["failures"] or 0)
             for item in stats.values()
         ),
         "stats": stats,
         "evals": [
-            _eval_view(
-                evaluation,
-                samples=eval_samples.get(int(evaluation["id"]), []),
-                attributions=attributions_by_eval.get(int(evaluation["id"]), []),
-                verdicts=verdicts,
-                attribution_counts=attribution_counts,
-                provider_labels=provider_labels,
-            )
-            for evaluation in evals
+            _eval_view(evaluation, lookups)
+            for evaluation in lookups.evals_by_query.get(query_id, [])
         ],
     }
 
 
-def _eval_view(
-    row: dict[str, Any],
-    *,
-    samples: list[dict[str, Any]],
-    attributions: list[dict[str, Any]],
-    verdicts: dict[tuple[int, str, str], str | None],
-    attribution_counts: dict[int, dict[str, Any]],
-    provider_labels: dict[int, str],
-) -> dict[str, Any]:
+def _eval_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
     eval_id = int(row["id"])
+    samples = lookups.eval_samples.get(eval_id, [])
     metrics = [
         name for name in loads(row["metrics_json"], []) if name in registry.METRIC_REGISTRY
     ]
@@ -229,14 +189,14 @@ def _eval_view(
         for sample in samples
         if 200 <= int(sample["http_status"] or 0) < 300
         and all(
-            verdicts.get((eval_id, sample["sample_id"], metric), _MISSING) is None
+            lookups.verdicts.get((eval_id, sample["sample_id"], metric), _MISSING) is None
             for metric in judge_metrics
         )
     )
     return {
         **_public_run(row),
         "model_label": (
-            provider_labels.get(int(row["judge_provider_id"]))
+            lookups.provider_labels.get(int(row["judge_provider_id"]))
             if row.get("judge_provider_id") is not None
             else "确定性指标"
         ),
@@ -248,18 +208,15 @@ def _eval_view(
             {
                 **_public_run(attribution),
                 "model_label": (
-                    provider_labels.get(int(attribution["report_provider_id"]))
+                    lookups.provider_labels.get(int(attribution["report_provider_id"]))
                     if attribution.get("report_provider_id") is not None
                     else "规则归因"
                 ),
-                "sample_count": int(
-                    attribution_counts.get(int(attribution["id"]), {}).get("samples") or 0
-                ),
-                "success_count": int(
-                    attribution_counts.get(int(attribution["id"]), {}).get("succeeded") or 0
-                ),
+                "sample_count": int(counts.get("samples") or 0),
+                "success_count": int(counts.get("succeeded") or 0),
             }
-            for attribution in attributions
+            for attribution in lookups.attributions_by_eval.get(eval_id, [])
+            for counts in [lookups.attribution_counts.get(int(attribution["id"]), {})]
         ],
     }
 

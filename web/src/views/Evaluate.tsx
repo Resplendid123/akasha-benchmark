@@ -21,7 +21,8 @@ import {
   Pass,
   RecordNav,
   RecordSearch,
-  StatusTag,
+  RunCells,
+  RunCountCells,
   Timing,
   duration,
   metric,
@@ -58,7 +59,6 @@ export function Evaluate({
   onOpenQuery,
   onAttribute,
   onOpenSettings,
-  onOpenTasks,
 }: {
   activeQuery: number | null
   activeEval: number | null
@@ -67,7 +67,6 @@ export function Evaluate({
   onOpenQuery: (compileId: number, queryId: number) => void
   onAttribute: (evalId: number) => void
   onOpenSettings: () => void
-  onOpenTasks: () => void
 }) {
   const compiles = useAsync(() => api.compiles(), [])
   const cleanup = useAction<unknown>()
@@ -110,14 +109,7 @@ export function Evaluate({
             </select>
           </Field>
           {query && (
-            <NewEval
-              query={query}
-              onOpenSettings={onOpenSettings}
-              onStarted={() => {
-                compiles.reload()
-                onOpenTasks()
-              }}
-            />
+            <NewEval query={query} onOpenSettings={onOpenSettings} onStarted={compiles.reload} />
           )}
         </ConfigPanel>
       )}
@@ -143,15 +135,8 @@ export function Evaluate({
             <tbody>
               {query.evals.map((run) => (
                 <tr key={run.id} className={run.id === activeEval ? 'selected' : ''}>
-                  <td className="mono small">
-                    {run.name} <span className="muted">#{run.id}</span>
-                  </td>
-                  <td className="small">{run.model_label ?? '—'}</td>
-                  <td>
-                    <StatusTag status={run.status} />
-                  </td>
-                  <td className="num">{run.sample_count}</td>
-                  <td className="num">{run.success_count}</td>
+                  <RunCells run={run} />
+                  <RunCountCells run={run} />
                   <td className="num mono">{run.concurrency}</td>
                   <td className="small mono">{run.ks.join(', ')}</td>
                   <td className="num">{run.metrics.length}</td>
@@ -587,7 +572,7 @@ function SampleResults({
       {samples.data.total === 0 ? (
         <p className="small muted">没有匹配的样本。</p>
       ) : (
-        <table>
+        <table className="eval-samples-table">
           <thead>
             <tr>
               <th>sample_id</th>

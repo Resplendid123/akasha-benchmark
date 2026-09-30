@@ -75,7 +75,7 @@ def run(ctx: TaskContext) -> None:
     limit = int(limit) if limit else None
     config = load_config(ctx.db)
     config.require_credentials()
-    concurrency = max(1, int(params.get("concurrency") or 3))
+    concurrency = max(1, int(params.get("concurrency") or 5))
     query_id = ctx.target("query")
     resuming = query_id is not None
 

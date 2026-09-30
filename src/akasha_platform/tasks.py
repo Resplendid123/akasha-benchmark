@@ -341,18 +341,10 @@ class TaskRunner:
         limit = STAGE_CONCURRENCY.get(stage, 1)
         features = TASK_MODEL_FEATURES.get(stage, ())
         incoming_configs = (params or {}).get("model_configs")
-        if features and not incoming_configs:
-
-            try:
-                config = load_config(connection)
-                config.require_credentials()
-                with AkashaClient(config) as client:
-                    client.login()
-                    incoming_configs = client.get_model_configs()
-                    if isinstance(params, dict):
-                        params["model_configs"] = incoming_configs
-            except (AkashaError, OSError, ValueError):
-                incoming_configs = None
+        if features and not incoming_configs and same_stage:
+            incoming_configs = self._fetch_model_configs(connection)
+            if incoming_configs and isinstance(params, dict):
+                params["model_configs"] = incoming_configs
 
         for task in same_stage:
             running_configs = (task.get("params") or {}).get("model_configs")
@@ -376,12 +368,23 @@ class TaskRunner:
             )
 
     @staticmethod
+    def _fetch_model_configs(connection) -> dict[str, Any] | None:
+        try:
+            config = load_config(connection)
+            config.require_credentials()
+            with AkashaClient(config) as client:
+                client.login()
+                return client.get_model_configs()
+        except (AkashaError, OSError, ValueError):
+            return None
+
+    @staticmethod
     def _normalize_schedule(value: Any) -> str:
         text = str(value).strip()
         if not text:
             raise ValueError("schedule_at 不能为空")
         try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(text)
         except ValueError as exc:
             raise ValueError("schedule_at 需要使用有效的 ISO 时间") from exc
         if parsed.tzinfo is None:
@@ -394,7 +397,7 @@ class TaskRunner:
         if not value:
             return None
         try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(str(value))
         except ValueError:
             return None
         if parsed.tzinfo is None:

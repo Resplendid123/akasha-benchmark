@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Attribution } from './views/Attribution'
+import { Comparison } from './views/Comparison'
 import { Compile } from './views/Compile'
 import { Datasets } from './views/Datasets'
 import { Evaluate } from './views/Evaluate'
@@ -22,6 +23,7 @@ const CROSS = [
   { key: 'tasks', label: '任务', hint: '实时观测六层的任务' },
   { key: 'settings', label: '配置', hint: 'Akasha 连接与模型端点' },
   { key: 'testing', label: '测试', hint: '轻量的一次完整链路' },
+  { key: 'comparison', label: '对比报告', hint: '在线组合多次评测与归因' },
 ] as const
 
 type ViewKey = (typeof LAYERS)[number]['key'] | (typeof CROSS)[number]['key']
@@ -42,12 +44,18 @@ export function App() {
     setQueryId(id)
     setEvalId(null)
   }
+  const paramId = (params: Record<string, unknown>, key: string): number | null => {
+    const value = params[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) return Number(value)
+    return null
+  }
 
   return (
     <div className="app">
       <aside className="sidebar">
         <h1>Akasha-Benchmark</h1>
-        <div className="sub">观测与评测平台</div>
+        <div className="sub">评测平台</div>
 
         <nav className="nav">
           {LAYERS.map((layer) => (
@@ -90,7 +98,6 @@ export function App() {
               selectCompile(id)
               setView('query')
             }}
-            onOpenTasks={openTasks}
           />
         )}
         {view === 'query' && (
@@ -106,7 +113,6 @@ export function App() {
               selectQuery(id)
               setView('evaluate')
             }}
-            onOpenTasks={openTasks}
           />
         )}
         {view === 'evaluate' && (
@@ -126,7 +132,6 @@ export function App() {
               setView('attribution')
             }}
             onOpenSettings={() => setView('settings')}
-            onOpenTasks={openTasks}
           />
         )}
         {view === 'attribution' && (
@@ -139,12 +144,58 @@ export function App() {
               setView('evaluate')
             }}
             onOpenSettings={() => setView('settings')}
-            onOpenTasks={openTasks}
           />
         )}
-        {view === 'tasks' && <Tasks />}
+        {view === 'tasks' && (
+          <Tasks
+            onNavigate={(stage, targetKind, targetId, params) => {
+              if (stage === 'download') {
+                setView('datasets')
+                return
+              }
+              if (stage === 'normalize') {
+                setView('normalize')
+                return
+              }
+              if (stage === 'compile') {
+                setCompileId(targetKind === 'compile' ? targetId : null)
+                setView('compile')
+                return
+              }
+              if (stage === 'query') {
+                setCompileId(
+                  targetKind === 'compile'
+                    ? targetId
+                    : paramId(params, 'compile_id'),
+                )
+                setQueryId(targetKind === 'query' ? targetId : null)
+                setView('query')
+                return
+              }
+              if (stage === 'evaluate') {
+                setQueryId(
+                  targetKind === 'query'
+                    ? targetId
+                    : paramId(params, 'query_id'),
+                )
+                setEvalId(targetKind === 'eval' ? targetId : null)
+                setView('evaluate')
+                return
+              }
+              if (stage === 'attribute') {
+                setEvalId(
+                  targetKind === 'eval'
+                    ? targetId
+                    : paramId(params, 'eval_id'),
+                )
+                setView('attribution')
+              }
+            }}
+          />
+        )}
         {view === 'settings' && <Settings />}
         {view === 'testing' && <Testing onOpenTasks={openTasks} />}
+        {view === 'comparison' && <Comparison />}
       </main>
     </div>
   )
