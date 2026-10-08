@@ -59,6 +59,7 @@ STAGES: dict[str, StageDefinition] = {
             "sample_limit": int,
             "concurrency": int,
             "retry_failed": bool,
+            "follow_up": bool,
         },
     ),
     "evaluate": StageDefinition(

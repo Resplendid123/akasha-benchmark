@@ -107,6 +107,14 @@ class TaskRunner:
             if scheduled_at is None:
                 self._require_free(connection, stage, params)
             task_id = task_store.create_task(connection, stage=stage, params=params)
+            if params.get("follow_up"):
+                task_store.set_task_chain(
+                    connection,
+                    task_id,
+                    chain=chain.follow_up_steps(),
+                    chain_id=task_id,
+                    verify=False,
+                )
             if scheduled_at is not None:
                 task_store.update_progress(
                     connection,
@@ -521,10 +529,10 @@ class TaskRunner:
 
     def _verify(self, connection, task_id: int, stage: str) -> None:
 
-        chain_id, _ = task_store.task_chain(connection, task_id)
+        chain_id, _, verify = task_store.task_chain(connection, task_id)
         definition = STAGES.get(stage)
         check = definition.verify if definition else None
-        if chain_id is None or check is None:
+        if chain_id is None or check is None or not verify:
             return
         task = task_store.get_task(connection, task_id) or {}
         target_id = task.get("target_id")
@@ -542,7 +550,7 @@ class TaskRunner:
 
     def _advance_chain(self, connection, task_id: int, stage: str) -> None:
 
-        chain_id, remaining = task_store.task_chain(connection, task_id)
+        chain_id, remaining, verify = task_store.task_chain(connection, task_id)
         if chain_id is None or not remaining:
             return
         task = task_store.get_task(connection, task_id) or {}
@@ -578,7 +586,9 @@ class TaskRunner:
             return
 
         next_id = task_store.create_task(connection, stage=step["stage"], params=params)
-        task_store.set_task_chain(connection, next_id, chain=rest, chain_id=chain_id)
+        task_store.set_task_chain(
+            connection, next_id, chain=rest, chain_id=chain_id, verify=verify
+        )
         task_store.log(
             connection,
             task_id=task_id,

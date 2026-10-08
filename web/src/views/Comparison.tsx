@@ -106,7 +106,7 @@ const METRIC_SECTIONS = [
   {
     title: '### 3.5 生成答案质量（提示词未约束简短，因此答案冗长，字面量计算偏低正常）',
     metrics: [
-      ['em', 'EM (Exact Match)'],
+      ['em', 'EM'],
       ['f1', 'F1'],
     ],
   },
@@ -134,16 +134,16 @@ function datasetLabel(name: string): string {
   return DATASET_LABELS[name.toLowerCase()] ?? name
 }
 
-function modelLabel(item: LoadedItem): string {
+function modelLabel(option: EvalOption): string {
   const compileModels = Array.from(new Set(
-    (item.option.compile.model_label ?? '').split(' + ').map((value) => value.trim()).filter(Boolean),
+    (option.compile.model_label ?? '').split(' + ').map((value) => value.trim()).filter(Boolean),
   )).join('+')
-  const queryModel = item.option.query.model_label ?? item.option.eval.model_label ?? `评测 #${item.option.eval.id}`
-  return compileModels ? `${compileModels}->${queryModel}` : queryModel
+  const queryModel = option.query.model_label ?? option.eval.model_label ?? `评测 #${option.eval.id}`
+  return `${compileModels || '编译模型未知'}->${queryModel}`
 }
 
 function modelNote(item: LoadedItem, index: number): string {
-  return `（${circledNumber(index + 1)} ${modelLabel(item)}）`
+  return `（${circledNumber(index + 1)} ${modelLabel(item.option)}）`
 }
 
 function elapsedMs(start: string | null, finish: string | null): number | null {
@@ -263,7 +263,7 @@ function buildMarkdown(items: LoadedItem[]): string {
     const queryMs = elapsedMs(item.option.query.created_at, item.option.query.finished_at)
     for (const dataset of item.detail.datasets.map((entry) => entry.dataset)) {
       const stats = item.option.compile.stats[dataset]
-      lines.push(`| ${circledNumber(itemIndex + 1)} | ${escapeCell(modelLabel(item))} | ${escapeCell(datasetLabel(dataset))} | ${stats?.imported ?? stats?.docs ?? '—'} | ${timingCell(item.option.compile.pace?.per_page_ms, compileMs, '/篇')} | ${datasetSummary(item, dataset)?.responses_evaluated ?? '—'} | ${timingCell(item.option.query.stats[dataset]?.latency_mean, queryMs, '/条')} |`)
+      lines.push(`| ${circledNumber(itemIndex + 1)} | ${escapeCell(modelLabel(item.option))} | ${escapeCell(datasetLabel(dataset))} | ${stats?.imported ?? stats?.docs ?? '—'} | ${timingCell(item.option.compile.pace?.per_page_ms, compileMs, '/篇')} | ${datasetSummary(item, dataset)?.responses_evaluated ?? '—'} | ${timingCell(item.option.query.stats[dataset]?.latency_mean, queryMs, '/条')} |`)
     }
   }
 
@@ -282,7 +282,7 @@ function buildMarkdown(items: LoadedItem[]): string {
     return `${(knowledgeShare * 100).toFixed(1)}%（${knowledge ?? 0}/${general ?? 0}）`
   }
   for (const [itemIndex, item] of items.entries()) {
-    lines.push(`| ${escapeCell(`${circledNumber(itemIndex + 1)} ${modelLabel(item)}`)} | ${datasets.map((dataset) => routeValues(item, dataset)).join(' | ')} |`)
+    lines.push(`| ${escapeCell(`${circledNumber(itemIndex + 1)} ${modelLabel(item.option)}`)} | ${datasets.map((dataset) => routeValues(item, dataset)).join(' | ')} |`)
   }
 
   lines.push('', '', '## 三、指标对比')
@@ -427,7 +427,7 @@ export function Comparison() {
                 <div>
                   <span className="comparison-drag-handle" title="拖动调整顺序">☷</span>
                   <strong>{index + 1}. {option.eval.name}</strong> <span className="mono small muted">#{option.eval.id}</span>
-                  <div className="small muted">{option.compile.datasets.join(', ')} · {option.query.model_label ?? '查询模型未知'} · {option.eval.sample_count} 条样本</div>
+                  <div className="small muted">{option.compile.datasets.join(', ')} · {modelLabel(option)} · {option.eval.sample_count} 条样本</div>
                 </div>
                 <div className="row tight">
                   <button className="action small danger" onClick={() => updateItems(items.filter((entry) => entry.evalId !== item.evalId))}>删除</button>

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
+from .. import naming
 from ..datasets import DATASET_NAMES, get_adapter
 from ..metrics import registry
 from ..store import (
@@ -71,6 +71,24 @@ def verify_attribute(connection, attribution_id: int) -> None:
         raise RuntimeError("归因没有覆盖评测的全部样本")
 
 
+def follow_up_steps() -> list[dict[str, Any]]:
+    """查询完成后自动跟的两步：确定性指标评测 + 规则归因。"""
+    return [
+        {
+            "stage": "evaluate",
+            "link": "query_id",
+            "params": {
+                "metrics": [
+                    definition.name
+                    for definition in registry.METRIC_DEFINITIONS
+                    if definition.kind == registry.KIND_DETERMINISTIC
+                ],
+            },
+        },
+        {"stage": "attribute", "link": "eval_id", "params": {"use_model": False}},
+    ]
+
+
 def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
 
     dataset = str(params.get("dataset") or DATASETS[0])
@@ -94,7 +112,7 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
         )
     negatives_ratio = (5 - gold_count) / gold_count if gold_count else 0.0
 
-    run_id = f"smoke{uuid.uuid4().hex[:8]}"
+    run_id = naming.smoke_name(connection, dataset)
     available_metrics = registry.available(get_adapter(dataset).provides)
     with_judge = bool(params.get("with_judge", False))
     metrics = [
@@ -103,7 +121,6 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
         if with_judge or definition.kind == registry.KIND_DETERMINISTIC
     ]
     evaluate_params: dict[str, Any] = {
-        "name": f"{run_id}-e",
         "metrics": metrics,
         "ks": [2],
     }
@@ -122,13 +139,12 @@ def build(params: dict[str, Any], connection) -> list[dict[str, Any]]:
                 "seed": params.get("seed") or compile.default_seed(),
             },
         },
-        {"stage": "query", "link": "compile_id", "params": {"name": f"{run_id}-q"}},
+        {"stage": "query", "link": "compile_id", "params": {}},
         {"stage": "evaluate", "link": "query_id", "params": evaluate_params},
         {
             "stage": "attribute",
             "link": "eval_id",
             "params": {
-                "name": f"{run_id}-a",
                 "use_model": bool(params.get("use_model", False)),
                 "provider_id": params.get("provider_id"),
             },

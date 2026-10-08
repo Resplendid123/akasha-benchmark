@@ -6,8 +6,11 @@ const REASONS: Record<string, { text: string; kind: string }> = {
   semantic: { text: '语义', kind: '' },
   lexical: { text: '词面', kind: '' },
   'exact-title': { text: '标题精确', kind: '' },
-  'graph-neighbor': { text: '图扩展', kind: 'accent' },
-  'sidecar-prefiltered': { text: '预筛', kind: '' },
+}
+
+const ORIGINS: Record<string, { text: string; kind: string }> = {
+  direct: { text: '直接召回', kind: '' },
+  graph: { text: '图扩展', kind: 'accent' },
 }
 
 export function AttributionChain({
@@ -30,9 +33,7 @@ export function AttributionChain({
     (snippet.sourceWindows ?? []).some(
       (window) => window.sourcePageId && goldPageIds.has(window.sourcePageId),
     )
-  const graphSnippets = snippets.filter((snippet) =>
-    (snippet.retrievalReasons ?? []).includes('graph-neighbor'),
-  )
+  const graphSnippets = snippets.filter((snippet) => snippet.origin === 'graph')
 
   return (
     <>
@@ -86,6 +87,11 @@ export function AttributionChain({
             <>
               <span className="mono small">#{index + 1}</span> {snippet.title || '（无标题）'}
               {isGold(snippet) && <span className="tag ok">gold</span>}
+              {snippet.origin && (
+                <span className={`tag ${ORIGINS[snippet.origin]?.kind ?? ''}`}>
+                  {ORIGINS[snippet.origin]?.text ?? snippet.origin}
+                </span>
+              )}
               {(snippet.retrievalReasons ?? []).map((reason) => (
                 <span key={reason} className={`tag ${REASONS[reason]?.kind ?? ''}`}>
                   {REASONS[reason]?.text ?? reason}

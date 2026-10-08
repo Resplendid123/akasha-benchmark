@@ -525,7 +525,7 @@ HTTP 失败、遗漏指标，以及最多 10 条 general 回答案例。案例�
 4. EM/F1 受解释性长答案影响，只描述其表现，不能仅凭低分断言答案错误或归因根因。
 5. Judge 指标可以辅助观察，但要说明它们来自模型判定，存在模型与提示词偏差。
 6. 给出按优先级排序、可验证的下一步建议，并说明报告局限。
-7. general 可能仍保留 retrievedSources 和 graph-neighbor 证据。分析 general 案例时必须
+7. general 可能仍保留 retrievedSources 和 origin=graph 的图扩展证据。分析 general 案例时必须
    结合检索、引用和图指标，不得把 general 自动解释为没有召回。不要逐条复述或外推整体。
 8. 不要声称看过未提供的原文、答案或日志。
 

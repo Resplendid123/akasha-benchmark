@@ -204,6 +204,7 @@ function NewQuery({
   const [name, setName] = useState('')
   const [limit, setLimit] = useState<number | ''>('')
   const [concurrency, setConcurrency] = useState(5)
+  const [followUp, setFollowUp] = useState(false)
   const start = useAction<unknown>()
 
   const available = Object.keys(compile.stats)
@@ -245,6 +246,16 @@ function NewQuery({
           />
         </Field>
       </div>
+      <label className="check" style={{ marginTop: 10 }}>
+        <input type="checkbox" checked={followUp} onChange={() => setFollowUp(!followUp)} />
+        完成后自动评测、归因
+      </label>
+      {followUp && (
+        <div className="note small">
+          评测跑确定性指标，归因用规则，都不调模型。要 Judge 指标或模型归因，去对应页面单独跑。
+        </div>
+      )}
+
       <div className="note small" style={{ marginTop: 10 }}>
         查询使用 Akasha 当前远端生效的 embedding 和 answer 配置。
       </div>
@@ -261,6 +272,7 @@ function NewQuery({
                 concurrency,
                 ...(name.trim() ? { name: name.trim() } : {}),
                 ...(limit === '' ? {} : { sample_limit: limit }),
+                ...(followUp ? { follow_up: true } : {}),
               })
               onStarted()
               return task

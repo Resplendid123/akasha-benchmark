@@ -157,8 +157,11 @@ const RETRIEVAL_REASON_LABELS: Record<string, { label: string; kind?: string }> 
   semantic: { label: '语义' },
   lexical: { label: '词面' },
   'exact-title': { label: '标题精确' },
-  'graph-neighbor': { label: '图扩展', kind: 'accent' },
-  'sidecar-prefiltered': { label: '预筛' },
+}
+
+const ORIGIN_LABELS: Record<string, { label: string; kind?: string }> = {
+  direct: { label: '直接召回' },
+  graph: { label: '图扩展', kind: 'accent' },
 }
 
 function MetricSnippetList({ snippets }: { snippets: NonNullable<NonNullable<MetricItem['evidence']>['snippets']> }) {
@@ -173,6 +176,11 @@ function MetricSnippetList({ snippets }: { snippets: NonNullable<NonNullable<Met
             <span className="mono small muted">#{snippet.rank}</span>
             <strong>{snippet.title || '（无标题）'}</strong>
             {snippet.is_gold && <span className="tag ok">gold</span>}
+            {snippet.origin && (
+              <span className={`tag ${ORIGIN_LABELS[snippet.origin]?.kind ?? ''}`}>
+                {ORIGIN_LABELS[snippet.origin]?.label ?? snippet.origin}
+              </span>
+            )}
             {snippet.retrieval_reasons.map((reason) => {
               const entry = RETRIEVAL_REASON_LABELS[reason]
               return <span key={reason} className={`tag ${entry?.kind ?? ''}`}>{entry?.label ?? reason}</span>

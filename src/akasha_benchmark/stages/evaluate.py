@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-import uuid
 from typing import Any
 
 import httpx
 
+from .. import naming
 from ..datasets import DataDependency, get_adapter
 from ..judge import (
     answer_correctness,
@@ -453,7 +453,10 @@ def run(ctx: TaskContext) -> None:
         provider = resolve_provider(ctx.db, provider_id, "judge")
         provider_id = provider.provider_id
 
-    name = str(params.get("name") or "").strip() or f"{query_run['name']}-e-{uuid.uuid4().hex[:6]}"
+    name = (
+        str(params.get("name") or "").strip()
+        or naming.child_name(ctx.db, str(query_run["name"]), "e")
+    )
     eval_id = ctx.target("eval")
     ctx.freeze(
         name=name, datasets=datasets, ks=list(ks), metrics=metrics,

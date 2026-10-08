@@ -116,15 +116,7 @@ def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
         {"dataset": "hotpotqa", "sample_id": "hotpotqa:q1", "use_model": False}
     )
 
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        with closing(connect(db_path)) as probe:
-            tasks = task_store.list_tasks(probe, limit=50)
-            done = [t for t in tasks if t["status"] == task_store.SUCCEEDED]
-            active = [t for t in tasks if t["status"] in task_store.ACTIVE]
-            if len(done) == 4 or (not active and len(tasks) >= 1):
-                break
-        time.sleep(0.2)
+    _settle(db_path)
 
     with closing(connect(db_path)) as probe:
         tasks = task_store.list_tasks(probe, limit=50)
@@ -139,3 +131,53 @@ def test_runner_advances_the_chain(db_path, normalized, monkeypatch):
         assert all(t["status"] == task_store.SUCCEEDED for t in tasks)
         assert {t["chain_id"] for t in tasks} == {int(head["id"])}
         assert task_store.task_chain(probe, max(int(t["id"]) for t in tasks))[1] == []
+
+
+def test_query_follow_up_runs_evaluate_and_attribute(db_path, normalized, monkeypatch):
+    """勾了自动跟进的查询，完成后自己把评测和归因串起来。"""
+    from akasha_platform.settings import Settings
+    from akasha_platform.tasks import TaskRunner
+
+    with closing(connect(db_path)) as connection:
+        config_store.update_connection(connection, base_url="http://x", email="e@x", password="p")
+        connection.commit()
+
+    monkeypatch.setattr(compile, "AkashaClient", lambda config: FakeClient(config))
+
+    def _fake_query_client(config):
+        with closing(connect(db_path)) as probe:
+            return FakeClient(config, retrieved=_imported_pages(probe))
+
+    monkeypatch.setattr(query, "AkashaClient", _fake_query_client)
+
+    runner = TaskRunner(Settings(db_path=db_path))
+    runner.start("compile", {"datasets": ["hotpotqa"], "qa_limit": 2})
+    _settle(db_path)
+
+    with closing(connect(db_path)) as probe:
+        compile_id = int(compile_store.list_compile_runs(probe)[0]["id"])
+    head = runner.start("query", {"compile_id": compile_id, "follow_up": True})
+    _settle(db_path)
+
+    with closing(connect(db_path)) as probe:
+        tasks = task_store.list_tasks(probe, limit=50)
+        failed = [(t["stage"], t["error"]) for t in tasks if t["status"] == task_store.FAILED]
+        assert not failed, f"链上有任务失败：{failed}"
+        assert [t["stage"] for t in tasks][::-1] == [
+            "compile",
+            "query",
+            "evaluate",
+            "attribute",
+        ]
+        followed = [t for t in tasks if t["stage"] in ("query", "evaluate", "attribute")]
+        assert {t["chain_id"] for t in followed} == {int(head["id"])}
+
+
+def _settle(db_path, timeout: float = 120.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with closing(connect(db_path)) as probe:
+            if not task_store.active_tasks(probe):
+                return
+        time.sleep(0.2)
+    raise AssertionError("任务没跑完")

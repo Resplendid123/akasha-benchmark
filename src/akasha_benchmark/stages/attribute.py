@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import uuid
 from typing import Any
 
-from .. import attribution, textdiff
+from .. import attribution, naming, textdiff
 from ..config import load_config
 from ..datasets import get_adapter, load_corpus, resolve
 from ..io_utils import load_json
@@ -85,7 +84,10 @@ def run(ctx: TaskContext) -> None:
     except LineageUnavailable as exc:
         ctx.log(f"链路证据不可用（compiled_away 判不了）：{exc}", "warn")
 
-    name = str(params.get("name") or "").strip() or f"{eval_run['name']}-a-{uuid.uuid4().hex[:6]}"
+    name = (
+        str(params.get("name") or "").strip()
+        or naming.child_name(ctx.db, str(eval_run["name"]), "a")
+    )
     attribution_id = ctx.target("attribution")
     ctx.freeze(name=name, use_model=use_model, provider_id=provider_id)
     if attribution_id is None:

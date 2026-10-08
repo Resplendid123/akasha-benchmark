@@ -9,6 +9,7 @@ from akasha_benchmark.model_configs import feature_of
 from akasha_benchmark.store import (
     attribution_store,
     compile_store,
+    config_store,
     eval_store,
     loads,
     query_store,
@@ -30,6 +31,7 @@ class _Lookups:
     verdicts: dict[tuple[int, str, str], str | None]
     attribution_counts: dict[int, dict[str, Any]]
     provider_labels: dict[int, str]
+    config_labels: dict[tuple[str, str, str], str]
 
 
 def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -99,6 +101,7 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         int(row["id"]): row["label"]
         for row in connection.execute("SELECT id, label FROM model_provider")
     }
+    config_labels = config_store.remote_label_map(connection)
 
     lookups = _Lookups(
         compile_stats=compile_stats,
@@ -114,6 +117,7 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         verdicts=verdicts,
         attribution_counts=attribution_counts,
         provider_labels=provider_labels,
+        config_labels=config_labels,
     )
     return [_compile_view(row, lookups) for row in compile_rows]
 
@@ -135,6 +139,7 @@ def _compile_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
         "model_label": _remote_model_labels(
             loads(row.get("model_configs_json"), {}),
             ("compiler",),
+            lookups.config_labels,
         ),
         "datasets": loads(row["datasets_json"], []),
         "stats": stats,
@@ -160,7 +165,7 @@ def _query_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
     return {
         **_public_run(row),
         "model_label": _remote_model_labels(
-            loads(row.get("model_configs_json"), {}), ("answer",)
+            loads(row.get("model_configs_json"), {}), ("answer",), lookups.config_labels
         ),
         "sample_count": lookups.query_sample_counts.get(query_id, 0) or response_count,
         "success_count": sum(
@@ -242,9 +247,16 @@ def _public_run(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if not key.endswith("_json")}
 
 
-def _remote_model_labels(configs: dict[str, Any], features: tuple[str, ...]) -> str | None:
+def _remote_model_labels(
+    configs: dict[str, Any],
+    features: tuple[str, ...],
+    config_labels: dict[tuple[str, str, str], str],
+) -> str | None:
     labels = [
-        str(config["model"])
+        config_labels.get(
+            (feature, str(config["model"]), str(config.get("baseUrl") or "")),
+            str(config["model"]),
+        )
         for feature in features
         if (config := feature_of(configs, feature)) and config.get("model")
     ]

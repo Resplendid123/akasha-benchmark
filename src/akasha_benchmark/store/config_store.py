@@ -146,6 +146,14 @@ def list_model_providers(
     ]
 
 
+def remote_label_map(connection: sqlite3.Connection) -> dict[tuple[str, str, str], str]:
+    """(purpose, model, base_url) → 标签，用于把远端配置快照认回本地配置。"""
+    return {
+        (row["purpose"], row["model"], row["base_url"]): row["label"]
+        for row in connection.execute("SELECT purpose, label, model, base_url FROM model_provider")
+    }
+
+
 def get_model_provider(connection: sqlite3.Connection, model_id: int) -> dict[str, Any] | None:
     row = connection.execute("SELECT * FROM model_provider WHERE id = ?", (model_id,)).fetchone()
     return dict(row) if row else None

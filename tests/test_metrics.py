@@ -71,24 +71,29 @@ def test_uncited_documents_separate_retrieval_from_citation():
     assert result["citation_recall"] == pytest.approx(0.0)
 
 
+def _snippet(page: str, origin: str, source_page: str, reasons=("semantic",)) -> dict:
+    return {
+        "id": f"chunk-{page}-{origin}",
+        "knowledgePageId": page,
+        "origin": origin,
+        "retrievalReasons": list(reasons),
+        "sourceWindows": [{"sourcePageId": source_page}],
+    }
+
+
 def test_graph_exclusive_gold_is_net_contribution():
-    page_to_doc = {"p1": "g1", "p2": "g2"}
-    snippets = [
-        {"retrievalReasons": ["semantic"], "sourceWindows": [{"sourcePageId": "p1"}]},
-        {"retrievalReasons": ["graph-neighbor"], "sourceWindows": [{"sourcePageId": "p2"}]},
-    ]
-    result = multihop.evaluate_sample(snippets, ["g1", "g2"], page_to_doc)
+    result = multihop.evaluate_sample(
+        [_snippet("kp-a", "direct", "p1"), _snippet("kp-b", "graph", "p2")],
+        ["g1", "g2"],
+        {"p1": "g1", "p2": "g2"},
+    )
     assert result["graph_exclusive_gold_share"] == pytest.approx(0.5)
 
 
-def test_direct_and_graph_hit_is_not_graph_exclusive():
+def test_same_knowledge_page_hit_both_ways_is_not_graph_exclusive():
+    """同一个 knowledge page 既被图扩展也被直接检索命中，图没有净贡献。"""
     result = multihop.evaluate_sample(
-        [
-            {
-                "retrievalReasons": ["semantic", "graph-neighbor"],
-                "sourceWindows": [{"sourcePageId": "p1"}],
-            }
-        ],
+        [_snippet("kp-1", "graph", "p1"), _snippet("kp-1", "direct", "p1")],
         ["g1"],
         {"p1": "g1"},
     )
@@ -97,26 +102,38 @@ def test_direct_and_graph_hit_is_not_graph_exclusive():
     assert "graph_neighbor_precision" in registry.METRIC_REGISTRY
 
 
+def test_other_knowledge_page_of_same_gold_still_counts_as_exclusive():
+    """同一篇 gold 原文档，图扩展带来的是另一个 knowledge page，算独占。"""
+    result = multihop.evaluate_sample(
+        [_snippet("kp-direct", "direct", "p1"), _snippet("kp-graph", "graph", "p1")],
+        ["g1"],
+        {"p1": "g1"},
+    )
+    assert result["graph_exclusive_gold_share"] == pytest.approx(1.0)
+
+
+def test_origin_decides_the_path_regardless_of_matching_reasons():
+    """reasons 全是匹配方式，图扩展的片段照样带 semantic，路径只看 origin。"""
+    result = multihop.evaluate_sample(
+        [_snippet("kp-g", "graph", "p1", reasons=("semantic", "lexical"))],
+        ["g1"],
+        {"p1": "g1"},
+    )
+    assert result["graph_exclusive_gold_share"] == pytest.approx(1.0)
+    assert result["origin_doc_counts"] == {"graph": 1}
+
+
 def test_graph_neighbor_precision_deduplicates_documents():
     page_to_doc = {"gold-page": "gold", "other-page": "other"}
     snippets = [
-        {
-            "retrievalReasons": ["graph-neighbor"],
-            "sourceWindows": [{"sourcePageId": "gold-page"}],
-        },
-        *[
-            {
-                "retrievalReasons": ["graph-neighbor"],
-                "sourceWindows": [{"sourcePageId": "other-page"}],
-            }
-            for _ in range(3)
-        ],
+        _snippet("kp-gold", "graph", "gold-page"),
+        *[_snippet(f"kp-other-{index}", "graph", "other-page") for index in range(3)],
     ]
 
     result = multihop.evaluate_sample(snippets, ["gold"], page_to_doc)
 
     assert result["graph_neighbor_precision"] == pytest.approx(0.5)
-    assert result["reason_doc_counts"]["graph-neighbor"] == 2
+    assert result["origin_doc_counts"]["graph"] == 2
 
 
 def test_answer_scoring_takes_max_over_references():
@@ -193,9 +210,11 @@ def test_every_registered_metric_has_structured_evidence_and_formula():
             "snippets": [
                 {
                     "id": "s1",
+                    "knowledgePageId": "kp-gold",
+                    "origin": "graph",
                     "title": "Gold",
                     "text": "evidence",
-                    "retrievalReasons": ["semantic", "graph-neighbor"],
+                    "retrievalReasons": ["semantic"],
                     "sourceWindows": [{"sourcePageId": "p1"}],
                 }
             ],

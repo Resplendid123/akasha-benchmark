@@ -4,7 +4,7 @@ from collections import Counter
 from math import log2
 from typing import Any
 
-from . import qa, registry
+from . import multihop, qa, registry
 
 FAMILY_LABELS = {
     registry.FAMILY_RETRIEVAL: "检索质量",
@@ -256,14 +256,22 @@ def _evidence_for_metric(
         graph_gold = [row for row in graph if row["is_gold"]]
         graph_gold_ids = {doc for row in graph for doc in row["gold_doc_ids"]}
         graph_doc_ids = {doc for row in graph for doc in row["doc_ids"]}
-        other_gold_ids = {
-            doc for row in snippets if not row["is_graph"] for doc in row["gold_doc_ids"]
-        }
-        exclusive = graph_gold_ids - other_gold_ids
+
+        def _pairs(rows):
+            return {
+                (row["knowledge_page_id"], doc)
+                for row in rows
+                for doc in row["gold_doc_ids"]
+            }
+
+        exclusive_pairs = _pairs(graph) - _pairs([r for r in snippets if not r["is_graph"]])
+        exclusive = {doc for _, doc in exclusive_pairs}
         formulas = {
             "graph_neighbor_gold_snippets": f"图扩展片段中命中 Gold 的片段（{len(graph_gold)}）",
             "graph_neighbor_precision": f"图扩展命中的 Gold 文档（{len(graph_gold_ids)}）/ 图扩展命中的文档（{len(graph_doc_ids)}）",
-            "graph_exclusive_gold_share": f"仅由图扩展命中的 Gold（{len(exclusive)}）/ 实际需要的 Gold（{gold_count}）",
+            "graph_exclusive_gold_share": (
+                f"有图独占 knowledge page 的 Gold（{len(exclusive)}）/ 实际需要的 Gold（{gold_count}）"
+            ),
         }
         evidence.update(
             formula=formulas[base],
@@ -341,19 +349,20 @@ def _snippet_rows(
             }
         )
         gold_ids = sorted(set(doc_ids) & gold)
-        reasons = list(snippet.get("retrievalReasons") or [])
         rows.append(
             {
                 "rank": index,
                 "id": snippet.get("id"),
+                "knowledge_page_id": multihop.knowledge_page_of(snippet),
                 "title": snippet.get("title") or "",
                 "text": snippet.get("text") or "",
-                "retrieval_reasons": reasons,
+                "retrieval_reasons": list(snippet.get("retrievalReasons") or []),
+                "origin": snippet.get("origin"),
                 "page_ids": page_ids,
                 "doc_ids": doc_ids,
                 "gold_doc_ids": gold_ids,
                 "is_gold": bool(gold_ids),
-                "is_graph": "graph-neighbor" in reasons,
+                "is_graph": multihop.is_graph(snippet),
             }
         )
     return rows
@@ -506,13 +515,13 @@ def _score_reason(
     if base == "uncited_gold_count":
         return f"有 {_count(value)} 篇已检索到的 gold 文档未被引用。"
     if base == "graph_exclusive_gold_share":
-        return f"约 {round(value * gold_count)}/{gold_count} 篇 gold 只能靠图扩展获得。"
-    if base == "graph_neighbor_precision":
-        total = int(
-            (((detail.get("multihop") or {}).get("reason_doc_counts") or {}).get(
-                "graph-neighbor"
-            ) or 0)
+        return (
+            f"约 {round(value * gold_count)}/{gold_count} 篇 gold 有 knowledge page "
+            "只靠图扩展才到达；同一篇 gold 的其他 page 可能已被直接检索命中。"
         )
+    if base == "graph_neighbor_precision":
+        origin_docs = (detail.get("multihop") or {}).get("origin_doc_counts") or {}
+        total = int(origin_docs.get("graph") or 0)
         return _ratio_text(value, total, "图扩展命中的文档属于 gold")
     if base == "faithfulness":
         return _judge_ratio(value, judge_detail, "claim_count", "supported", "事实陈述有检索证据支持")

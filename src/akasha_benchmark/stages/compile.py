@@ -5,7 +5,6 @@ import random
 import re
 import sqlite3
 import time
-import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -28,6 +27,7 @@ from ..datasets import (
     SubsetStrategy,
     get_adapter,
 )
+from .. import naming
 from ..model_configs import matches
 from ..store import compile_store, data_store, dumps, loads, transaction
 from ..task import Paused, TaskContext
@@ -635,6 +635,13 @@ def _retry_batches(
     return wait, len(all_run_ids)
 
 
+def _compiler_slug(ctx: TaskContext, config: AkashaConfig) -> str:
+    """取名要用编译模型，得先问一次远端当前配置。"""
+    with AkashaClient(config) as client:
+        client.login()
+        return naming.model_slug(ctx.db, client.get_model_configs(), "compiler")
+
+
 def run(ctx: TaskContext) -> None:
     params = ctx.params
     datasets = list(params.get("datasets") or [])
@@ -663,7 +670,10 @@ def run(ctx: TaskContext) -> None:
     compile_id = ctx.target("compile")
     resuming = compile_id is not None
     options = CompileOptions(
-        run_id=str(params.get("run_id") or "").strip() or f"run{uuid.uuid4().hex[:10]}",
+        run_id=str(params.get("run_id") or "").strip()
+        or naming.compile_name(
+            ctx.db, datasets=datasets, model=_compiler_slug(ctx, config)
+        ),
         datasets=datasets,
         seed=seed,
         qa_limit=qa_limit,
@@ -733,7 +743,7 @@ def _execute(
         )
         ctx.db.commit()
         if not space_id:
-            slug = f"bench{uuid.uuid4().hex[:16]}"
+            slug = naming.space_slug(options.run_id)
             space = client.create_space(
                 name=f"bench {options.run_id}"[:100],
                 slug=slug,

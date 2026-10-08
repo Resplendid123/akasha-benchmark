@@ -62,22 +62,30 @@ def update_progress(
 
 
 def set_task_chain(
-    connection: sqlite3.Connection, task_id: int, *, chain: list[dict[str, Any]], chain_id: int
+    connection: sqlite3.Connection,
+    task_id: int,
+    *,
+    chain: list[dict[str, Any]],
+    chain_id: int,
+    verify: bool = True,
 ) -> None:
     connection.execute(
         "UPDATE task SET chain_id = ?, chain_json = ? WHERE id = ?",
-        (chain_id, dumps(chain), task_id),
+        (chain_id, dumps({"verify": verify, "steps": chain}), task_id),
     )
 
 
-def task_chain(connection: sqlite3.Connection, task_id: int) -> tuple[int | None, list[dict]]:
-
+def task_chain(
+    connection: sqlite3.Connection, task_id: int
+) -> tuple[int | None, list[dict], bool]:
+    """返回 (chain_id, 剩余步骤, 是否跑契约校验)。"""
     row = connection.execute(
         "SELECT chain_id, chain_json FROM task WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
-        return None, []
-    return row["chain_id"], loads(row["chain_json"], []) or []
+        return None, [], True
+    envelope = loads(row["chain_json"], {}) or {}
+    return row["chain_id"], envelope.get("steps") or [], bool(envelope.get("verify", True))
 
 
 _HIDDEN = ("params_json", "chain_json")
