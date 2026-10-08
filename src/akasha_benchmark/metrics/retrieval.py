@@ -54,10 +54,17 @@ def precision_at_k(ranked: Sequence[str], gold: Sequence[str], k: int) -> float:
     return len(set(top) & set(gold)) / len(top)
 
 
-def retrieval_f1_at_k(ranked: Sequence[str], gold: Sequence[str], k: int) -> float:
+def retrieval_f1(ranked: Sequence[str], gold: Sequence[str]) -> float:
 
-    precision = precision_at_k(ranked, gold, k)
-    recall = recall_at_k(ranked, gold, k)
+    gold_set = set(gold)
+    if not gold_set:
+        raise ValueError("retrieval_f1 requires at least one gold document")
+    returned = set(ranked)
+    if not returned:
+        return 0.0
+    hits = len(returned & gold_set)
+    precision = hits / len(returned)
+    recall = hits / len(gold_set)
     return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
 
@@ -94,11 +101,13 @@ def full_coverage(ranked: Sequence[str], gold: Sequence[str], k: int) -> float:
 def evaluate_sample(
     ranked: Sequence[str], gold: Sequence[str], ks: Sequence[int] = DEFAULT_KS
 ) -> dict[str, float]:
-    metrics: dict[str, float] = {"mrr": mrr(ranked, gold)}
+    metrics: dict[str, float] = {
+        "mrr": mrr(ranked, gold),
+        "retrieval_f1": retrieval_f1(ranked, gold),
+    }
     for k in ks:
         metrics[f"precision@{k}"] = precision_at_k(ranked, gold, k)
         metrics[f"recall@{k}"] = recall_at_k(ranked, gold, k)
-        metrics[f"retrieval_f1@{k}"] = retrieval_f1_at_k(ranked, gold, k)
         metrics[f"ndcg@{k}"] = ndcg_at_k(ranked, gold, k)
         metrics[f"hit@{k}"] = hit_at_k(ranked, gold, k)
         metrics[f"full_coverage@{k}"] = full_coverage(ranked, gold, k)

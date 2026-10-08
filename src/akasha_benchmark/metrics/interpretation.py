@@ -144,7 +144,8 @@ def _evidence_for_metric(
     cited_gold = {row["doc_id"] for row in valid_citations if row["is_gold"]}
     evidence: dict[str, Any] = {"formula": None, "gold_documents": gold_documents}
     if base in {"precision", "recall", "retrieval_f1", "hit", "full_coverage", "ndcg"}:
-        top = retrieved[: k or 0]
+
+        top = retrieved if k is None else retrieved[:k]
         top_gold = {row["doc_id"] for row in top if row["is_gold"]}
         top_pages = {row["page_id"] for row in top}
         evidence.update(
@@ -157,7 +158,11 @@ def _evidence_for_metric(
         elif base == "retrieval_f1":
             precision = len(top_gold) / len(top) if top else 0.0
             recall = len(top_gold) / gold_count if gold_count else 0.0
-            evidence["formula"] = f"2 × Precision（{precision:.4f}）× Recall（{recall:.4f}）/（Precision + Recall）"
+            evidence["formula"] = (
+                f"Precision = 命中 Gold（{len(top_gold)}）/ 实际返回文档（{len(top)}）= {precision:.4f}，"
+                f"Recall = 命中 Gold（{len(top_gold)}）/ 实际需要的 Gold（{gold_count}）= {recall:.4f}，"
+                "取两者调和平均"
+            )
         elif base == "recall":
             evidence["formula"] = (
                 f"前 {k} 条中命中 Gold（{len(top_gold)}）/ 实际需要的 Gold（{gold_count}）"
@@ -481,7 +486,10 @@ def _score_reason(
     if base == "precision":
         return f"前 {k} 条实际返回文档中，命中 gold 的比例为 {_percent(value)}。"
     if base == "retrieval_f1":
-        return f"前 {k} 条检索结果的 Precision 与 Recall 调和平均为 {_percent(value)}。"
+        return (
+            f"系统实际返回的全部文档与 gold 的 set F1 为 {_percent(value)}；"
+            "漏召和多返回都会拉低该值，顺序不影响。"
+        )
     if base == "hit":
         return f"前 {k} 条内{'至少命中一篇' if value else '没有命中任何'} gold 文档。"
     if base == "full_coverage":

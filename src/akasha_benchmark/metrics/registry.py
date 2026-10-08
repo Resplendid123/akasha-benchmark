@@ -56,7 +56,12 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
 
     _definition("precision", FAMILY_RETRIEVAL, _GOLD, "前 k 个实际返回文档中命中的 gold 占比", per_k=True),
     _definition("recall", FAMILY_RETRIEVAL, _GOLD, "前 k 个里命中的 gold 占比", per_k=True),
-    _definition("retrieval_f1", FAMILY_RETRIEVAL, _GOLD, "Precision@k 与 Recall@k 的调和平均", per_k=True),
+    _definition(
+        "retrieval_f1",
+        FAMILY_RETRIEVAL,
+        _GOLD,
+        "set F1：对系统实际返回的全部文档算一次，多返回和漏召都扣分，不看顺序也不随 k 变化",
+    ),
     _definition("ndcg", FAMILY_RETRIEVAL, _GOLD, "二元相关性下的 nDCG", per_k=True),
     _definition("hit", FAMILY_RETRIEVAL, _GOLD, "前 k 个里至少命中一个 gold", per_k=True),
     _definition(

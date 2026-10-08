@@ -34,8 +34,23 @@ def test_retrieval_precision_and_f1_at_k_use_actual_result_count():
     gold = ["d1", "d2"]
     assert retrieval.precision_at_k(ranked, gold, 5) == pytest.approx(0.5)
     assert retrieval.recall_at_k(ranked, gold, 5) == pytest.approx(0.5)
-    assert retrieval.retrieval_f1_at_k(ranked, gold, 5) == pytest.approx(0.5)
+    assert retrieval.retrieval_f1(ranked, gold) == pytest.approx(0.5)
     assert retrieval.precision_at_k([], gold, 5) == 0.0
+
+
+def test_retrieval_f1_ignores_k_and_order():
+    gold = ["d1", "d2"]
+    early = ["d1", "d2", "x", "y", "z", "w", "v", "u"]
+    late = ["x", "y", "z", "w", "v", "u", "d1", "d2"]
+
+    assert retrieval.retrieval_f1(early, gold) == pytest.approx(0.4)
+    assert retrieval.retrieval_f1(late, gold) == pytest.approx(0.4)
+    assert retrieval.retrieval_f1(gold, gold) == pytest.approx(1.0)
+    assert retrieval.retrieval_f1([], gold) == 0.0
+
+    metrics = retrieval.evaluate_sample(early, gold, (2, 5, 10))
+    assert "retrieval_f1" in metrics
+    assert not any(name.startswith("retrieval_f1@") for name in metrics)
 
 
 def test_ndcg_rewards_earlier_gold():
