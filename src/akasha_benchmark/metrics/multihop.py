@@ -25,6 +25,11 @@ def knowledge_page_of(snippet: dict[str, Any]) -> str:
     return str(snippet.get("knowledgePageId") or snippet.get("id") or "")
 
 
+def chunk_of(snippet: dict[str, Any]) -> str:
+    """独占性按 chunk 判定：同一 knowledge page 的不同 chunk 是不同证据。"""
+    return str(snippet.get("id") or snippet.get("knowledgePageId") or "")
+
+
 def evaluate_sample(
     snippets: Sequence[dict[str, Any]], gold: Sequence[str], page_to_doc: dict[str, str]
 ) -> dict[str, Any]:
@@ -40,7 +45,7 @@ def evaluate_sample(
     for snippet in snippets:
         docs = snippet_doc_ids(snippet, page_to_doc)
         hits = docs & gold_set
-        pairs = {(knowledge_page_of(snippet), doc) for doc in hits}
+        pairs = {(chunk_of(snippet), doc) for doc in hits}
         origin = str(snippet.get("origin") or "unknown")
         origin_counts[origin] += 1
         origin_docs.setdefault(origin, set()).update(docs)

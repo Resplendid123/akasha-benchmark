@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import type { AttributionDetail, CompileRun, EvalDetail, EvalRun, QueryRun, QueryStats } from '../types'
 import { Failed, Loading, downloadText, duration, formatDateTime, useAsync } from '../ui'
@@ -102,7 +102,7 @@ const METRIC_SECTIONS = [
     ],
   },
   {
-    title: '### 3.5 生成答案质量（提示词未约束简短，因此答案冗长，字面量计算偏低正常）',
+    title: '### 3.5 生成答案质量',
     metrics: [
       ['em', 'EM'],
       ['f1', 'F1'],
@@ -113,6 +113,7 @@ const METRIC_SECTIONS = [
     metrics: [
       ['graph_neighbor_gold_snippets', 'Graph Neighbor Gold Snippets'],
       ['graph_neighbor_precision', 'Graph Neighbor Precision'],
+      ['graph_exclusive_gold_share', 'Graph Exclusive Gold Share'],
     ],
   },
 ] as const
@@ -170,17 +171,15 @@ function queryStats(item: LoadedItem, dataset: string) {
 type Segment = { label: string; startMs: number; durationMs: number; fill: string }
 
 /** 按管线顺序把均值摊成首尾相接的区段；生成段对齐到合计末尾。 */
-function timelineSegments(
-  stats: QueryStats,
-): { segments: Segment[]; totalMs: number; generationStartMs: number | null } | null {
+function timelineSegments(stats: QueryStats): { segments: Segment[]; totalMs: number } | null {
   const total = stats.server_total_ms_mean
   if (total === null || total === undefined || total <= 0) return null
 
   const segments: Segment[] = []
   let cursor = 0
   for (const [value, label, fill] of [
-    [stats.rewrite_ms_mean, '改写', '▓'],
-    [stats.retrieval_ms_mean, '检索', '█'],
+    [stats.rewrite_ms_mean, '改写', '░'],
+    [stats.retrieval_ms_mean, '检索', '▓'],
   ] as const) {
     if (value === null || value === undefined) continue
     segments.push({ label, startMs: cursor, durationMs: value, fill })
@@ -188,15 +187,14 @@ function timelineSegments(
   }
 
   const generation = stats.generation_ms_mean
-  let generationStartMs: number | null = null
   if (generation !== null && generation !== undefined) {
-    generationStartMs = Math.max(cursor, total - generation)
-    if (generationStartMs - cursor > total * 0.01) {
-      segments.push({ label: '未计', startMs: cursor, durationMs: generationStartMs - cursor, fill: '░' })
+    const startMs = Math.max(cursor, total - generation)
+    if (startMs - cursor > total * 0.01) {
+      segments.push({ label: '未计', startMs: cursor, durationMs: startMs - cursor, fill: '·' })
     }
-    segments.push({ label: '生成', startMs: generationStartMs, durationMs: generation, fill: '▒' })
+    segments.push({ label: '生成', startMs, durationMs: generation, fill: '▒' })
   }
-  return segments.length > 0 ? { segments, totalMs: total, generationStartMs } : null
+  return segments.length > 0 ? { segments, totalMs: total } : null
 }
 
 function timelineBlock(item: LoadedItem, dataset: string, index: number): string[] {
@@ -205,7 +203,7 @@ function timelineBlock(item: LoadedItem, dataset: string, index: number): string
   const timeline = timelineSegments(stats)
   if (!timeline) return []
 
-  const { segments, totalMs, generationStartMs } = timeline
+  const { segments, totalMs } = timeline
   const scale = TIMELINE_WIDTH / totalMs
 
   const cells = Array.from({ length: TIMELINE_WIDTH }, () => ' ')
@@ -215,19 +213,26 @@ function timelineBlock(item: LoadedItem, dataset: string, index: number): string
     cells.fill(segment.fill, from, to)
   }
 
-  // ttft_ms 自生成请求起算，标记落在生成段内部。
-  const ttft = generationStartMs === null ? null : stats.ttft_ms_mean ?? null
+  // ttft_ms 自生成请求起算，标记锚在生成段内；各阶段均值取自不同子集，夹住防止越界。
+  const generation = segments.find((segment) => segment.label === '生成')
+  const ttft = generation === undefined ? null : stats.ttft_ms_mean ?? null
   const marks = Array.from({ length: TIMELINE_WIDTH }, () => ' ')
-  if (ttft !== null && generationStartMs !== null) {
-    marks[Math.min(TIMELINE_WIDTH - 1, Math.round((generationStartMs + ttft) * scale))] = '▲'
+  if (ttft !== null && generation !== undefined) {
+    const offset = generation.startMs + Math.min(ttft, generation.durationMs)
+    const from = Math.round(generation.startMs * scale)
+    const to = Math.round((generation.startMs + generation.durationMs) * scale) - 1
+    marks[Math.min(Math.max(Math.round(offset * scale), from), Math.max(from, to))] = '▲'
   }
 
   const legend = segments.map((segment) => `${segment.fill} ${segment.label} ${duration(segment.durationMs)}`)
   if (ttft !== null) legend.push(`▲ TTFT ${duration(ttft)}`)
   return [
     `${circledNumber(index + 1)} ${modelLabel(item.option)} · ${datasetLabel(dataset)}`,
-    `0 ├${cells.join('')}┤ ${duration(totalMs)}`,
-    `  │${marks.join('')}│ ${legend.join('   ')}`,
+    '',
+    `0 ▌${cells.join('')}▐ ${duration(totalMs)}`,
+    ...(ttft === null ? [] : [`  ▌${marks.join('')}▐`]),
+    '',
+    `  ${legend.join('   ')}`,
   ]
 }
 

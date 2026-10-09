@@ -105,16 +105,23 @@ def test_graph_exclusive_gold_is_net_contribution():
     assert result["graph_exclusive_gold_share"] == pytest.approx(0.5)
 
 
-def test_same_knowledge_page_hit_both_ways_is_not_graph_exclusive():
-    """同一个 knowledge page 既被图扩展也被直接检索命中，图没有净贡献。"""
+def test_other_chunk_of_same_knowledge_page_counts_as_exclusive():
+    """同一 knowledge page 的不同 chunk 是不同证据，图扩展带来的那个算独占。"""
     result = multihop.evaluate_sample(
         [_snippet("kp-1", "graph", "p1"), _snippet("kp-1", "direct", "p1")],
         ["g1"],
         {"p1": "g1"},
     )
-    assert result["graph_exclusive_gold_share"] == 0.0
+    assert result["graph_exclusive_gold_share"] == pytest.approx(1.0)
     assert result["graph_neighbor_precision"] == pytest.approx(1.0)
-    assert "graph_neighbor_precision" in registry.METRIC_REGISTRY
+
+
+def test_same_chunk_hit_both_ways_is_not_graph_exclusive():
+    """同一个 chunk 既来自图扩展也来自直接检索，图没有净贡献。"""
+    shared = _snippet("kp-1", "graph", "p1")
+    duplicate = {**shared, "origin": "direct"}
+    result = multihop.evaluate_sample([shared, duplicate], ["g1"], {"p1": "g1"})
+    assert result["graph_exclusive_gold_share"] == 0.0
 
 
 def test_other_knowledge_page_of_same_gold_still_counts_as_exclusive():

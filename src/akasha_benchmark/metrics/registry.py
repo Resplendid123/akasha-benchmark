@@ -100,7 +100,7 @@ METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         "graph_exclusive_gold_share",
         FAMILY_MULTIHOP,
         _GOLD,
-        "有 knowledge page 只靠图扩展才到达的 gold 占比，即图边的净增量价值",
+        "有 chunk 只靠图扩展才到达的 gold 占比，即图边的净增量价值",
     ),
     _definition(
         "graph_neighbor_precision",
