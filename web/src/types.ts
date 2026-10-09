@@ -245,6 +245,12 @@ export interface QueryStats {
   failures: number
   latency_mean: number | null
   latency_max: number | null
+  timed_responses: number | null
+  ttft_ms_mean: number | null
+  rewrite_ms_mean: number | null
+  retrieval_ms_mean: number | null
+  generation_ms_mean: number | null
+  server_total_ms_mean: number | null
 }
 
 export interface QueryRun {

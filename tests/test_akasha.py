@@ -47,6 +47,25 @@ def bind_compile_task(connection, compile_id: int, params: dict[str, Any] | None
     return task_id
 
 
+@pytest.fixture
+def client():
+    connection = AkashaClient(AkashaConfig())
+    yield connection
+    connection.close()
+
+
+def pages_client(items_by_run: dict[str, list[dict[str, Any]]], totals=None) -> FakeClient:
+    """按 runId 返回预设 run_pages 分页。"""
+
+    class Pages(FakeClient):
+        def run_pages(self, run_id, *, page=1, limit=100):
+            items = items_by_run.get(run_id, [])
+            total = (totals or {}).get(run_id, len(items))
+            return {"items": items, "total": total, "limit": limit}
+
+    return Pages(None)
+
+
 def context(connection, params: dict[str, Any], task_id=None) -> TaskContext:
     if task_id is None:
         task_id = task_store.create_task(connection, stage="test", params=params)
@@ -215,37 +234,50 @@ def _jwt(expiry: float) -> str:
     return f"{encode({'alg': 'none'})}.{encode({'exp': expiry})}.signature"
 
 
-def test_clients_share_jwt_in_memory_and_from_local_cache(tmp_path, monkeypatch):
-    token = _jwt(time.time() + 3600)
-    login_calls = 0
-    call_lock = threading.Lock()
+def fake_http(token: str):
+    """返回（假 httpx 客户端类, 登录计数）：登录发 cookie，其余请求首次 401 触发重登。"""
+    calls = {"login": 0}
+    lock = threading.Lock()
 
-    class HTTPClient:
+    class FakeHTTP:
         def __init__(self):
             self.cookies = akasha_client.httpx.Cookies()
+            self.request_calls = 0
 
         def request(self, method, url, **kwargs):
-            nonlocal login_calls
-            assert url.endswith("/auth/login")
-            with call_lock:
-                login_calls += 1
-            self.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, token)
+            if url.endswith("/auth/login"):
+                with lock:
+                    calls["login"] += 1
+                self.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, token)
+                return akasha_client.httpx.Response(201, json={"success": True, "status": 201})
+            self.request_calls += 1
+            status = 401 if self.request_calls == 1 else 200
             return akasha_client.httpx.Response(
-                201, json={"success": True, "status": 201}
+                status, json={"data": {}, "success": status == 200, "status": status}
             )
 
         def close(self):
             pass
+
+    return FakeHTTP, calls
+
+
+def swap_transport(client: AkashaClient, fake_cls):
+    client._client.close()
+    client._client = fake_cls()
+    return client
+
+
+def test_clients_share_jwt_in_memory_and_from_local_cache(tmp_path, monkeypatch):
+    token = _jwt(time.time() + 3600)
+    FakeHTTP, calls = fake_http(token)
 
     monkeypatch.setattr(akasha_client, "_AUTH_CACHE_PATH", tmp_path / "auth.json")
     akasha_client._AUTH_TOKENS.clear()
     config = AkashaConfig(
         base_url="http://akasha", email="owner@example.com", password="pw"
     )
-    clients = [AkashaClient(config) for _ in range(4)]
-    for client in clients:
-        client._client.close()
-        client._client = HTTPClient()
+    clients = [swap_transport(AkashaClient(config), FakeHTTP) for _ in range(4)]
 
     threads = [threading.Thread(target=client.login) for client in clients]
     for thread in threads:
@@ -253,18 +285,16 @@ def test_clients_share_jwt_in_memory_and_from_local_cache(tmp_path, monkeypatch)
     for thread in threads:
         thread.join()
 
-    assert login_calls == 1
+    assert calls["login"] == 1
     assert all(
         client._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == token
         for client in clients
     )
 
     akasha_client._AUTH_TOKENS.clear()
-    restarted = AkashaClient(config)
-    restarted._client.close()
-    restarted._client = HTTPClient()
+    restarted = swap_transport(AkashaClient(config), FakeHTTP)
     restarted.login()
-    assert login_calls == 1
+    assert calls["login"] == 1
     assert restarted._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == token
     akasha_client._AUTH_TOKENS.clear()
 
@@ -274,44 +304,20 @@ def test_unauthorized_client_reuses_jwt_refreshed_by_another_client(
 ):
     stale = _jwt(time.time() + 3600)
     fresh = _jwt(time.time() + 7200)
-    login_calls = 0
-
-    class HTTPClient:
-        def __init__(self):
-            self.cookies = akasha_client.httpx.Cookies()
-            self.request_calls = 0
-
-        def request(self, method, url, **kwargs):
-            nonlocal login_calls
-            if url.endswith("/auth/login"):
-                login_calls += 1
-                self.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, fresh)
-                return akasha_client.httpx.Response(
-                    201, json={"success": True, "status": 201}
-                )
-            self.request_calls += 1
-            status = 401 if self.request_calls == 1 else 200
-            return akasha_client.httpx.Response(
-                status, json={"data": {}, "success": status == 200, "status": status}
-            )
-
-        def close(self):
-            pass
+    FakeHTTP, calls = fake_http(fresh)
 
     monkeypatch.setattr(akasha_client, "_AUTH_CACHE_PATH", tmp_path / "auth.json")
     config = AkashaConfig(base_url="http://akasha", email="e@x", password="pw")
     key = akasha_client._auth_cache_key(config)
     akasha_client._AUTH_TOKENS.clear()
     akasha_client._AUTH_TOKENS[key] = stale
-    clients = [AkashaClient(config), AkashaClient(config)]
+    clients = [swap_transport(AkashaClient(config), FakeHTTP) for _ in range(2)]
     for client in clients:
-        client._client.close()
-        client._client = HTTPClient()
         client._client.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, stale)
 
     assert clients[0].get("users/me") == {}
     assert clients[1].get("users/me") == {}
-    assert login_calls == 1
+    assert calls["login"] == 1
     assert all(
         client._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == fresh
         for client in clients
@@ -321,40 +327,16 @@ def test_unauthorized_client_reuses_jwt_refreshed_by_another_client(
 
 def test_unauthorized_without_cookie_logs_in_and_saves_new_jwt(tmp_path, monkeypatch):
     fresh = _jwt(time.time() + 7200)
-    login_calls = 0
-
-    class HTTPClient:
-        def __init__(self):
-            self.cookies = akasha_client.httpx.Cookies()
-            self.request_calls = 0
-
-        def request(self, method, url, **kwargs):
-            nonlocal login_calls
-            if url.endswith("/auth/login"):
-                login_calls += 1
-                self.cookies.set(akasha_client.AUTH_TOKEN_COOKIE, fresh)
-                return akasha_client.httpx.Response(
-                    201, json={"success": True, "status": 201}
-                )
-            self.request_calls += 1
-            status = 401 if self.request_calls == 1 else 200
-            return akasha_client.httpx.Response(
-                status, json={"data": {}, "success": status == 200, "status": status}
-            )
-
-        def close(self):
-            pass
+    FakeHTTP, calls = fake_http(fresh)
 
     cache_path = tmp_path / "auth.json"
     monkeypatch.setattr(akasha_client, "_AUTH_CACHE_PATH", cache_path)
     akasha_client._AUTH_TOKENS.clear()
     config = AkashaConfig(base_url="http://akasha", email="e@x", password="pw")
-    client = AkashaClient(config)
-    client._client.close()
-    client._client = HTTPClient()
+    client = swap_transport(AkashaClient(config), FakeHTTP)
 
     assert client.get("users/me") == {}
-    assert login_calls == 1
+    assert calls["login"] == 1
     assert client._client.cookies.get(akasha_client.AUTH_TOKEN_COOKIE) == fresh
     assert json.loads(cache_path.read_text(encoding="utf-8"))[
         akasha_client._auth_cache_key(config)
@@ -362,8 +344,7 @@ def test_unauthorized_without_cookie_logs_in_and_saves_new_jwt(tmp_path, monkeyp
     akasha_client._AUTH_TOKENS.clear()
 
 
-def test_client_collects_failed_run_pages_across_pages(monkeypatch):
-    client = AkashaClient(AkashaConfig())
+def test_client_collects_failed_run_pages_across_pages(client, monkeypatch):
     calls: list[tuple[str, int, int]] = []
 
     def run_pages(run_id, *, page=1, limit=100):
@@ -397,78 +378,71 @@ def test_client_collects_failed_run_pages_across_pages(monkeypatch):
         }
 
     monkeypatch.setattr(client, "run_pages", run_pages)
-    try:
-        assert client.retryable_run_page_ids(["run-1"]) == [
-            "text-failed",
-            "merge-failed",
-            "cancelled",
-        ]
-        assert calls == [("run-1", 1, 100), ("run-1", 2, 100)]
-    finally:
-        client.close()
+    assert client.retryable_run_page_ids(["run-1"]) == [
+        "text-failed",
+        "merge-failed",
+        "cancelled",
+    ]
+    assert calls == [("run-1", 1, 100), ("run-1", 2, 100)]
 
 
-def test_retryable_pages_use_latest_status_across_runs(monkeypatch):
-    client = AkashaClient(AkashaConfig())
-    pages = {
-        "original": [
-            {"sourcePageId": "eventually-ok", "status": "failed"},
-            {"sourcePageId": "still-failed", "status": "failed"},
-            {"sourcePageId": "already-ok", "status": "succeeded"},
-        ],
-        "retry": [
-            {"sourcePageId": "eventually-ok", "status": "succeeded"},
+@pytest.mark.parametrize(
+    ("pages", "run_ids", "expected"),
+    [
+        pytest.param(
             {
-                "sourcePageId": "still-failed",
-                "status": "skipped",
-                "errorCode": "manual_cancelled",
+                "original": [
+                    {"sourcePageId": "eventually-ok", "status": "failed"},
+                    {"sourcePageId": "still-failed", "status": "failed"},
+                    {"sourcePageId": "already-ok", "status": "succeeded"},
+                ],
+                "retry": [
+                    {"sourcePageId": "eventually-ok", "status": "succeeded"},
+                    {
+                        "sourcePageId": "still-failed",
+                        "status": "skipped",
+                        "errorCode": "manual_cancelled",
+                    },
+                ],
             },
-        ],
-    }
-
+            ["original", "retry"],
+            ["still-failed"],
+            id="latest-status-across-runs",
+        ),
+        pytest.param(
+            {
+                "newer": [
+                    {
+                        "sourcePageId": "page",
+                        "status": "succeeded",
+                        "updatedAt": "2026-09-24T10:00:00Z",
+                    }
+                ],
+                "older": [
+                    {
+                        "sourcePageId": "page",
+                        "status": "skipped",
+                        "errorCode": "manual_cancelled",
+                        "updatedAt": "2026-09-24T09:00:00Z",
+                    }
+                ],
+            },
+            ["newer", "older"],
+            [],
+            id="remote-updated-at-beats-run-order",
+        ),
+    ],
+)
+def test_retryable_pages(client, monkeypatch, pages, run_ids, expected):
     monkeypatch.setattr(
         client,
         "run_pages",
         lambda run_id, **_: {"items": pages[run_id], "total": len(pages[run_id]), "limit": 100},
     )
-    try:
-        assert client.retryable_run_page_ids(["original", "retry"]) == ["still-failed"]
-    finally:
-        client.close()
+    assert client.retryable_run_page_ids(run_ids) == expected
 
 
-def test_retryable_pages_use_remote_updated_at_not_run_order(monkeypatch):
-    client = AkashaClient(AkashaConfig())
-    pages = {
-        "newer": [
-            {
-                "sourcePageId": "page",
-                "status": "succeeded",
-                "updatedAt": "2026-09-24T10:00:00Z",
-            }
-        ],
-        "older": [
-            {
-                "sourcePageId": "page",
-                "status": "skipped",
-                "errorCode": "manual_cancelled",
-                "updatedAt": "2026-09-24T09:00:00Z",
-            }
-        ],
-    }
-    monkeypatch.setattr(
-        client,
-        "run_pages",
-        lambda run_id, **_: {"items": pages[run_id], "total": 1, "limit": 100},
-    )
-    try:
-        assert client.retryable_run_page_ids(["newer", "older"]) == []
-    finally:
-        client.close()
-
-
-def test_client_requires_retry_batches_of_at_most_100(monkeypatch):
-    client = AkashaClient(AkashaConfig())
+def test_client_requires_retry_batches_of_at_most_100(client, monkeypatch):
     batches: list[list[str]] = []
 
     def post(path, body):
@@ -477,14 +451,11 @@ def test_client_requires_retry_batches_of_at_most_100(monkeypatch):
         return {"queuedPageCount": 1, "jobIds": [f"run-{len(batches)}"]}
 
     monkeypatch.setattr(client, "post", post)
-    try:
-        with pytest.raises(ValueError, match="最多 100"):
-            client.retry_pages([f"page-{index}" for index in range(101)])
-        result = client.retry_pages([f"page-{index}" for index in range(100)])
-        assert [len(batch) for batch in batches] == [100]
-        assert result == {"queuedPageCount": 1, "jobIds": ["run-1"]}
-    finally:
-        client.close()
+    with pytest.raises(ValueError, match="最多 100"):
+        client.retry_pages([f"page-{index}" for index in range(101)])
+    result = client.retry_pages([f"page-{index}" for index in range(100)])
+    assert [len(batch) for batch in batches] == [100]
+    assert result == {"queuedPageCount": 1, "jobIds": ["run-1"]}
 
 
 def test_embedding_drift_is_detected():
@@ -726,52 +697,57 @@ def test_compile_progress_uses_current_run_not_space_history(ready_connection, m
     assert result["runs"][0]["runId"] == "current"
 
 
-def test_compile_progress_counts_only_current_compile_pages(ready_connection):
-    _, task_id = compile_with_pages(ready_connection, "target-progress", ["target-0", "target-1"])
-
-    class RunPages(FakeClient):
-        def run_pages(self, run_id, *, page=1, limit=100):
-            return {
-                "items": [
+@pytest.mark.parametrize(
+    ("run_id", "page_ids", "items_by_run", "runs", "expected"),
+    [
+        pytest.param(
+            "target-progress",
+            ["target-0", "target-1"],
+            {
+                "run-1": [
                     {"sourcePageId": "target-0", "status": "succeeded"},
                     {"sourcePageId": "target-1", "status": "succeeded"},
                     {"sourcePageId": "unrelated", "status": "succeeded"},
-                ],
-                "total": 3,
-                "limit": limit,
-            }
-
-    progress = compile._target_run_progress(
-        context(ready_connection, {}, task_id=task_id),
-        RunPages(None),
-        [{"runId": "run-1"}],
-    )
-
-    assert progress == {"expected": 2, "succeeded": 2, "failed": 0, "skipped": 0}
-
-
-def test_compile_progress_uses_latest_page_status_across_retry_runs(ready_connection):
-    page_ids = ["retry-target-0", "retry-target-1"]
-    _, task_id = compile_with_pages(ready_connection, "retry-progress", page_ids)
-
-    class RunPages(FakeClient):
-        def run_pages(self, run_id, *, page=1, limit=100):
-            items = (
-                [
-                    {"sourcePageId": page_ids[0], "status": "succeeded"},
-                    {"sourcePageId": page_ids[1], "status": "failed"},
                 ]
-                if run_id == "original"
-                else [{"sourcePageId": page_ids[1], "status": "succeeded"}]
-            )
-            return {"items": items, "total": len(items), "limit": limit}
-
+            },
+            [{"runId": "run-1"}],
+            {"expected": 2, "succeeded": 2, "failed": 0, "skipped": 0},
+            id="ignores-pages-outside-this-compile",
+        ),
+        pytest.param(
+            "retry-progress",
+            ["retry-0", "retry-1"],
+            {
+                "original": [
+                    {"sourcePageId": "retry-0", "status": "succeeded"},
+                    {"sourcePageId": "retry-1", "status": "failed"},
+                ],
+                "retry": [{"sourcePageId": "retry-1", "status": "succeeded"}],
+            },
+            [{"runId": "original"}, {"runId": "retry"}],
+            {"expected": 2, "succeeded": 2, "failed": 0, "skipped": 0},
+            id="latest-status-wins-across-retry-runs",
+        ),
+        pytest.param(
+            "merge-progress",
+            ["merge-page"],
+            {
+                "run": [
+                    {"sourcePageId": "merge-page", "status": "succeeded", "mergeStatus": "failed"}
+                ]
+            },
+            [{"runId": "run"}],
+            {"expected": 1, "succeeded": 0, "failed": 1, "skipped": 0},
+            id="merge-failure-counts-as-failed",
+        ),
+    ],
+)
+def test_compile_progress(ready_connection, run_id, page_ids, items_by_run, runs, expected):
+    _, task_id = compile_with_pages(ready_connection, run_id, page_ids)
     progress = compile._target_run_progress(
-        context(ready_connection, {}, task_id=task_id),
-        RunPages(None),
-        [{"runId": "original"}, {"runId": "retry"}],
+        context(ready_connection, {}, task_id=task_id), pages_client(items_by_run), runs
     )
-    assert progress == {"expected": 2, "succeeded": 2, "failed": 0, "skipped": 0}
+    assert progress == expected
 
 
 def test_compile_progress_uses_remote_total_when_retrying(ready_connection, monkeypatch):
@@ -784,25 +760,20 @@ def test_compile_progress_uses_remote_total_when_retrying(ready_connection, monk
         lambda *_args, **_kwargs: [{"page_id": page_id} for page_id in page_ids],
     )
 
-    class RemoteProgress(FakeClient):
-        def run_pages(self, run_id, *, page=1, limit=100):
-            if run_id == "original":
-                items = [
-                    {"sourcePageId": page_id, "status": "succeeded"}
-                    for page_id in page_ids[:105]
-                ]
-                total = 105
-            else:
-                items = [
-                    {"sourcePageId": f"page-{index}", "status": "succeeded"}
-                    for index in (105, 106, 107)
-                ]
-                total = 3
-            return {"items": items, "total": total, "limit": limit}
-
+    client = pages_client(
+        {
+            "original": [
+                {"sourcePageId": page_id, "status": "succeeded"} for page_id in page_ids[:105]
+            ],
+            "retry": [
+                {"sourcePageId": f"page-{index}", "status": "succeeded"}
+                for index in (105, 106, 107)
+            ],
+        }
+    )
     progress = compile._target_run_progress(
         context(ready_connection, {}, task_id=task_id),
-        RemoteProgress(None),
+        client,
         [
             {"runId": "original", "progress": {"text": {"expected": 244}}},
             {"runId": "retry", "progress": {"text": {"expected": 3}}},
@@ -810,21 +781,6 @@ def test_compile_progress_uses_remote_total_when_retrying(ready_connection, monk
     )
 
     assert progress == {"expected": 244, "succeeded": 108, "failed": 0, "skipped": 0}
-
-
-def test_compile_progress_counts_merge_failure_as_failed(ready_connection):
-    _, task_id = compile_with_pages(ready_connection, "merge-progress", ["merge-page"])
-
-    class MergeFailed(FakeClient):
-        def run_pages(self, run_id, *, page=1, limit=100):
-            return {
-                "items": [{"sourcePageId": "merge-page", "status": "succeeded", "mergeStatus": "failed"}],
-                "total": 1, "limit": limit,
-            }
-
-    assert compile._target_run_progress(
-        context(ready_connection, {}, task_id=task_id), MergeFailed(None), [{"runId": "run"}]
-    ) == {"expected": 1, "succeeded": 0, "failed": 1, "skipped": 0}
 
 
 def test_retry_batches_resume_current_run_before_submitting_pending(ready_connection, monkeypatch):

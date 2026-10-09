@@ -203,7 +203,8 @@ def _evidence_for_metric(
             snippets=snippets,
         )
     elif base in {"em", "f1"}:
-        comparisons = _answer_comparisons(answer, references)
+        scored_answer = qa.strip_general_disclaimer(answer)
+        comparisons = _answer_comparisons(scored_answer, references)
         evidence.update(
             formula=(
                 "系统答案与参考答案归一化后完全匹配记为 1，否则记为 0；多参考答案取最高"
@@ -212,7 +213,7 @@ def _evidence_for_metric(
             ),
             answer_comparison={
                 "answer": answer,
-                "normalized_answer": qa.normalize_answer(answer),
+                "normalized_answer": qa.normalize_answer(scored_answer),
                 "references": comparisons,
             },
         )

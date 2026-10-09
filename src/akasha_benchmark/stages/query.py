@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import queue
 import sqlite3
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -10,6 +11,7 @@ import httpx
 from .. import naming
 from ..akasha_client import AkashaClient, AkashaError
 from ..config import load_config
+from ..lineage import LineageReader, LineageUnavailable
 from ..model_configs import drift, matches
 from ..store import compile_store, loads, query_store
 from ..task import TaskContext
@@ -36,6 +38,37 @@ def _query_one(
         "error": error,
         "response": body,
     }
+
+
+def _collect_timings(ctx: TaskContext, query_id: int, since: str | None) -> None:
+    """从 PG 审计表回填各阶段耗时；缺 database_url 时跳过。"""
+    rows = query_store.responses_of(ctx.db, query_id)
+    questions = [str(row.get("question") or "") for row in rows]
+    samples_by_hash: dict[str, list[str]] = {}
+    for row, question in zip(rows, questions, strict=True):
+        digest = "sha256:" + hashlib.sha256(question.encode("utf-8")).hexdigest()
+        samples_by_hash.setdefault(digest, []).append(row["sample_id"])
+
+    try:
+        reader = LineageReader(load_config(ctx.db).database_url)
+        audits = reader.query_audits(questions, since=since)
+    except LineageUnavailable as exc:
+        ctx.log(f"阶段耗时未采集：{exc}", "warn")
+        return
+
+    timings = {}
+    for digest, metadata in audits.items():
+        parsed = query_store.timings_from_audit(metadata)
+        if parsed:
+            for sample_id in samples_by_hash.get(digest, []):
+                timings[sample_id] = parsed
+
+    updated = query_store.record_timings(ctx.db, query_id, timings)
+    ctx.db.commit()
+    if updated:
+        ctx.log(f"已回填 {updated} / {len(rows)} 条阶段耗时")
+    else:
+        ctx.log("审计表没有可用的阶段耗时（远端可能未开启 timings）", "warn")
 
 
 def _select_samples(
@@ -155,6 +188,9 @@ def run(ctx: TaskContext) -> None:
             ctx.freeze(retry_failed=False)
 
         _issue(ctx, client, query_id, compile_run["space_id"], concurrency)
+        _collect_timings(
+            ctx, query_id, (query_store.get_query_run(ctx.db, query_id) or {}).get("created_at")
+        )
         retryable = query_store.retryable_responses(ctx.db, query_id)
         if retryable:
             examples = [row["sample_id"] for row in retryable[:3]]
@@ -176,9 +212,11 @@ def run(ctx: TaskContext) -> None:
 
     stats = query_store.query_stats(ctx.db, query_id)
     for dataset, row in stats.items():
+        ttft = row.get("ttft_ms_mean")
         ctx.log(
             f"{dataset}: 响应 {row['responses']}，失败 {row['failures']}，"
             f"平均 {int(row['latency_mean'] or 0)}ms"
+            + (f"，TTFT {int(ttft)}ms" if ttft else "")
         )
 
 

@@ -8,17 +8,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 from akasha_benchmark.datasets import DATASET_NAMES
+from akasha_benchmark.judge.client import JudgeReply
+from akasha_benchmark.judge.providers import resolve_provider
 from akasha_benchmark.stages import STAGES, StageDefinition
 from akasha_benchmark.store import (
     attribution_store,
     compile_store,
     config_store,
     connect,
+    dumps,
     eval_store,
     query_store,
     run_store,
     task_store,
 )
+from akasha_benchmark.task import Paused
+from akasha_platform import tasks as task_runner
+from akasha_platform.api import config as config_api
+from akasha_platform.api import datasets as datasets_api
+from akasha_platform.api import runs as runs_api
 from akasha_platform.main import create_app
 from conftest import make_compile_run
 from akasha_benchmark.metrics.interpretation import build_metric_evidence
@@ -515,8 +523,6 @@ def test_provider_api_key_never_leaves_the_backend(client):
 
 
 def test_provider_probe_reports_failure_as_data(client, monkeypatch):
-    from akasha_benchmark.judge.client import JudgeReply
-
     client.put(
         "/api/providers/judge",
         json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "k"},
@@ -541,8 +547,6 @@ def test_provider_probe_reports_failure_as_data(client, monkeypatch):
 
 
 def test_provider_probe_returns_the_reply(client, monkeypatch):
-    from akasha_benchmark.judge.client import JudgeReply
-
     client.put(
         "/api/providers/attribution",
         json={"label": "d", "base_url": "https://x/v1", "model": "m", "api_key": "k"},
@@ -566,8 +570,6 @@ def test_provider_probe_returns_the_reply(client, monkeypatch):
 
 
 def test_provider_probe_reports_missing_key(client):
-    from akasha_benchmark.store import config_store
-
     with closing(connect(client.app.state.settings.db_path)) as connection:
         provider_id = config_store.upsert_model_provider(
             connection,
@@ -597,7 +599,6 @@ def test_provider_does_not_expose_or_use_concurrency(client):
     provider = client.get("/api/providers?role=judge").json()[0]
     assert "concurrency" not in provider
 
-    from akasha_benchmark.judge.providers import resolve_provider
 
     with closing(connect(client.app.state.settings.db_path)) as connection:
         provider_id = config_store.upsert_model_provider(
@@ -681,8 +682,6 @@ def test_embedding_model_dimension_roundtrip_and_validation(client):
 
 
 def test_akasha_embedding_probe_uses_minimal_request(client, monkeypatch):
-    from akasha_platform.api import config as config_api
-
     model = client.put(
         "/api/akasha-models",
         json={
@@ -744,7 +743,6 @@ def test_embedding_model_apply_sends_dimension(client, monkeypatch):
     ).json()
     pushed = []
 
-    from akasha_platform.api import config as config_api
 
     class Fake(_AkashaStub):
         def put_model_config(self, feature, payload):
@@ -836,7 +834,6 @@ def test_connection_test_flags_compiles_in_another_workspace(client, db_path, mo
         connection.commit()
     client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
 
-    from akasha_platform.api import config as config_api
 
     class Fake(_AkashaStub):
         def current_user(self):
@@ -856,8 +853,6 @@ def test_connection_test_flags_compiles_in_another_workspace(client, db_path, mo
 
 
 def test_raw_samples_serves_qa_and_corpus_separately(client, dataset_dir, monkeypatch):
-    from akasha_platform.api import datasets as datasets_api
-
     monkeypatch.setattr(datasets_api, "DEFAULT_DATASET_DIR", dataset_dir)
 
     qa = client.get("/api/datasets/hotpotqa/raw?kind=qa&limit=1").json()
@@ -876,8 +871,6 @@ def test_raw_samples_serves_qa_and_corpus_separately(client, dataset_dir, monkey
 
 
 def test_raw_samples_searches_qa_and_corpus(client, dataset_dir, monkeypatch):
-    from akasha_platform.api import datasets as datasets_api
-
     monkeypatch.setattr(datasets_api, "DEFAULT_DATASET_DIR", dataset_dir)
 
     qa = client.get(
@@ -941,7 +934,6 @@ def test_normalized_corpus_returns_full_text(client, normalized):
 def test_normalized_dataset_browsing_filters_and_pages_in_sqlite(
     client, normalized, monkeypatch
 ):
-    from akasha_platform.api import datasets as datasets_api
 
     def reject_full_load(*args, **kwargs):
         raise AssertionError("full dataset load is forbidden for paged routes")
@@ -1041,7 +1033,6 @@ def test_model_config_put_fills_the_only_legal_provider(client, monkeypatch):
     client.put("/api/connection", json={"base_url": "http://x", "email": "e@x", "password": "p"})
     sent: dict = {}
 
-    from akasha_platform.api import config as config_api
 
     class Fake(_AkashaStub):
         def put_model_config(self, feature, payload):
@@ -1086,7 +1077,6 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
     compile_store.record_page(
         normalized, compile_id, "hotpotqa", "2", page_id="page-venice", error=None
     )
-    from akasha_benchmark.store import dumps
 
     compile_store.update_compile_run(
         normalized,
@@ -1204,8 +1194,6 @@ def test_compile_query_and_eval_records_are_searchable(client, normalized):
 
 
 def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, monkeypatch):
-    from akasha_platform.api import runs as runs_api
-
     for index in range(4):
         compile_id = make_compile_run(normalized, run_id=f"tree-{index}")
         query_id = query_store.create_query_run(
@@ -1315,8 +1303,6 @@ def test_non_loopback_refuses_to_start(db_path):
 
 @pytest.mark.parametrize("outcome", ["succeeded", "failed", "paused", "invalid_result"])
 def test_task_and_run_finish_together(settings, db, query_id, monkeypatch, outcome):
-    from akasha_benchmark.task import Paused
-
     db.commit()
 
     def stage(ctx):
@@ -1365,7 +1351,6 @@ def test_recovery_pauses_bound_run(settings, db, query_id):
 def test_cleanup_protects_active_descendants(
     client, db, compile_id, query_id, eval_id, parent, stage, bound
 ):
-    from akasha_benchmark.store import attribution_store
 
     attribution_id = attribution_store.create_attribution_run(
         db,
@@ -1429,8 +1414,6 @@ def test_compile_and_query_tasks_can_run_concurrently(settings, db, monkeypatch)
     ],
 )
 def test_compile_and_query_allow_same_stage_concurrency(settings, db, monkeypatch, stage, args):
-    from akasha_platform import tasks as task_runner
-
     class Fake(_AkashaStub):
         def get_model_configs(self):
             return {"configs": []}
@@ -1461,7 +1444,6 @@ def test_compile_and_query_allow_same_stage_concurrency(settings, db, monkeypatc
 def test_remote_model_config_lock_is_feature_scoped(
     client, db, monkeypatch, stage, feature, allowed
 ):
-    from akasha_platform.api import config as config_api
 
     class Fake(_AkashaStub):
         def put_model_config(self, selected_feature, payload):
@@ -1482,7 +1464,6 @@ def test_remote_model_config_lock_is_feature_scoped(
 def test_saved_model_apply_uses_the_same_feature_lock(
     client, db, monkeypatch, feature, expected
 ):
-    from akasha_platform.api import config as config_api
 
     model_id = config_store.upsert_model_provider(
         db,

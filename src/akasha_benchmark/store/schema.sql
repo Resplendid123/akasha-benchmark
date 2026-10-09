@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS query_response (
     latency_ms INTEGER,
     error TEXT,
     response_json TEXT,
+    timings_json TEXT,
     requested_at TEXT NOT NULL,
     PRIMARY KEY (query_id, sample_id)
 );

@@ -9,6 +9,23 @@ _ARTICLES = re.compile(r"\b(a|an|the)\b", re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
 _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
 
+# 服务端给 general 模式回答注入的固定免责前缀，非模型输出，计分前剥掉。
+GENERAL_DISCLAIMERS = (
+    "> 以下回答基于通用模型知识，未引用企业知识库。",
+    (
+        "> This answer uses general model knowledge and does not cite the "
+        "workspace knowledge base."
+    ),
+)
+
+
+def strip_general_disclaimer(text: str) -> str:
+    stripped = text.lstrip()
+    for disclaimer in GENERAL_DISCLAIMERS:
+        if stripped.startswith(disclaimer):
+            return stripped[len(disclaimer) :].lstrip()
+    return text
+
 
 def normalize_answer(text: str) -> str:
 
@@ -48,7 +65,7 @@ def score_answer(prediction: str, references: Sequence[str]) -> dict[str, float]
 
     if not references:
         raise ValueError("score_answer requires at least one reference")
-    prediction = prediction or ""
+    prediction = strip_general_disclaimer(prediction or "")
     return {
         "em": max(exact_match(prediction, r) for r in references),
         "f1": max(token_f1(prediction, r) for r in references),

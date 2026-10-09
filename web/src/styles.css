@@ -118,6 +118,11 @@ h5 {
 .markdown-preview h2:first-child { margin-top: 0; }
 .markdown-preview p { margin: 8px 0; }
 .markdown-preview ul { margin: 8px 0; padding-left: 22px; }
+.markdown-pre {
+  margin: 10px 0 16px; padding: 10px 12px; overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5;
+}
 .markdown-table-wrap { overflow-x: auto; margin: 10px 0 16px; }
 .markdown-table { min-width: max-content; }
 .markdown-table th,

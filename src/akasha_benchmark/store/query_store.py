@@ -127,6 +127,30 @@ def pending_query_samples(connection: sqlite3.Connection, query_id: int) -> list
     ]
 
 
+_AUDIT_TIMING_KEYS = {
+    "ttft_ms": "ttftMs",
+    "rewrite_ms": "rewriteMs",
+    "retrieval_ms": "retrievalMs",
+    "generation_ms": "generationMs",
+    "server_total_ms": "totalMs",
+}
+
+TIMING_PHASES = tuple(_AUDIT_TIMING_KEYS)
+
+
+def timings_from_audit(metadata: Any) -> dict[str, Any] | None:
+    """把审计表 metadata.timings 转成本地列名。"""
+    timings = metadata.get("timings") if isinstance(metadata, dict) else None
+    if not isinstance(timings, dict):
+        return None
+    local = {}
+    for local_key, remote_key in _AUDIT_TIMING_KEYS.items():
+        value = timings.get(remote_key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            local[local_key] = value
+    return local or None
+
+
 def record_response(
     connection: sqlite3.Connection,
     query_id: int,
@@ -166,11 +190,33 @@ def record_response(
     )
 
 
+def record_timings(
+    connection: sqlite3.Connection,
+    query_id: int,
+    timings_by_sample: dict[str, dict[str, Any]],
+) -> int:
+    """写入远端阶段耗时，仅覆盖已有响应的样本。"""
+    if not timings_by_sample:
+        return 0
+    return connection.executemany(
+        "UPDATE query_response SET timings_json = ? WHERE query_id = ? AND sample_id = ?",
+        [
+            (dumps(timings), query_id, sample_id)
+            for sample_id, timings in timings_by_sample.items()
+        ],
+    ).rowcount
+
+
 def _response(row: sqlite3.Row) -> dict[str, Any]:
     body = loads(row["response_json"])
     return {
-        **{k: v for k, v in dict(row).items() if k != "response_json"},
+        **{
+            k: v
+            for k, v in dict(row).items()
+            if k not in ("response_json", "timings_json")
+        },
         "response": body,
+        "timings": loads(row["timings_json"]),
         "answer_mode": body.get("answerMode") if isinstance(body, dict) else None,
     }
 
@@ -294,6 +340,10 @@ def all_query_stats(
     )
     if query_id is not None:
         params += (query_id,)
+    phases = ",\n".join(
+        f"               AVG(json_extract(timings_json, '$.{phase}')) AS {phase}_mean"
+        for phase in TIMING_PHASES
+    )
     rows = connection.execute(
         f"""
         SELECT query_id, dataset, COUNT(*) AS responses,
@@ -304,7 +354,9 @@ def all_query_stats(
                    ELSE 0
                END) AS failures,
                AVG(latency_ms) AS latency_mean,
-               MAX(latency_ms) AS latency_max
+               MAX(latency_ms) AS latency_max,
+               SUM(timings_json IS NOT NULL) AS timed_responses,
+{phases}
         FROM query_response {where}
         GROUP BY query_id, dataset ORDER BY query_id, dataset
         """,

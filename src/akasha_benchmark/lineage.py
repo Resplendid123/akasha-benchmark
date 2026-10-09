@@ -35,6 +35,7 @@ QUERY_AUDITS = """
 SELECT DISTINCT ON (query_hash) query_hash, metadata
 FROM knowledge_query_audit
 WHERE query_hash = ANY(%(hashes)s)
+  AND (%(since)s::timestamptz IS NULL OR created_at >= %(since)s::timestamptz)
 ORDER BY query_hash, created_at DESC
 """
 
@@ -123,7 +124,10 @@ class LineageReader:
                 f"PostgreSQL compilation count unavailable: {type(exc).__name__}"
             ) from exc
 
-    def query_audits(self, questions: list[str]) -> dict[str, dict[str, Any]]:
+    def query_audits(
+        self, questions: list[str], *, since: str | None = None
+    ) -> dict[str, dict[str, Any]]:
+
         hashes = [
             "sha256:" + hashlib.sha256(question.encode("utf-8")).hexdigest()
             for question in dict.fromkeys(questions)
@@ -134,7 +138,7 @@ class LineageReader:
             with self._connect() as connection:
                 connection.read_only = True
                 with connection.cursor() as cursor:
-                    cursor.execute(QUERY_AUDITS, {"hashes": hashes})
+                    cursor.execute(QUERY_AUDITS, {"hashes": hashes, "since": since})
                     return {
                         str(row[0]): row[1] if isinstance(row[1], dict) else {}
                         for row in cursor.fetchall()
