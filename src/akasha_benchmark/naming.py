@@ -79,5 +79,5 @@ def child_name(
 
 
 def space_slug(run_id: str) -> str:
-    """远端 Akasha space 的 slug。"""
-    return f"bench-{run_id}"[:64]
+    """远端 Akasha space 的 slug；Akasha 只收字母数字。"""
+    return f"bench{''.join(c for c in run_id if c.isascii() and c.isalnum())}"[:64]
