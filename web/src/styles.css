@@ -152,6 +152,7 @@ h5 {
 .form-grid + .form-grid { margin-top: 10px; }
 .form-grid label.field > input,
 .form-grid label.field > select,
+.form-grid label.field > textarea,
 .form-grid .secret-input input { min-width: 0; width: 100%; }
 .form-grid label.field.wide { grid-column: 1 / -1; }
 @media (max-width: 900px) {
@@ -187,12 +188,12 @@ tbody tr.selected { background: var(--accent-soft); }
 .endpoint-table .endpoint-url-col { width: 30%; }
 .endpoint-table .endpoint-key-col { width: 11%; }
 .endpoint-table .endpoint-actions-col { width: 19%; }
-.embedding-endpoint-table .endpoint-label-col { width: 16%; }
-.embedding-endpoint-table .endpoint-name-col { width: 20%; }
-.embedding-endpoint-table .endpoint-url-col { width: 27%; }
-.embedding-endpoint-table .endpoint-dimension-col { width: 9%; }
-.embedding-endpoint-table .endpoint-key-col { width: 10%; }
-.embedding-endpoint-table .endpoint-actions-col { width: 18%; }
+.akasha-endpoint-table .endpoint-label-col { width: 14%; }
+.akasha-endpoint-table .endpoint-name-col { width: 18%; }
+.akasha-endpoint-table .endpoint-url-col { width: 23%; }
+.akasha-endpoint-table .endpoint-params-col { width: 18%; }
+.akasha-endpoint-table .endpoint-key-col { width: 9%; }
+.akasha-endpoint-table .endpoint-actions-col { width: 18%; }
 .endpoint-table td { overflow: hidden; text-overflow: ellipsis; }
 .table-actions {
   display: flex;
@@ -279,6 +280,7 @@ input:focus, select:focus, textarea:focus {
 input[type="checkbox"] { accent-color: var(--accent); }
 label.field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
 label.field input, label.field select { min-width: 180px; }
+label.field textarea { resize: vertical; }
 label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
 
 pre.block {

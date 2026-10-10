@@ -287,6 +287,7 @@ function LiveTable({ data }: { data: ModelConfigsView }) {
           <th>配置项</th>
           <th>模型</th>
           <th>base_url(/v1)</th>
+          <th>parameters</th>
           <th>密钥</th>
         </tr>
       </thead>
@@ -304,6 +305,12 @@ function LiveTable({ data }: { data: ModelConfigsView }) {
               </td>
               <td className="small mono">{row?.model ?? '—'}</td>
               <td className="small mono muted truncate">{row?.baseUrl ?? '—'}</td>
+              <td
+                className="small mono muted truncate"
+                title={formatParameters(row?.parameters)}
+              >
+                {formatParameters(row?.parameters)}
+              </td>
               <td>
                 <Pass ok={Boolean(row?.apiKeySet)} yes="已设置" no="缺失" />
               </td>
@@ -323,13 +330,53 @@ type AkashaModelForm = {
   base_url: string
   model: string
   api_key: string
-  dimension: string
-  parameters: Record<string, unknown>
+  parameters: string
 }
 
 const emptyAkashaModel = (feature: AkashaFeature): AkashaModelForm => ({
-  feature, label: '', base_url: '', model: '', api_key: '', dimension: '', parameters: {},
+  feature, label: '', base_url: '', model: '', api_key: '', parameters: '{}',
 })
+
+const TUNABLE_KEYS =
+  'temperature（0-2）、topP（0-1）、seed（整数）、thinkingMode（qwen|openai）、' +
+  'thinkingEnabled（布尔）、reasoningEffort（low|medium|high）'
+
+// Akasha 服务端按白名单校验，列表外的 key 会被静默丢弃
+const PARAMETER_KEYS: Record<AkashaFeature, string> = {
+  compiler: TUNABLE_KEYS,
+  answer: TUNABLE_KEYS,
+  image: TUNABLE_KEYS,
+  embedding: 'dimension（正整数）、supportsMrl（布尔）',
+}
+
+function parseParameters(text: string): {
+  value: Record<string, unknown> | null
+  error: string | null
+} {
+  const raw = text.trim()
+  if (!raw) return { value: {}, error: null }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (exc) {
+    return { value: null, error: `JSON 解析失败：${(exc as Error).message}` }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { value: null, error: 'parameters 必须是 JSON 对象' }
+  }
+  const value = parsed as Record<string, unknown>
+  const dimension = value.dimension
+  if (
+    dimension !== undefined &&
+    (typeof dimension !== 'number' || !Number.isInteger(dimension) || dimension <= 0)
+  ) {
+    return { value: null, error: 'dimension 必须是正整数' }
+  }
+  return { value, error: null }
+}
+
+const formatParameters = (parameters: Record<string, unknown> | undefined) =>
+  parameters && Object.keys(parameters).length ? JSON.stringify(parameters) : '—'
 
 function AkashaModels() {
   const { data, error, loading, reload } = useAsync(() => api.akashaModels(), [])
@@ -347,8 +394,7 @@ function AkashaModels() {
     setForm({
       feature: item.feature, label: item.label, base_url: item.base_url,
       model: item.model, api_key: '',
-      dimension: item.parameters.dimension === undefined ? '' : String(item.parameters.dimension),
-      parameters: item.parameters,
+      parameters: JSON.stringify(item.parameters ?? {}, null, 2),
     })
     save.reset()
   }
@@ -361,9 +407,7 @@ function AkashaModels() {
     setEditing(null)
     save.reset()
   }
-  const dimension = Number(form.dimension)
-  const dimensionInvalid = form.feature === 'embedding' && form.dimension.trim() !== ''
-    && (!Number.isInteger(dimension) || dimension <= 0)
+  const parameters = parseParameters(form.parameters)
   const label = form.label.trim()
   const taken = models.some((item) =>
     item.feature === form.feature && item.label === label && item.id !== editing)
@@ -385,22 +429,21 @@ function AkashaModels() {
               新增端点
             </button>
           </div>
-          <table className={`endpoint-table${feature === 'embedding' ? ' embedding-endpoint-table' : ''}`}>
+          <table className="endpoint-table akasha-endpoint-table">
             <colgroup>
               <col className="endpoint-label-col" />
               <col className="endpoint-name-col" />
               <col className="endpoint-url-col" />
-              {feature === 'embedding' && <col className="endpoint-dimension-col" />}
+              <col className="endpoint-params-col" />
               <col className="endpoint-key-col" />
               <col className="endpoint-actions-col" />
             </colgroup>
-            <thead><tr><th>标签</th><th>模型</th><th>base_url(/v1)</th>{feature === 'embedding' && <th>维度</th>}<th>密钥</th><th /></tr></thead>
+            <thead><tr><th>标签</th><th>模型</th><th>base_url(/v1)</th><th>parameters</th><th>密钥</th><th /></tr></thead>
             <tbody>
               {models.filter((item) => item.feature === feature).map((item) => (
                 <AkashaModelRow
                   key={item.id}
                   model={item}
-                  embedding={feature === 'embedding'}
                   selected={item.id === editing}
                   applyBusy={apply.busy}
                   removeBusy={remove.busy}
@@ -426,24 +469,25 @@ function AkashaModels() {
                 <Field label="模型"><input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></Field>
                 <Field label="base_url"><input value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></Field>
                 <SecretField label="api_key" hint={typeof editing === 'number' ? '留空保留原值' : undefined} value={form.api_key} onChange={(api_key) => setForm({ ...form, api_key })} />
-                {feature === 'embedding' && (
-                  <Field label="向量维度" hint="可选，填写正整数">
-                    <input type="number" min={1} step={1} value={form.dimension} onChange={(e) => setForm({ ...form, dimension: e.target.value })} placeholder="1024" />
-                  </Field>
-                )}
+                <Field label="parameters" hint={`JSON 对象，可用：${PARAMETER_KEYS[feature]}`} wide>
+                  <textarea
+                    className="mono"
+                    rows={5}
+                    spellCheck={false}
+                    value={form.parameters}
+                    onChange={(e) => setForm({ ...form, parameters: e.target.value })}
+                    placeholder="{}"
+                  />
+                </Field>
               </div>
-              {dimensionInvalid && <div className="note bad">向量维度必须是正整数。</div>}
+              {parameters.error && <div className="note bad">{parameters.error}</div>}
               {taken && <div className="note bad">该类型下已经有一个叫「{label}」的端点。</div>}
               <div className="panel-actions">
-                <button className="action primary" disabled={save.busy || dimensionInvalid || taken || !label || !form.model.trim() || !form.base_url.trim()} onClick={() => save.run(async () => {
-                  const parameters = { ...form.parameters }
-                  if (feature === 'embedding') {
-                    if (form.dimension.trim()) parameters.dimension = dimension
-                    else delete parameters.dimension
-                  }
+                <button className="action primary" disabled={save.busy || !parameters.value || taken || !label || !form.model.trim() || !form.base_url.trim()} onClick={() => save.run(async () => {
                   const result = await api.saveAkashaModel({
                     feature: form.feature, label, base_url: form.base_url.trim(),
-                    model: form.model.trim(), api_key: form.api_key, parameters,
+                    model: form.model.trim(), api_key: form.api_key,
+                    parameters: parameters.value ?? {},
                     ...(typeof editing === 'number' ? { id: editing } : {}),
                   })
                   close(); reload(); return result
@@ -460,7 +504,6 @@ function AkashaModels() {
 
 function AkashaModelRow({
   model,
-  embedding,
   selected,
   applyBusy,
   removeBusy,
@@ -469,7 +512,6 @@ function AkashaModelRow({
   onDeleted,
 }: {
   model: AkashaModelProvider
-  embedding: boolean
   selected: boolean
   applyBusy: boolean
   removeBusy: boolean
@@ -478,6 +520,7 @@ function AkashaModelRow({
   onDeleted: () => void
 }) {
   const probe = useAction<ProviderProbe>()
+  const embedding = model.feature === 'embedding'
 
   return (
     <>
@@ -485,7 +528,9 @@ function AkashaModelRow({
         <td>{model.label}</td>
         <td className="mono small">{model.model}</td>
         <td className="mono small muted truncate">{model.base_url}</td>
-        {embedding && <td className="mono small">{String(model.parameters.dimension ?? '—')}</td>}
+        <td className="mono small muted truncate" title={formatParameters(model.parameters)}>
+          {formatParameters(model.parameters)}
+        </td>
         <td><Pass ok={model.api_key_set} yes="已设置" no="缺失" /></td>
         <td className="table-actions-cell"><div className="table-actions">
           <button className="action small" onClick={onEdit}>编辑</button>
@@ -505,7 +550,7 @@ function AkashaModelRow({
       </tr>
       {(probe.result || probe.error) && (
         <tr>
-          <td colSpan={embedding ? 6 : 5}>
+          <td colSpan={6}>
             {probe.error && <Failed error={probe.error} />}
             {probe.result && <ProbeResult result={probe.result} onClose={probe.reset} />}
           </td>
