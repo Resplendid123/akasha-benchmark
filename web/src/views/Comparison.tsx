@@ -1,7 +1,15 @@
 import type { ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import type { AttributionDetail, CompileRun, EvalDetail, EvalRun, QueryRun, QueryStats } from '../types'
+import type {
+  AttributionDetail,
+  CompileEmbedding,
+  CompileRun,
+  EvalDetail,
+  EvalRun,
+  QueryRun,
+  QueryStats,
+} from '../types'
 import { Failed, Loading, downloadText, duration, formatDateTime, useAsync } from '../ui'
 
 type EvalOption = {
@@ -19,6 +27,8 @@ type LoadedItem = {
   option: EvalOption
   detail: EvalDetail
   attribution: AttributionDetail | null
+  /** PG 不可用时为 null，报告跳过嵌入成本一节。 */
+  embedding: CompileEmbedding | null
 }
 
 const STORAGE_KEY = 'benchmark-comparison-items'
@@ -120,6 +130,15 @@ const METRIC_SECTIONS = [
 
 const TIMELINE_WIDTH = 48
 
+const EMBEDDING_METRICS = [
+  ['mrr', 'MRR'],
+  ['ndcg@5', 'NDCG@5'],
+  ['recall@5', 'Recall@5'],
+  ['precision@5', 'Precision@5'],
+  ['retrieval_f1', 'Retrieval F1 (set)'],
+  ['full_coverage@5', 'Full Coverage@5'],
+] as const
+
 const KNOWLEDGE_METRICS = [
   ['mrr', 'MRR'],
   ['ndcg@5', 'NDCG@5'],
@@ -136,12 +155,41 @@ function datasetLabel(name: string): string {
   return DATASET_LABELS[name.toLowerCase()] ?? name
 }
 
+/** 按查询时的 embedding 模型挑对应那一代；重建后旧代仍带着自己的用量留在 PG 里。 */
+function embeddingGeneration(item: LoadedItem) {
+  const generations = item.embedding?.generations ?? []
+  const model = item.option.query.embedding_model
+  const matching = generations.filter((entry) => entry.model === model)
+  if (matching.length === 0) return null
+  const merged = matching.reduce((total, entry) => ({
+    ...total,
+    chunks: total.chunks + entry.chunks,
+    total_tokens: sumOrNull(total.total_tokens, entry.total_tokens),
+    duration_ms_sum: sumOrNull(total.duration_ms_sum, entry.duration_ms_sum),
+  }))
+  return {
+    ...merged,
+    duration_ms_mean:
+      merged.duration_ms_sum === null || merged.chunks === 0
+        ? null
+        : merged.duration_ms_sum / merged.chunks,
+  }
+}
+
+function sumOrNull(left: number | null, right: number | null): number | null {
+  return left === null && right === null ? null : (left ?? 0) + (right ?? 0)
+}
+
+function embeddingLabel(option: EvalOption): string {
+  return option.query.embedding_label ?? option.compile.embedding_label ?? '嵌入模型未知'
+}
+
 function modelLabel(option: EvalOption): string {
   const compileModels = Array.from(new Set(
     (option.compile.model_label ?? '').split(' + ').map((value) => value.trim()).filter(Boolean),
   )).join('+')
   const queryModel = option.query.model_label ?? option.eval.model_label ?? `评测 #${option.eval.id}`
-  return `${compileModels || '编译模型未知'}->${queryModel}`
+  return `${compileModels || '编译模型未知'}->${embeddingLabel(option)}->${queryModel}`
 }
 
 function modelNote(item: LoadedItem, index: number): string {
@@ -154,10 +202,20 @@ function elapsedMs(start: string | null, finish: string | null): number | null {
   return Number.isFinite(value) && value >= 0 ? value : null
 }
 
-function timingCell(perValue: number | null | undefined, total: number | null, unit: string): string {
-  if (total === null) return '—'
-  const per = perValue === null || perValue === undefined ? '—' : `${duration(perValue)}${unit}`
-  return `${per} · 共 ${duration(total)}`
+function timingCell(
+  perValue: number | null | undefined,
+  total: number | null,
+  unit: string,
+  concurrency?: number | string | null,
+): string {
+  const parts: string[] = []
+  if (total === null) parts.push('—')
+  else {
+    parts.push(perValue === null || perValue === undefined ? '—' : `${duration(perValue)}${unit}`)
+    parts.push(`共 ${duration(total)}`)
+  }
+  if (concurrency !== null && concurrency !== undefined) parts.push(`并发 ${concurrency}`)
+  return parts.join(' · ')
 }
 
 function datasetSummary(item: LoadedItem, dataset: string) {
@@ -348,7 +406,7 @@ function buildMarkdown(items: LoadedItem[]): string {
     const queryMs = elapsedMs(item.option.query.created_at, item.option.query.finished_at)
     for (const dataset of item.detail.datasets.map((entry) => entry.dataset)) {
       const stats = item.option.compile.stats[dataset]
-      lines.push(`| ${circledNumber(itemIndex + 1)} | ${escapeCell(modelLabel(item.option))} | ${escapeCell(datasetLabel(dataset))} | ${stats?.imported ?? stats?.docs ?? '—'} | ${timingCell(item.option.compile.pace?.per_page_ms, compileMs, '/篇')} | ${datasetSummary(item, dataset)?.responses_evaluated ?? '—'} | ${timingCell(item.option.query.stats[dataset]?.latency_mean, queryMs, '/条')} |`)
+      lines.push(`| ${circledNumber(itemIndex + 1)} | ${escapeCell(modelLabel(item.option))} | ${escapeCell(datasetLabel(dataset))} | ${stats?.imported ?? stats?.docs ?? '—'} | ${timingCell(item.option.compile.pace?.per_page_ms, compileMs, '/篇')} | ${datasetSummary(item, dataset)?.responses_evaluated ?? '—'} | ${timingCell(item.option.query.stats[dataset]?.latency_mean, queryMs, '/条', item.option.query.concurrency)} |`)
     }
   }
 
@@ -364,6 +422,20 @@ function buildMarkdown(items: LoadedItem[]): string {
       lines.push(...block)
     }
     lines.push('```')
+  }
+
+  const costRows = items.flatMap((item, itemIndex) => {
+    const generation = embeddingGeneration(item)
+    if (!generation) return []
+    const tokens = generation.total_tokens
+    return [
+      `| ${escapeCell(`${circledNumber(itemIndex + 1)} ${embeddingLabel(item.option)}`)} | ${generation.chunks} | ${generation.dimensions ?? '—'} | ${tokens === null ? '—' : tokens} | ${timingCell(generation.duration_ms_mean, generation.duration_ms_sum, '/块', item.option.query.embedding_concurrency ?? '远端默认')} |`,
+    ]
+  })
+  if (costRows.length > 0) {
+    lines.push('', '### 1.2 嵌入成本', '')
+    lines.push(...tableHeader(['嵌入模型', '向量数', '维度', 'token 合计', '嵌入耗时']))
+    lines.push(...costRows)
   }
 
   lines.push('', '## 二、路由率对比', '')
@@ -403,7 +475,33 @@ function buildMarkdown(items: LoadedItem[]): string {
     lines.push('')
   }
 
-  lines.push('### 3.7 Knowledge-Only 指标对比', '')
+  const embeddingColumns = columns.filter(
+    ({ item }) => item.option.query.embedding_model || item.option.query.embedding_label,
+  )
+  const embeddingModels = new Set(embeddingColumns.map(({ item }) => embeddingLabel(item.option)))
+  if (embeddingModels.size > 1) {
+    lines.push('### 3.7 嵌入模型检索对比', '')
+    lines.push('语料与编译模型相同，只换嵌入模型重算向量后的检索差异。', '')
+    lines.push(...tableHeader([
+      '指标',
+      ...embeddingColumns.map(({ dataset, item }) =>
+        `${datasetLabel(dataset)}（${circledNumber(items.indexOf(item) + 1)} ${embeddingLabel(item.option)}）`),
+    ]))
+    for (const [name, label] of EMBEDDING_METRICS) {
+      if (!embeddingColumns.some(({ dataset, item }) => metricValue(item, dataset, 'overall', name) !== null)) continue
+      const baselineByDataset = new Map<string, number | null>()
+      const cells = embeddingColumns.map(({ dataset, item }) => {
+        const value = metricValue(item, dataset, 'overall', name)
+        const baseline = baselineByDataset.get(dataset)
+        if (!baselineByDataset.has(dataset)) baselineByDataset.set(dataset, value)
+        return metricCell(value, baseline ?? null)
+      })
+      lines.push(`| ${label} | ${cells.join(' | ')} |`)
+    }
+    lines.push('')
+  }
+
+  lines.push(`### 3.${embeddingModels.size > 1 ? 8 : 7} Knowledge-Only 指标对比`, '')
   const knowledgeColumns = columns
   lines.push(...tableHeader(['指标', ...knowledgeColumns.map(({ dataset, item }) => `${datasetLabel(dataset)} ${modelNote(item, items.indexOf(item))}`)]))
   for (const [name, label] of KNOWLEDGE_METRICS) {
@@ -455,7 +553,11 @@ export function Comparison() {
     async () => Promise.all(items.flatMap((item) => {
       const option = optionMap.get(item.evalId)
       if (!option) return []
-      return [Promise.all([api.evalRun(item.evalId), item.attributionId === null ? Promise.resolve(null) : api.attribution(item.attributionId)]).then(([detail, attribution]) => ({ option, detail, attribution }))]
+      return [Promise.all([
+        api.evalRun(item.evalId),
+        item.attributionId === null ? Promise.resolve(null) : api.attribution(item.attributionId),
+        api.compileEmbedding(option.compile.id).catch(() => null),
+      ]).then(([detail, attribution, embedding]) => ({ option, detail, attribution, embedding }))]
     })),
     [selectedKey, options.length],
   )

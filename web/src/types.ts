@@ -253,6 +253,34 @@ export interface QueryStats {
   server_total_ms_mean: number | null
 }
 
+export interface EmbeddingGeneration {
+  model: string | null
+  dimensions: number | null
+  active: boolean
+  chunks: number
+  embedded: number
+  total_tokens: number | null
+  duration_ms_sum: number | null
+  duration_ms_mean: number | null
+  first_created_at: string | null
+  last_created_at: string | null
+}
+
+export interface EmbeddingCoverage {
+  total: number
+  matched: number
+  ready: boolean
+  models: string[]
+}
+
+export interface CompileEmbedding {
+  compile_id: number
+  space_id: string
+  target: { model: string | null; dimensions: number | null }
+  coverage: EmbeddingCoverage
+  generations: EmbeddingGeneration[]
+}
+
 export interface QueryRun {
   id: number
   name: string
@@ -260,6 +288,9 @@ export interface QueryRun {
   concurrency: number
   status: RunStatus
   model_label: string | null
+  embedding_label: string | null
+  embedding_model: string | null
+  embedding_concurrency: number | null
   sample_count: number
   success_count: number
   created_at: string
@@ -293,6 +324,7 @@ export interface CompileRun {
   space_name: string | null
   workspace_id: string | null
   model_label: string | null
+  embedding_label: string | null
   status: RunStatus
   created_at: string
   finished_at: string | null

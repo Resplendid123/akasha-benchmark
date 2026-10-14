@@ -15,13 +15,15 @@ from .compile_control import CompileRemoteService
 from .settings import Settings
 
 
-EXCLUSIVE = frozenset({"download", "normalize"})
+# embed 重建期间空间里是新旧混合的活跃代，编译和查询都读不到稳定结果
+EXCLUSIVE = frozenset({"download", "normalize", "embed"})
 
 STAGE_CONCURRENCY: dict[str, int] = {"compile": 16, "query": 16}
 UNLIMITED_CONCURRENCY = frozenset({"attribute"})
 TASK_MODEL_FEATURES: dict[str, tuple[str, ...]] = {
     "compile": ("compiler", "embedding", "image"),
-    "query": ("answer",),
+    "embed": ("embedding",),
+    "query": ("embedding", "answer"),
 }
 BEIJING = timezone(timedelta(hours=8), name="Asia/Shanghai")
 MAX_TIMER_DELAY_SECONDS = 24 * 60 * 60

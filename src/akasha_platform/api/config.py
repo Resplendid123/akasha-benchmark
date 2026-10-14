@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api")
 
 MODEL_FEATURE_STAGES = {
     "compiler": frozenset({"compile"}),
-    "embedding": frozenset({"compile", "query"}),
+    "embedding": frozenset({"compile", "embed", "query"}),
     "answer": frozenset({"query"}),
     "image": frozenset({"compile"}),
 }
@@ -95,7 +95,7 @@ def test_connection(request: Request) -> dict[str, Any]:
             model_configs = client.get_model_configs()
     except AkashaError as exc:
         raise HTTPException(502, f"Akasha 拒绝了请求：{exc}") from exc
-    except OSError as exc:
+    except (httpx.RequestError, OSError) as exc:
         raise HTTPException(502, f"连不上 {config.base_url}：{exc}") from exc
 
     user = (me or {}).get("user") or {}
@@ -143,7 +143,7 @@ def get_model_configs(request: Request) -> dict[str, Any]:
             live = client.get_model_configs()
     except AkashaError as exc:
         raise HTTPException(502, str(exc)) from exc
-    except OSError as exc:
+    except (httpx.RequestError, OSError) as exc:
         raise HTTPException(502, f"连不上 {config.base_url}：{exc}") from exc
 
     with db(request) as connection:
@@ -180,15 +180,19 @@ def put_model_config(
                 result = client.put_model_config(feature, payload)
     except AkashaError as exc:
         raise HTTPException(502, str(exc)) from exc
-    except OSError as exc:
+    except (httpx.RequestError, OSError) as exc:
         raise HTTPException(502, f"连不上 {config.base_url}：{exc}") from exc
 
-    requires_rebuild = feature in {"compiler", "embedding"}
+    impact = {
+        "compiler": "需要重新编译",
+        "embedding": "已有编译可用「重建嵌入」复用，不必重新编译",
+    }.get(feature, "不影响已有编译")
     return {
         "feature": feature,
         "result": result,
-        "requires_new_compile": requires_rebuild,
-        "impact": "需要重新编译" if requires_rebuild else "不影响已有编译",
+        "requires_new_compile": feature == "compiler",
+        "requires_embedding_rebuild": feature == "embedding",
+        "impact": impact,
     }
 
 
@@ -555,6 +559,6 @@ def apply_akasha_model(request: Request, model_id: int) -> dict[str, Any]:
                 )
     except AkashaError as exc:
         raise HTTPException(502, str(exc)) from exc
-    except OSError as exc:
+    except (httpx.RequestError, OSError) as exc:
         raise HTTPException(502, f"连不上 {config.base_url}：{exc}") from exc
     return {"applied": feature}

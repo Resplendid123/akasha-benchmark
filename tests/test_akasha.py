@@ -12,7 +12,8 @@ from akasha_benchmark import model_configs
 from akasha_benchmark import akasha_client
 from akasha_benchmark.akasha_client import AkashaClient, unwrap_envelope
 from akasha_benchmark.config import AkashaConfig
-from akasha_benchmark.stages import compile, query
+from akasha_benchmark.lineage import LineageUnavailable
+from akasha_benchmark.stages import compile, embed, query
 from akasha_benchmark.store import (
     compile_store,
     config_store,
@@ -130,6 +131,7 @@ class FakeClient:
             }
         }
         self.queries: list[str] = []
+        self.rebuilt: list[list[str]] = []
 
     def __enter__(self):
         return self
@@ -162,6 +164,14 @@ class FakeClient:
             "acceptedRunCount": self.accepted_runs,
             "coalescedRunCount": 0,
             "runs": ([{"runId": "remote-run-1", "disposition": "created"}] if self.accepted_runs else []),
+        }
+
+    def rebuild_space_embeddings(self, space_ids, *, embedding_concurrency=None):
+        self.rebuilt.append({"spaces": list(space_ids), "concurrency": embedding_concurrency})
+        return {
+            "action": "rebuild_embeddings",
+            "queuedSpaceCount": len(space_ids),
+            "jobIds": [f"rebuild-{index}" for index, _ in enumerate(space_ids)],
         }
 
     def run_diagnostics(self, space_ids, *, limit=50):
@@ -1311,7 +1321,7 @@ def test_query_blocks_embedding_model_change(ready_connection, monkeypatch):
     ctx = context(
         ready_connection, {"compile_id": compile_id, "name": "embedding-changed"}
     )
-    with pytest.raises(RuntimeError, match="embedding.*必须重新编译"):
+    with pytest.raises(RuntimeError, match="无法用 PostgreSQL 确认"):
         execute(query.run, ctx)
     assert query_store.query_run_by_name(ready_connection, "embedding-changed") is None
 
@@ -1554,8 +1564,228 @@ def test_query_refuses_embedding_drift_from_compile_snapshot(ready_connection, m
             return changed
 
     monkeypatch.setattr(query, "AkashaClient", lambda config: Drifted(config))
-    with pytest.raises(RuntimeError, match="embedding.*必须重新编译"):
+    with pytest.raises(RuntimeError, match="无法用 PostgreSQL 确认"):
         execute(query.run, context(ready_connection, {"compile_id": compile_id}))
+
+
+def _drifted_client(monkeypatch, module, target="changed-embedding"):
+    """远端 embedding 换成 target 的 FakeClient。"""
+    changed = {
+        "configs": [
+            {**entry, **({"model": target} if entry["feature"] == "embedding" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+    monkeypatch.setattr(
+        module, "AkashaClient", lambda config: FakeClient(config, configs=changed)
+    )
+    return changed
+
+
+def _stub_generations(monkeypatch, module, generations):
+    """替掉 PG 读取，只给活跃代分布。"""
+
+    class Reader:
+        def __init__(self, database_url):
+            self.database_url = database_url
+
+        def space_embedding_generations(self, space_id):
+            return {"space_id": space_id, "generations": generations}
+
+        def query_audits(self, questions, *, since=None):
+            raise LineageUnavailable("stubbed")
+
+    monkeypatch.setattr(module, "LineageReader", Reader)
+
+
+def _active(model, chunks):
+    return {"model": model, "dimensions": 1024, "active": True, "chunks": chunks}
+
+
+def test_query_allows_embedding_change_after_full_rebuild(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    _drifted_client(monkeypatch, query)
+    _stub_generations(monkeypatch, query, [_active("changed-embedding", 4)])
+
+    execute(
+        query.run,
+        context(ready_connection, {"compile_id": compile_id, "name": "rebuilt"}),
+    )
+
+    run = query_store.query_run_by_name(ready_connection, "rebuilt")
+    assert run["status"] == run_store.STATUS_SUCCEEDED
+
+
+def test_query_blocks_half_rebuilt_embeddings(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    _drifted_client(monkeypatch, query)
+    _stub_generations(
+        monkeypatch,
+        query,
+        [_active("changed-embedding", 3), _active("e1", 1)],
+    )
+
+    with pytest.raises(RuntimeError, match="已重建 3 / 共 4"):
+        execute(query.run, context(ready_connection, {"compile_id": compile_id}))
+
+
+def test_query_blocks_when_nothing_was_rebuilt(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    _drifted_client(monkeypatch, query)
+    _stub_generations(monkeypatch, query, [_active("e1", 4)])
+
+    with pytest.raises(RuntimeError, match="重建嵌入"):
+        execute(query.run, context(ready_connection, {"compile_id": compile_id}))
+
+
+def test_embed_rebuilds_when_active_generation_already_matches(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    steps = [
+        [_active("e1", 4)],
+        [{**_active("e1", 4), "total_tokens": 40}],
+    ]
+
+    class Reader:
+        def __init__(self, database_url):
+            pass
+
+        def space_embedding_generations(self, space_id):
+            return {"space_id": space_id, "generations": steps.pop(0) if len(steps) > 1 else steps[0]}
+
+    monkeypatch.setattr(embed, "LineageReader", Reader)
+
+    execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
+
+    assert client.rebuilt == [{"spaces": ["space-1"], "concurrency": None}]
+
+
+def test_embed_fails_when_same_model_rebuild_changes_nothing(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    _stub_generations(monkeypatch, embed, [_active("e1", 4)])
+
+    with pytest.raises(RuntimeError, match="重建没有生效"):
+        execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
+
+
+def test_embed_skips_when_space_has_no_active_chunks(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    _stub_generations(monkeypatch, embed, [])
+
+    execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
+
+    assert client.rebuilt == []
+
+
+def test_embed_rebuilds_then_waits_for_full_coverage(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    steps = [
+        [_active("e1", 4)],
+        [_active("e1", 2), _active("e1-new", 2)],
+        [_active("e1-new", 4)],
+    ]
+
+    class Reader:
+        def __init__(self, database_url):
+            pass
+
+        def space_embedding_generations(self, space_id):
+            return {"space_id": space_id, "generations": steps.pop(0) if len(steps) > 1 else steps[0]}
+
+    monkeypatch.setattr(embed, "LineageReader", Reader)
+    client.configs = {
+        "configs": [
+            {**entry, **({"model": "e1-new"} if entry["feature"] == "embedding" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+
+    execute(
+        embed.run,
+        context(ready_connection, {"compile_id": compile_id, "embedding_concurrency": 16}),
+    )
+
+    assert client.rebuilt == [{"spaces": ["space-1"], "concurrency": 16}]
+
+
+def test_embed_leaves_concurrency_to_remote_default(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    client.configs = {
+        "configs": [
+            {**entry, **({"model": "e1-new"} if entry["feature"] == "embedding" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    steps = [[_active("e1", 4)], [_active("e1-new", 4)]]
+
+    class Reader:
+        def __init__(self, database_url):
+            pass
+
+        def space_embedding_generations(self, space_id):
+            return {"space_id": space_id, "generations": steps.pop(0) if len(steps) > 1 else steps[0]}
+
+    monkeypatch.setattr(embed, "LineageReader", Reader)
+
+    execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
+
+    assert client.rebuilt == [{"spaces": ["space-1"], "concurrency": None}]
+
+
+@pytest.mark.parametrize("value", [0, 51])
+def test_embed_rejects_concurrency_outside_remote_limit(ready_connection, monkeypatch, value):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: FakeClient(config))
+
+    with pytest.raises(ValueError, match="1 到 50"):
+        execute(
+            embed.run,
+            context(
+                ready_connection,
+                {"compile_id": compile_id, "embedding_concurrency": value},
+            ),
+        )
+
+
+def test_embed_fails_when_rebuild_stalls(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    client.configs = {
+        "configs": [
+            {**entry, **({"model": "e1-new"} if entry["feature"] == "embedding" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(embed, "MAX_IDLE_POLLS", 3)
+    _stub_generations(monkeypatch, embed, [_active("e1", 4)])
+
+    with pytest.raises(RuntimeError, match="重建停滞"):
+        execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
+
+
+def test_embed_requires_database_url(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    config_store.update_connection(ready_connection, database_url="")
+    ready_connection.commit()
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: FakeClient(config))
+
+    with pytest.raises(RuntimeError, match="PostgreSQL"):
+        execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
 
 
 def test_query_uses_frozen_selection(ready_connection, monkeypatch):

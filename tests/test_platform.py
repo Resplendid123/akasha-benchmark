@@ -4,12 +4,14 @@ import threading
 import time
 from contextlib import closing, contextmanager
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from akasha_benchmark.datasets import DATASET_NAMES
 from akasha_benchmark.judge.client import JudgeReply
 from akasha_benchmark.judge.providers import resolve_provider
+from akasha_benchmark.lineage import LineageUnavailable
 from akasha_benchmark.stages import STAGES, StageDefinition
 from akasha_benchmark.store import (
     attribution_store,
@@ -194,6 +196,46 @@ def test_only_compile_can_be_scheduled(settings):
             "query",
             {"compile_id": 1, "schedule_at": "2099-01-02T08:30"},
         )
+
+
+def _active_task(db, stage: str, params: dict | None = None) -> int:
+    task_id = task_store.create_task(db, stage=stage, params=params or {})
+    db.commit()
+    return task_id
+
+
+def _stage_params(stage: str) -> dict:
+    return {"datasets": ["hotpotqa"]} if stage == "compile" else {"compile_id": 1}
+
+
+@pytest.mark.parametrize(
+    ("running", "incoming"),
+    [
+        ("embed", "compile"),
+        ("embed", "query"),
+        ("compile", "embed"),
+        ("query", "embed"),
+    ],
+)
+def test_embed_is_exclusive_with_compile_and_query(settings, db, running, incoming):
+    """重建期间空间里是新旧混合的活跃代，编译和查询都读不到稳定结果。"""
+    _active_task(db, running, _stage_params(running))
+    runner = TaskRunner(settings)
+
+    with pytest.raises(TaskRejected, match="请先等它结束或暂停"):
+        runner.start(incoming, _stage_params(incoming))
+
+
+def test_compile_and_query_still_run_side_by_side(settings, db, monkeypatch):
+    """对照：互斥只来自 embed，compile 与 query 的并发上限没被改窄。"""
+    _active_task(db, "compile", _stage_params("compile"))
+    runner = TaskRunner(settings)
+    monkeypatch.setattr(runner, "_spawn", lambda *args: None)
+    monkeypatch.setattr(task_runner.TaskRunner, "_fetch_model_configs", staticmethod(lambda _c: None))
+
+    task = runner.start("query", _stage_params("query"))
+
+    assert task["status"] == task_store.QUEUED
 
 
 def test_due_scheduled_compile_is_claimed_once(settings, db, monkeypatch):
@@ -1246,6 +1288,42 @@ def test_compile_tree_uses_constant_queries_and_no_postgres(client, normalized, 
     assert len(selects) <= 15
 
 
+def test_query_view_reports_embed_concurrency_in_effect_when_it_started(client, normalized):
+    """重建前跑的查询用的是编译时向量，不能贴上重建的并发。"""
+    compile_id = make_compile_run(normalized, run_id="embed-concurrency")
+    queries = {}
+    for name, created_at in (("before-rebuild", "2026-10-14T06:00:00Z"), ("after-rebuild", "2026-10-14T08:00:00Z")):
+        queries[name] = query_store.create_query_run(
+            normalized, name=name, compile_id=compile_id, concurrency=4, model_configs={}
+        )
+        normalized.execute(
+            "UPDATE query_run SET created_at = ? WHERE id = ?", (created_at, queries[name])
+        )
+    for status, finished_at, concurrency in (
+        (task_store.SUCCEEDED, "2026-10-14T07:00:00Z", 16),
+        (task_store.FAILED, "2026-10-14T07:30:00Z", 32),
+    ):
+        task_id = task_store.create_task(
+            normalized,
+            stage="embed",
+            params={"compile_id": compile_id, "embedding_concurrency": concurrency},
+        )
+        task_store.transition(normalized, task_id, status)
+        normalized.execute("UPDATE task SET finished_at = ? WHERE id = ?", (finished_at, task_id))
+    normalized.commit()
+
+    runs = {
+        run["id"]: run
+        for run in next(
+            item for item in client.get("/api/compiles").json()["compiles"]
+            if item["id"] == compile_id
+        )["queries"]
+    }
+
+    assert runs[queries["before-rebuild"]]["embedding_concurrency"] is None
+    assert runs[queries["after-rebuild"]]["embedding_concurrency"] == 16
+
+
 def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, monkeypatch):
     calls: list[str] = []
 
@@ -1270,6 +1348,96 @@ def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, mon
     assert body["removed_bullmq_jobs"] == 2
     assert calls == ["run-1"]
     assert "空间没有删除" in body["note"]
+
+
+def _embedding_client(monkeypatch, generations, model="e2"):
+    class FakeAkasha(_AkashaStub):
+        def get_model_configs(self):
+            return {
+                "configs": [
+                    {
+                        "feature": "embedding",
+                        "model": model,
+                        "baseUrl": "http://x/v1",
+                        "parameters": {"dimension": 1024},
+                    }
+                ]
+            }
+
+    class Reader:
+        def __init__(self, database_url):
+            if not database_url:
+                raise LineageUnavailable("no database_url configured")
+
+        def space_embedding_generations(self, space_id):
+            return {"space_id": space_id, "generations": generations}
+
+    monkeypatch.setattr("akasha_platform.api.runs.AkashaClient", FakeAkasha)
+    monkeypatch.setattr("akasha_platform.api.runs.LineageReader", Reader)
+
+
+def test_compile_embedding_maps_unreachable_remote_to_502(client, db_path, monkeypatch):
+    """Akasha 没起时 httpx 抛 ConnectError，不能漏成 500。"""
+
+    class Unreachable(_AkashaStub):
+        def get_model_configs(self):
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr("akasha_platform.api.runs.AkashaClient", Unreachable)
+    with closing(connect(db_path)) as connection:
+        compile_id = make_compile_run(connection)
+        compile_store.update_compile_run(connection, compile_id, space_id="space-1")
+        connection.commit()
+
+    assert client.get(f"/api/compiles/{compile_id}/embedding").status_code == 502
+
+
+def test_compile_embedding_reports_coverage_and_usage(client, db_path, monkeypatch):
+    _embedding_client(
+        monkeypatch,
+        [
+            {
+                "model": "e2", "dimensions": 1024, "active": True, "chunks": 3, "embedded": 3,
+                "total_tokens": 600, "duration_ms_sum": 1800, "duration_ms_mean": 600.0,
+                "first_created_at": None, "last_created_at": None,
+            },
+            {
+                "model": "e1", "dimensions": 768, "active": False, "chunks": 3, "embedded": 3,
+                "total_tokens": None, "duration_ms_sum": None, "duration_ms_mean": None,
+                "first_created_at": None, "last_created_at": None,
+            },
+        ],
+    )
+    with closing(connect(db_path)) as connection:
+        compile_id = make_compile_run(connection)
+        compile_store.update_compile_run(connection, compile_id, space_id="space-1")
+        connection.commit()
+
+    body = client.get(f"/api/compiles/{compile_id}/embedding").json()
+
+    assert body["target"] == {"model": "e2", "dimensions": 1024}
+    assert body["coverage"] == {"total": 3, "matched": 3, "ready": True, "models": ["e2"]}
+    assert [entry["active"] for entry in body["generations"]] == [True, False]
+
+
+def test_compile_embedding_needs_postgres(client, db_path, monkeypatch):
+    _embedding_client(monkeypatch, [])
+    with closing(connect(db_path)) as connection:
+        compile_id = make_compile_run(connection)
+        compile_store.update_compile_run(connection, compile_id, space_id="space-1")
+        config_store.update_connection(connection, database_url="")
+        connection.commit()
+
+    assert client.get(f"/api/compiles/{compile_id}/embedding").status_code == 503
+
+
+def test_compile_embedding_requires_a_space(client, db_path, monkeypatch):
+    _embedding_client(monkeypatch, [])
+    with closing(connect(db_path)) as connection:
+        compile_id = make_compile_run(connection)
+        connection.commit()
+
+    assert client.get(f"/api/compiles/{compile_id}/embedding").status_code == 409
 
 
 def test_cleanup_refused_while_a_task_writes_the_record(client, db_path):

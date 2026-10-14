@@ -32,6 +32,7 @@ class _Lookups:
     attribution_counts: dict[int, dict[str, Any]]
     provider_labels: dict[int, str]
     config_labels: dict[tuple[str, str, str], str]
+    embed_runs: dict[int, list[tuple[str, int | None]]]
 
 
 def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -102,6 +103,25 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         for row in connection.execute("SELECT id, label FROM model_provider")
     }
     config_labels = config_store.remote_label_map(connection)
+    # 每次成功重建的完成时刻与并发，按时刻升序；留空走远端默认，记作 None
+    embed_runs: dict[int, list[tuple[str, int | None]]] = {}
+    for row in connection.execute(
+        """
+        SELECT json_extract (params_json, '$.compile_id') AS compile_id,
+               json_extract (params_json, '$.embedding_concurrency') AS concurrency,
+               finished_at
+        FROM task
+        WHERE stage = 'embed' AND status = 'succeeded' AND finished_at IS NOT NULL
+          AND json_extract (params_json, '$.compile_id') IS NOT NULL
+        ORDER BY finished_at
+        """
+    ):
+        embed_runs.setdefault(int(row["compile_id"]), []).append(
+            (
+                str(row["finished_at"]),
+                None if row["concurrency"] is None else int(row["concurrency"]),
+            )
+        )
 
     lookups = _Lookups(
         compile_stats=compile_stats,
@@ -118,6 +138,7 @@ def build_compile_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         attribution_counts=attribution_counts,
         provider_labels=provider_labels,
         config_labels=config_labels,
+        embed_runs=embed_runs,
     )
     return [_compile_view(row, lookups) for row in compile_rows]
 
@@ -139,6 +160,11 @@ def _compile_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
         "model_label": _remote_model_labels(
             loads(row.get("model_configs_json"), {}),
             ("compiler",),
+            lookups.config_labels,
+        ),
+        "embedding_label": _remote_model_labels(
+            loads(row.get("model_configs_json"), {}),
+            ("embedding",),
             lookups.config_labels,
         ),
         "datasets": loads(row["datasets_json"], []),
@@ -166,6 +192,13 @@ def _query_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
         **_public_run(row),
         "model_label": _remote_model_labels(
             loads(row.get("model_configs_json"), {}), ("answer",), lookups.config_labels
+        ),
+        "embedding_label": _remote_model_labels(
+            loads(row.get("model_configs_json"), {}), ("embedding",), lookups.config_labels
+        ),
+        "embedding_model": _remote_model(loads(row.get("model_configs_json"), {}), "embedding"),
+        "embedding_concurrency": _embed_concurrency_at(
+            lookups.embed_runs.get(int(row["compile_id"]), []), str(row["created_at"])
         ),
         "sample_count": lookups.query_sample_counts.get(query_id, 0) or response_count,
         "success_count": sum(
@@ -226,6 +259,14 @@ def _eval_view(row: dict[str, Any], lookups: _Lookups) -> dict[str, Any]:
     }
 
 
+def _embed_concurrency_at(
+    runs: list[tuple[str, int | None]], started_at: str
+) -> int | None:
+    """查询跑在它启动前最后一次重建的向量上；更早的查询用编译时向量，并发不由本地定。"""
+    picked = [value for finished_at, value in runs if finished_at <= started_at]
+    return picked[-1] if picked else None
+
+
 def _grouped(rows: list[dict[str, Any]], key: str) -> dict[int, list[dict[str, Any]]]:
     grouped: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
@@ -245,6 +286,12 @@ def _compiled_pages(run: dict[str, Any], stats: dict[str, Any]) -> int | None:
 
 def _public_run(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if not key.endswith("_json")}
+
+
+def _remote_model(configs: dict[str, Any], feature: str) -> str | None:
+    """原始模型名，用于和 PG 里 chunk 的 embedding_model 对齐（标签可能是本地别名）。"""
+    config = feature_of(configs, feature) or {}
+    return str(config["model"]) if config.get("model") else None
 
 
 def _remote_model_labels(

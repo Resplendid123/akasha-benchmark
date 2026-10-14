@@ -11,8 +11,8 @@ import httpx
 from .. import naming
 from ..akasha_client import AkashaClient, AkashaError
 from ..config import load_config
-from ..lineage import LineageReader, LineageUnavailable
-from ..model_configs import drift, matches
+from ..lineage import BadPageId, LineageReader, LineageUnavailable, active_coverage
+from ..model_configs import drift, feature_of, matches
 from ..store import compile_store, loads, query_store
 from ..task import TaskContext
 
@@ -71,6 +71,42 @@ def _collect_timings(ctx: TaskContext, query_id: int, since: str | None) -> None
         ctx.log("审计表没有可用的阶段耗时（远端可能未开启 timings）", "warn")
 
 
+def _require_rebuilt_embeddings(
+    ctx: TaskContext, compile_run: dict[str, Any], current: dict[str, Any]
+) -> None:
+    """embedding 与编译时不同时，查 PG 活跃代：已整代重建过就放行，否则拦住。"""
+    target = str((feature_of(current, "embedding") or {}).get("model") or "")
+    space_id = compile_run["space_id"]
+    try:
+        reader = LineageReader(load_config(ctx.db).database_url)
+        report = reader.space_embedding_generations(str(space_id))
+    except (LineageUnavailable, BadPageId) as exc:
+        raise RuntimeError(
+            f"远端 embedding 配置与编译时不同，无法用 PostgreSQL 确认是否已重建：{exc}。"
+            "请先在查询页点「重建嵌入」，并填好 database_url 以便确认重建结果；"
+            "或重新编译"
+        ) from exc
+
+    coverage = active_coverage(report["generations"], target)
+    if coverage["ready"]:
+        ctx.log(
+            f"embedding 已整代重建为 {target}（{coverage['total']} 个 chunk），"
+            "语料仍是原 compiler 编译的产物",
+            "warn",
+        )
+        return
+    if coverage["matched"]:
+        raise RuntimeError(
+            f"嵌入重建未完成：已重建 {coverage['matched']} / 共 {coverage['total']} 个 chunk，"
+            "活跃代新旧混合，检索结果不可用。请等重建任务跑完"
+        )
+    raise RuntimeError(
+        f"远端 embedding 配置是 {target}，但空间里的 chunk 还是 "
+        f"{', '.join(coverage['models']) or '（无）'}。"
+        "dense 检索按 embedding profile 过滤，会一条都召回不到。请先在查询页点「重建嵌入」"
+    )
+
+
 def _select_samples(
     connection: sqlite3.Connection,
     compile_id: int,
@@ -127,7 +163,7 @@ def run(ctx: TaskContext) -> None:
         snapshot = loads(compile_run["model_configs_json"])
         changed = drift(current, snapshot)
         if changed["embedding"]:
-            raise RuntimeError("远端 embedding 配置与编译时不同，必须重新编译")
+            _require_rebuilt_embeddings(ctx, compile_run, current)
         if resuming:
             existing_query = query_store.get_query_run(ctx.db, query_id) or {}
             query_snapshot = loads(existing_query.get("model_configs_json"))
@@ -153,7 +189,7 @@ def run(ctx: TaskContext) -> None:
                 ctx.db,
                 str(compile_run["run_id"]),
                 "q",
-                naming.model_slug(ctx.db, current, "answer"),
+                naming.query_slug(ctx.db, current),
             )
         )
         ctx.freeze(

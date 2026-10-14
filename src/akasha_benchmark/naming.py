@@ -40,6 +40,13 @@ def model_slug(
     return _slug(label) or _slug(model) or "unknown"
 
 
+def query_slug(connection: sqlite3.Connection, configs: dict[str, Any]) -> str:
+    """嵌入-回答，如 bgem3-gpt56sol；只换 embedding 的两次查询靠这段区分。"""
+    return "-".join(
+        model_slug(connection, configs, feature) for feature in ("embedding", "answer")
+    )
+
+
 def _pick(candidate: Callable[[int], str], taken: Callable[[str], bool]) -> str:
     index = 1
     while taken(name := candidate(index)):

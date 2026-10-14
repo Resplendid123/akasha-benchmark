@@ -40,14 +40,17 @@ dataset/ ── normalize ──▶ sample + corpus_doc
                               │
                               ▼
 compile_run ──▶ query_run ──▶ eval_run ──▶ attribution_run
+      ▲
+      └── embed（重建向量，不产生运行记录）
 ```
 
 1. `download` 将数据集文件下载或整理到 `dataset/`。
 2. `normalize` 通过适配器生成统一的 `sample` 和 `corpus_doc`，只写 SQLite。
 3. `compile` 抽取样本和语料，创建独立 Akasha 空间，导入并编译文档，同时保存抽样参数、空间信息和远端模型快照。
-4. `query` 在指定编译空间逐样本调用 Akasha，保存 HTTP 状态、耗时和完整响应。
-5. `evaluate` 将 `sourcePageId` 映射回语料文档，计算可用指标和可选 Judge，并保存逐样本结果与汇总。
-6. `attribute` 基于指标与血缘证据给出逐样本规则根因；配置模型时，还可为整轮评测生成一份分析报告。
+4. `embed` 用当前远端 embedding 配置重算整个空间的向量。
+5. `query` 在指定编译空间逐样本调用 Akasha，保存 HTTP 状态、耗时和完整响应。
+6. `evaluate` 将 `sourcePageId` 映射回语料文档，计算可用指标和可选 Judge，并保存逐样本结果与汇总。
+7. `attribute` 基于指标与血缘证据给出逐样本规则根因；配置模型时，还可为整轮评测生成一份分析报告。
 
 编译子集策略由数据集适配器声明：有 gold 映射的数据集按 QA 选择语料，`musique` 额外按跳数分层，`narrativeqa` 按完整文档取样，`itfaq` 使用全量语料。指标同样声明所需标注，数据集不满足依赖时直接省略该指标。
 
@@ -69,6 +72,9 @@ compile_run 1 ── * query_run 1 ── * eval_run 1 ── * attribution_run
 - 阶段在已落库的边界检查暂停信号。继续任务复用冻结参数与原产物 ID：查询跳过已有成功响应，Judge 和归因跳过已有结果。
 - 编译暂停先取消远端 exact run；继续时根据累积 RunPage 状态，仅通过 `retry-pages` 重试失败、合并失败或手动取消的页面。
 - 后端启动时处理上次进程遗留的活动任务；远端编译确认停止后标记暂停，无法确认时标记失败。
-- 编译要求 Akasha owner 权限。编译和查询在开始、结束及续跑时校验 workspace 与模型快照；embedding 与原编译不一致时拒绝查询。运行任务只读取远端模型配置，不隐式修改它。
+- 编译要求 Akasha owner 权限，重建向量要求 owner 或 admin。编译和查询在开始、结束及续跑时校验 workspace 与模型快照。运行任务只读取远端模型配置，不隐式修改它。
+- embedding 与原编译不一致时，查询改为按 PostgreSQL 的活跃代覆盖率判定：整代已重建则放行并告警，部分重建或完全未重建则拒绝。dense 检索按 embedding profile 与维度过滤，混合代会召回不到。
+- `embed` 与所有其他任务互斥：重建期间空间里是新旧混合的活跃代，编译和查询都读不到稳定结果。
+- `embed` 入口不按模型是否变化开关：模型不同按覆盖率判完成，模型相同按活跃代用量指纹判完成（先变化再稳定），空间没有活跃 chunk 才直接返回。
 - 编译完整性由 `missingChunk`、`missingEmbedding`、`missingSource` 和 `stalePageCount` 判定。明确存在成功页面但整体失败的编译可降级用于查询，并标记结果不完整。
-- PostgreSQL 仅用于读取编译血缘。不可用时，归因跳过依赖血缘的 `compiled_away` 判据，其他规则照常执行。
+- PostgreSQL 用于读取编译血缘和 chunk 各代的嵌入模型与用量。不可用时，归因跳过依赖血缘的 `compiled_away` 判据，其他规则照常执行；但 `embed` 阶段强依赖它——重建时旧向量是标 stale 而不是置空，Akasha 的质量闸门全程为 0，HTTP 侧判不了进度。

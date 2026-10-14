@@ -20,7 +20,26 @@ SELECT kc.id, kc.knowledge_page_id, kp.title, kc.chunk_role,
 FROM knowledge_chunks kc
 JOIN knowledge_pages kp ON kp.id = kc.knowledge_page_id
 WHERE kc.knowledge_page_id = ANY(%(ids)s)
+  AND kc.stale_at IS NULL
 ORDER BY kp.title, kc.chunk_role
+"""
+
+
+SPACE_EMBEDDING_GENERATIONS = """
+SELECT kc.embedding_model,
+       kc.embedding_dimensions,
+       kc.stale_at IS NULL AS active,
+       COUNT(*)::bigint AS chunks,
+       COUNT(kc.embedding)::bigint AS embedded,
+       SUM(kc.embedding_total_tokens)::bigint AS total_tokens,
+       SUM(kc.embedding_duration_ms)::bigint AS duration_ms_sum,
+       AVG(kc.embedding_duration_ms)::double precision AS duration_ms_mean,
+       MIN(kc.created_at) AS first_created_at,
+       MAX(kc.created_at) AS last_created_at
+FROM knowledge_chunks kc
+WHERE kc.space_id = %(space)s
+GROUP BY kc.embedding_model, kc.embedding_dimensions, kc.stale_at IS NULL
+ORDER BY active DESC, last_created_at DESC
 """
 
 
@@ -78,6 +97,31 @@ class BadPageId(ValueError):
 def _rows(cursor) -> list[dict[str, Any]]:
     columns = [c.name for c in cursor.description]
     return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)
+
+
+def _iso(value: Any) -> str | None:
+    return None if value is None else getattr(value, "isoformat", lambda: str(value))()
+
+
+def active_coverage(generations: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    """活跃代里匹配目标模型的占比。活跃集是 1:1 替换，总数恒定，占比即重建进度。"""
+    active = [entry for entry in generations if entry["active"]]
+    total = sum(entry["chunks"] for entry in active)
+    matched = sum(entry["chunks"] for entry in active if entry["model"] == model)
+    return {
+        "total": total,
+        "matched": matched,
+        "ready": bool(total) and matched == total,
+        "models": sorted({str(entry["model"]) for entry in active if entry["model"]}),
+    }
 
 
 class LineageReader:
@@ -150,14 +194,51 @@ class LineageReader:
                 f"PostgreSQL query audit unavailable: {type(exc).__name__}"
             ) from exc
 
+    def space_embedding_generations(self, space_id: str) -> dict[str, Any]:
+        """按 space 聚合各代 chunk 的嵌入模型与用量；活跃代即当前可检索的那一代。"""
+        space_id = self._check_id(space_id, "space id")
+        try:
+            with self._connect() as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    cursor.execute(SPACE_EMBEDDING_GENERATIONS, {"space": space_id})
+                    rows = _rows(cursor)
+        except LineageUnavailable:
+            raise
+        except Exception as exc:
+            raise LineageUnavailable(
+                f"PostgreSQL embedding generations unavailable: {type(exc).__name__}"
+            ) from exc
+
+        generations = [
+            {
+                "model": row["embedding_model"],
+                "dimensions": row["embedding_dimensions"],
+                "active": bool(row["active"]),
+                "chunks": int(row["chunks"] or 0),
+                "embedded": int(row["embedded"] or 0),
+                "total_tokens": _optional_int(row["total_tokens"]),
+                "duration_ms_sum": _optional_int(row["duration_ms_sum"]),
+                "duration_ms_mean": _optional_float(row["duration_ms_mean"]),
+                "first_created_at": _iso(row["first_created_at"]),
+                "last_created_at": _iso(row["last_created_at"]),
+            }
+            for row in rows
+        ]
+        return {"space_id": space_id, "generations": generations}
+
     @staticmethod
-    def _check_page_id(page_id: str) -> str:
+    def _check_id(value: str, label: str = "page id") -> str:
 
         try:
-            UUID(page_id)
+            UUID(value)
         except (ValueError, AttributeError, TypeError) as exc:
-            raise BadPageId(f"{page_id!r} is not a valid page id (expected a UUID)") from exc
-        return page_id
+            raise BadPageId(f"{value!r} is not a valid {label} (expected a UUID)") from exc
+        return value
+
+    @classmethod
+    def _check_page_id(cls, page_id: str) -> str:
+        return cls._check_id(page_id)
 
     def lineage(self, page_id: str, *, chunk_chars: int | None = 2000) -> dict[str, Any]:
 

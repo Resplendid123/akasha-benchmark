@@ -2,6 +2,7 @@ import type {
   AkashaModelsView,
   AttributionDetail,
   CompileDoc,
+  CompileEmbedding,
   CompileRun,
   Connection,
   ConnectionTest,
@@ -120,6 +121,7 @@ export const api = {
     request<MetricsView>(`/api/metrics${query({ datasets: datasets.join(',') })}`),
 
   compiles: () => request<{ compiles: CompileRun[] }>('/api/compiles'),
+  compileEmbedding: (id: number) => request<CompileEmbedding>(`/api/compiles/${id}/embedding`),
   compileDocs: (
     id: number,
     params: { dataset?: string; gold_only?: boolean; q?: string; limit?: number; offset?: number } = {},

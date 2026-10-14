@@ -15,6 +15,7 @@ import {
 
 const STAGE_LABELS: Record<string, string> = {
   compile: '编译',
+  embed: '嵌入',
   query: '查询',
   evaluate: '评测',
   attribute: '归因',

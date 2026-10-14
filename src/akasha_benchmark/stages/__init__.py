@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..task import Stage
-from . import attribute, chain, compile, download, evaluate, normalize, query
+from . import attribute, chain, compile, download, embed, evaluate, normalize, query
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,11 @@ STAGES: dict[str, StageDefinition] = {
             "import_concurrency": int,
             "schedule_at": str,
         },
+    ),
+    "embed": StageDefinition(
+        label="嵌入",
+        run=embed.run,
+        params={"compile_id": int, "embedding_concurrency": int},
     ),
     "query": StageDefinition(
         label="查询",

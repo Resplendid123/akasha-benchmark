@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from akasha_benchmark.akasha_client import AkashaClient, AkashaError
+from akasha_benchmark.config import load_config
+from akasha_benchmark.lineage import (
+    BadPageId,
+    LineageReader,
+    LineageUnavailable,
+    active_coverage,
+)
+from akasha_benchmark.model_configs import feature_of
 from akasha_benchmark.store import (
     compile_store,
     query_store,
@@ -57,6 +66,48 @@ def compile_docs(
         "offset": offset,
         "limit": limit,
         "docs": docs,
+    }
+
+
+@router.get("/compiles/{compile_id}/embedding")
+def compile_embedding(request: Request, compile_id: int) -> dict[str, Any]:
+    """远端当前 embedding 配置，与空间里各代 chunk 的覆盖率和用量。"""
+    with db(request) as connection:
+        row = compile_store.get_compile_run(connection, compile_id)
+        if row is None:
+            raise HTTPException(404, f"编译 #{compile_id} 不存在")
+        config = load_config(connection)
+    space_id = row["space_id"]
+    if not space_id:
+        raise HTTPException(409, f"编译 {row['run_id']!r} 还没有 Akasha 空间")
+
+    try:
+        config.require_credentials()
+        with AkashaClient(config) as client:
+            client.login()
+            live = client.get_model_configs()
+    except AkashaError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except (httpx.RequestError, OSError, ValueError) as exc:
+        raise HTTPException(502, f"读远端模型配置失败：{type(exc).__name__}: {exc}") from exc
+
+    target = feature_of(live, "embedding") or {}
+    try:
+        report = LineageReader(config.database_url).space_embedding_generations(str(space_id))
+    except LineageUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except BadPageId as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {
+        "compile_id": compile_id,
+        "space_id": space_id,
+        "target": {
+            "model": target.get("model"),
+            "dimensions": (target.get("parameters") or {}).get("dimension"),
+        },
+        "coverage": active_coverage(report["generations"], str(target.get("model") or "")),
+        "generations": report["generations"],
     }
 
 

@@ -346,6 +346,15 @@ class AkashaClient:
 
         return self.post("llm-wiki/admin/compile-spaces", {"spaceIds": space_ids})
 
+    def rebuild_space_embeddings(
+        self, space_ids: list[str], *, embedding_concurrency: int | None = None
+    ) -> dict[str, Any]:
+        """用当前远端 embedding 配置重算整个空间：旧 chunk 标 stale，插入新一代。"""
+        payload: dict[str, Any] = {"action": "rebuild_embeddings", "spaceIds": space_ids}
+        if embedding_concurrency is not None:
+            payload["embeddingConcurrency"] = embedding_concurrency
+        return self.post("llm-wiki/admin/space-action", payload, retry=False)
+
     def run_pages(
         self, run_id: str, *, page: int = 1, limit: int = 100
     ) -> dict[str, Any]:
