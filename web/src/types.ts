@@ -253,6 +253,7 @@ export interface QueryStats {
   server_total_ms_mean: number | null
 }
 
+/** 用量三列只有编译路径写，重建不写；重建用量看 EmbeddingRebuild。 */
 export interface EmbeddingGeneration {
   model: string | null
   dimensions: number | null
@@ -273,12 +274,25 @@ export interface EmbeddingCoverage {
   models: string[]
 }
 
+/** 重建批次的聚合用量。duration_ms_sum 是真墙钟，可直接比并发。 */
+export interface EmbeddingRebuild {
+  model: string | null
+  batches: number
+  chunks: number
+  failed: number
+  total_tokens: number | null
+  duration_ms_sum: number | null
+  first_batch_at: string | null
+  last_batch_at: string | null
+}
+
 export interface CompileEmbedding {
   compile_id: number
   space_id: string
   target: { model: string | null; dimensions: number | null }
   coverage: EmbeddingCoverage
   generations: EmbeddingGeneration[]
+  rebuilds: EmbeddingRebuild[]
 }
 
 export interface QueryRun {
@@ -349,6 +363,22 @@ export interface CompileDoc {
   is_gold: number
   page_id: string | null
   error: string | null
+}
+
+export interface QueryPreview {
+  compile_id: number
+  run_id: string
+  space_id: string
+  question: string
+  http_status: number
+  latency_ms: number
+  error: string | null
+  answer_mode: string | null
+  answer: unknown
+  retrieved_sources: Array<Record<string, unknown>>
+  citations: Array<Record<string, unknown>>
+  snippets: Array<Record<string, unknown>>
+  response: unknown
 }
 
 export interface QueryResponseRow {

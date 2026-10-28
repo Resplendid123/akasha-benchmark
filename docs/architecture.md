@@ -73,8 +73,9 @@ compile_run 1 ── * query_run 1 ── * eval_run 1 ── * attribution_run
 - 编译暂停先取消远端 exact run；继续时根据累积 RunPage 状态，仅通过 `retry-pages` 重试失败、合并失败或手动取消的页面。
 - 后端启动时处理上次进程遗留的活动任务；远端编译确认停止后标记暂停，无法确认时标记失败。
 - 编译要求 Akasha owner 权限，重建向量要求 owner 或 admin。编译和查询在开始、结束及续跑时校验 workspace 与模型快照。运行任务只读取远端模型配置，不隐式修改它。
-- embedding 与原编译不一致时，查询改为按 PostgreSQL 的活跃代覆盖率判定：整代已重建则放行并告警，部分重建或完全未重建则拒绝。dense 检索按 embedding profile 与维度过滤，混合代会召回不到。
-- `embed` 与所有其他任务互斥：重建期间空间里是新旧混合的活跃代，编译和查询都读不到稳定结果。
-- `embed` 入口不按模型是否变化开关：模型不同按覆盖率判完成，模型相同按活跃代用量指纹判完成（先变化再稳定），空间没有活跃 chunk 才直接返回。
+- embedding 与原编译不一致时，查询改为按 PostgreSQL 的活跃 chunk 覆盖率判定：已整体重建则放行并告警，部分重建或完全未重建则拒绝。dense 检索按 embedding profile 与维度过滤，新旧混合会召回不到。
+- `embed` 与所有其他任务互斥：重建期间空间里新旧向量混在同一批 chunk 上，编译和查询都读不到稳定结果。
+- `embed` 统一按 `knowledge_embedding_rebuild_batches` 判完成：取请求前的 PG 时钟作起点，累加之后批次的 chunk 数到覆盖总数为止，再回查覆盖率确认目标模型已铺满。重建原地改写同一批 chunk，模型相同时覆盖率恒为满，批次是唯一进度信号。失败批次会被重试并重复记录，故进度用 `>=` 收尾。
 - 编译完整性由 `missingChunk`、`missingEmbedding`、`missingSource` 和 `stalePageCount` 判定。明确存在成功页面但整体失败的编译可降级用于查询，并标记结果不完整。
-- PostgreSQL 用于读取编译血缘和 chunk 各代的嵌入模型与用量。不可用时，归因跳过依赖血缘的 `compiled_away` 判据，其他规则照常执行；但 `embed` 阶段强依赖它——重建时旧向量是标 stale 而不是置空，Akasha 的质量闸门全程为 0，HTTP 侧判不了进度。
+- PostgreSQL 用于读取编译血缘、chunk 的嵌入模型分布和重建批次用量。不可用时，归因跳过依赖血缘的 `compiled_away` 判据，其他规则照常执行；但 `embed` 阶段强依赖它——远端重建不产生 run 记录，HTTP 侧没有进度可查。
+- 嵌入用量分两个来源：chunk 行上的 `embedding_total_tokens`/`_duration_ms` 只有编译路径写，是单次调用墙钟相加，不反映并发；重建用量在 `knowledge_embedding_rebuild_batches`，`duration_ms` 是整批并发 embed 的真墙钟，批次间串行，相加即总墙钟。对比报告标注用量来源，重建过的优先用批次表。

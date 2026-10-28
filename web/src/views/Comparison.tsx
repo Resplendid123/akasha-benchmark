@@ -155,11 +155,10 @@ function datasetLabel(name: string): string {
   return DATASET_LABELS[name.toLowerCase()] ?? name
 }
 
-/** 按查询时的 embedding 模型挑对应那一代；重建后旧代仍带着自己的用量留在 PG 里。 */
+/** 按查询时的 embedding 模型取用量。重建过就用批次表的墙钟，否则用编译时的累计调用耗时。 */
 function embeddingGeneration(item: LoadedItem) {
-  const generations = item.embedding?.generations ?? []
   const model = item.option.query.embedding_model
-  const matching = generations.filter((entry) => entry.model === model)
+  const matching = (item.embedding?.generations ?? []).filter((entry) => entry.model === model)
   if (matching.length === 0) return null
   const merged = matching.reduce((total, entry) => ({
     ...total,
@@ -167,12 +166,18 @@ function embeddingGeneration(item: LoadedItem) {
     total_tokens: sumOrNull(total.total_tokens, entry.total_tokens),
     duration_ms_sum: sumOrNull(total.duration_ms_sum, entry.duration_ms_sum),
   }))
+
+  const rebuild = (item.embedding?.rebuilds ?? []).find((entry) => entry.model === model)
+  const usage = rebuild
+    ? { total_tokens: rebuild.total_tokens, duration_ms_sum: rebuild.duration_ms_sum }
+    : { total_tokens: merged.total_tokens, duration_ms_sum: merged.duration_ms_sum }
+  const chunks = rebuild ? rebuild.chunks : merged.chunks
   return {
     ...merged,
+    ...usage,
+    source: rebuild ? '重建' : '编译',
     duration_ms_mean:
-      merged.duration_ms_sum === null || merged.chunks === 0
-        ? null
-        : merged.duration_ms_sum / merged.chunks,
+      usage.duration_ms_sum === null || chunks === 0 ? null : usage.duration_ms_sum / chunks,
   }
 }
 
@@ -429,13 +434,14 @@ function buildMarkdown(items: LoadedItem[]): string {
     if (!generation) return []
     const tokens = generation.total_tokens
     return [
-      `| ${escapeCell(`${circledNumber(itemIndex + 1)} ${embeddingLabel(item.option)}`)} | ${generation.chunks} | ${generation.dimensions ?? '—'} | ${tokens === null ? '—' : tokens} | ${timingCell(generation.duration_ms_mean, generation.duration_ms_sum, '/块', item.option.query.embedding_concurrency ?? '远端默认')} |`,
+      `| ${escapeCell(`${circledNumber(itemIndex + 1)} ${embeddingLabel(item.option)}`)} | ${generation.chunks} | ${generation.dimensions ?? '—'} | ${generation.source} | ${tokens === null ? '—' : tokens} | ${timingCell(generation.duration_ms_mean, generation.duration_ms_sum, '/块', item.option.query.embedding_concurrency ?? '远端默认')} |`,
     ]
   })
   if (costRows.length > 0) {
     lines.push('', '### 1.2 嵌入成本', '')
-    lines.push(...tableHeader(['嵌入模型', '向量数', '维度', 'token 合计', '嵌入耗时']))
+    lines.push(...tableHeader(['嵌入模型', '向量数', '维度', '用量来源', 'token 合计', '嵌入耗时']))
     lines.push(...costRows)
+    lines.push('', '用量来源为「编译」时，嵌入耗时是单次调用墙钟相加，不反映并发；「重建」是整批并发的真墙钟。')
   }
 
   lines.push('', '## 二、路由率对比', '')

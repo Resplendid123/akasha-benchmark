@@ -264,10 +264,7 @@ function ModelConfigs() {
       <div className="panel">
         <h3>Akasha 远端模型配置</h3>
         {error ? (
-          <>
-            <Failed error={error} />
-            <p className="small muted">这一段需要连上 Akasha。先把上面的连接配好并测试通过。</p>
-          </>
+          <Failed error={error} />
         ) : (
           data && <LiveTable data={data} />
         )}

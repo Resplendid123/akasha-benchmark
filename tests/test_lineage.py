@@ -6,6 +6,7 @@ from akasha_benchmark.lineage import (
     CHUNKS_OF_ARTIFACTS,
     COMPILED_SOURCE_PAGES,
     SPACE_EMBEDDING_GENERATIONS,
+    SPACE_REBUILD_BATCHES,
     BadPageId,
     LineageReader,
     active_coverage,
@@ -46,7 +47,7 @@ def test_compiled_source_pages_are_queried_in_one_batch(monkeypatch):
 
 
 def test_compiled_chunks_exclude_stale_generations():
-    """重建会插新代并把旧代标 stale；不过滤会让扩写比按多代重复计数。"""
+    """重编译会把旧 chunk 标 stale；不过滤会让扩写比按多代重复计数。"""
     assert "kc.stale_at IS NULL" in CHUNKS_OF_ARTIFACTS
 
 
@@ -108,6 +109,64 @@ def test_space_embedding_generations_groups_by_model_and_liveness(monkeypatch):
 def test_space_embedding_generations_rejects_non_uuid():
     with pytest.raises(BadPageId, match="space id"):
         LineageReader("postgresql://configured").space_embedding_generations("space-1")
+
+
+def test_space_rebuild_usage_aggregates_batches(monkeypatch):
+    space = "00000000-0000-0000-0000-00000000000a"
+    seen: dict = {}
+
+    class Database:
+        read_only = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, params):
+            seen.update({"sql": sql, "params": params})
+
+        @property
+        def description(self):
+            return [
+                type("Column", (), {"name": name})
+                for name in (
+                    "embedding_model",
+                    "batches",
+                    "chunks",
+                    "failed",
+                    "total_tokens",
+                    "duration_ms_sum",
+                    "first_batch_at",
+                    "last_batch_at",
+                )
+            ]
+
+        def fetchall(self):
+            return [
+                ("e2", 2, 80, 1, 1600, 9000, None, None),
+                ("e1", 1, 40, 0, None, 5000, None, None),
+            ]
+
+    reader = LineageReader("postgresql://configured")
+    monkeypatch.setattr(reader, "_connect", Database)
+
+    usage = reader.space_rebuild_usage(space, since="2026-10-14T00:00:00+00:00")
+
+    assert seen["sql"] == SPACE_REBUILD_BATCHES
+    assert seen["params"] == {"space": space, "since": "2026-10-14T00:00:00+00:00"}
+    assert (usage["batches"], usage["chunks"], usage["failed"]) == (3, 120, 1)
+    assert usage["models"][0]["duration_ms_sum"] == 9000
+    assert usage["models"][1]["total_tokens"] is None
+
+
+def test_space_rebuild_usage_rejects_non_uuid():
+    with pytest.raises(BadPageId, match="space id"):
+        LineageReader("postgresql://configured").space_rebuild_usage("space-1")
 
 
 def test_active_coverage_ignores_stale_generations():

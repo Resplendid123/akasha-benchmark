@@ -17,6 +17,7 @@ import type {
   Paged,
   Provider,
   ProviderProbe,
+  QueryPreview,
   RawSamples,
   ResponseList,
   SampleDetail,
@@ -122,6 +123,8 @@ export const api = {
 
   compiles: () => request<{ compiles: CompileRun[] }>('/api/compiles'),
   compileEmbedding: (id: number) => request<CompileEmbedding>(`/api/compiles/${id}/embedding`),
+  queryPreview: (id: number, question: string) =>
+    post<QueryPreview>(`/api/compiles/${id}/query-preview`, { question }),
   compileDocs: (
     id: number,
     params: { dataset?: string; gold_only?: boolean; q?: string; limit?: number; offset?: number } = {},

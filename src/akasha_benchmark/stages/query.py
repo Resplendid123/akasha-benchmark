@@ -74,7 +74,7 @@ def _collect_timings(ctx: TaskContext, query_id: int, since: str | None) -> None
 def _require_rebuilt_embeddings(
     ctx: TaskContext, compile_run: dict[str, Any], current: dict[str, Any]
 ) -> None:
-    """embedding 与编译时不同时，查 PG 活跃代：已整代重建过就放行，否则拦住。"""
+    """embedding 与编译时不同时，查 PG 活跃 chunk：已整体重建过就放行，否则拦住。"""
     target = str((feature_of(current, "embedding") or {}).get("model") or "")
     space_id = compile_run["space_id"]
     try:
@@ -90,7 +90,7 @@ def _require_rebuilt_embeddings(
     coverage = active_coverage(report["generations"], target)
     if coverage["ready"]:
         ctx.log(
-            f"embedding 已整代重建为 {target}（{coverage['total']} 个 chunk），"
+            f"embedding 已整体重建为 {target}（{coverage['total']} 个 chunk），"
             "语料仍是原 compiler 编译的产物",
             "warn",
         )
@@ -98,7 +98,7 @@ def _require_rebuilt_embeddings(
     if coverage["matched"]:
         raise RuntimeError(
             f"嵌入重建未完成：已重建 {coverage['matched']} / 共 {coverage['total']} 个 chunk，"
-            "活跃代新旧混合，检索结果不可用。请等重建任务跑完"
+            "新旧向量混在一起，检索结果不可用。请等重建任务跑完"
         )
     raise RuntimeError(
         f"远端 embedding 配置是 {target}，但空间里的 chunk 还是 "

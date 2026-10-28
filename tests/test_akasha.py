@@ -1582,15 +1582,50 @@ def _drifted_client(monkeypatch, module, target="changed-embedding"):
     return changed
 
 
-def _stub_generations(monkeypatch, module, generations):
-    """替掉 PG 读取，只给活跃代分布。"""
+def _stub_generations(monkeypatch, module, generations, batches=None):
+    """替掉 PG 读取。generations/batches 传列表时按轮询逐步推进，末步保持。"""
+    generation_steps = generations if generations and isinstance(generations[0], list) else [generations]
+    batch_steps = [0] if batches is None else batches
+
+    def advance(steps):
+        return steps.pop(0) if len(steps) > 1 else steps[0]
 
     class Reader:
         def __init__(self, database_url):
             self.database_url = database_url
 
         def space_embedding_generations(self, space_id):
-            return {"space_id": space_id, "generations": generations}
+            return {"space_id": space_id, "generations": advance(generation_steps)}
+
+        def server_now(self):
+            return "2026-10-14T00:00:00+00:00"
+
+        def space_rebuild_usage(self, space_id, *, since=None):
+            chunks = advance(batch_steps)
+            models = (
+                [
+                    {
+                        "model": "e1",
+                        "batches": 1,
+                        "chunks": chunks,
+                        "failed": 0,
+                        "total_tokens": chunks * 10,
+                        "duration_ms_sum": chunks * 100,
+                        "first_batch_at": None,
+                        "last_batch_at": None,
+                    }
+                ]
+                if chunks
+                else []
+            )
+            return {
+                "space_id": space_id,
+                "models": models,
+                "batches": 1 if chunks else 0,
+                "chunks": chunks,
+                "failed": 0,
+                "last_batch_at": None,
+            }
 
         def query_audits(self, questions, *, since=None):
             raise LineageUnavailable("stubbed")
@@ -1638,38 +1673,80 @@ def test_query_blocks_when_nothing_was_rebuilt(ready_connection, monkeypatch):
         execute(query.run, context(ready_connection, {"compile_id": compile_id}))
 
 
-def test_embed_rebuilds_when_active_generation_already_matches(ready_connection, monkeypatch):
+def test_embed_tracks_same_model_rebuild_by_batches(ready_connection, monkeypatch):
+    """模型没变时覆盖率恒为满，只有批次表能证明重建真的跑了。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     client = FakeClient(None)
     monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
     monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
-    steps = [
-        [_active("e1", 4)],
-        [{**_active("e1", 4), "total_tokens": 40}],
-    ]
-
-    class Reader:
-        def __init__(self, database_url):
-            pass
-
-        def space_embedding_generations(self, space_id):
-            return {"space_id": space_id, "generations": steps.pop(0) if len(steps) > 1 else steps[0]}
-
-    monkeypatch.setattr(embed, "LineageReader", Reader)
+    _stub_generations(monkeypatch, embed, [_active("e1", 4)], batches=[0, 2, 4])
 
     execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
 
     assert client.rebuilt == [{"spaces": ["space-1"], "concurrency": None}]
 
 
-def test_embed_fails_when_same_model_rebuild_changes_nothing(ready_connection, monkeypatch):
+def test_embed_resume_reuses_frozen_rebuild_start(ready_connection, monkeypatch):
+    """续跑若重取 PG 时钟，暂停前已记录的批次不计入进度，会误判停滞。"""
     compile_id = _compiled(ready_connection, monkeypatch)
     client = FakeClient(None)
     monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
     monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
-    _stub_generations(monkeypatch, embed, [_active("e1", 4)])
+    _stub_generations(monkeypatch, embed, [_active("e1", 4)], batches=[4])
+    seen: list[str | None] = []
 
-    with pytest.raises(RuntimeError, match="重建没有生效"):
+    class Recording(embed.LineageReader):
+        def server_now(self):
+            pytest.fail("续跑不应重取起点")
+
+        def space_rebuild_usage(self, space_id, *, since=None):
+            seen.append(since)
+            return super().space_rebuild_usage(space_id, since=since)
+
+    monkeypatch.setattr(embed, "LineageReader", Recording)
+
+    execute(
+        embed.run,
+        context(
+            ready_connection,
+            {"compile_id": compile_id, "rebuild_since": "2026-10-13T00:00:00+00:00"},
+        ),
+    )
+
+    assert seen == ["2026-10-13T00:00:00+00:00"]
+
+
+def test_embed_fails_when_no_batch_appears(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(embed, "MAX_IDLE_POLLS", 3)
+    _stub_generations(monkeypatch, embed, [_active("e1", 4)], batches=[0])
+
+    with pytest.raises(RuntimeError, match="没有产生任何重建批次"):
+        execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
+
+
+def test_embed_fails_when_batches_done_but_coverage_incomplete(ready_connection, monkeypatch):
+    compile_id = _compiled(ready_connection, monkeypatch)
+    client = FakeClient(None)
+    client.configs = {
+        "configs": [
+            {**entry, **({"model": "e1-new"} if entry["feature"] == "embedding" else {})}
+            for entry in CONFIGS["configs"]
+        ]
+    }
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    _stub_generations(
+        monkeypatch,
+        embed,
+        [[_active("e1", 4)], [_active("e1-new", 3), _active("e1", 1)]],
+        batches=[0, 4],
+    )
+
+    with pytest.raises(RuntimeError, match="只有 3 / 4"):
         execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
 
 
@@ -1687,28 +1764,20 @@ def test_embed_skips_when_space_has_no_active_chunks(ready_connection, monkeypat
 def test_embed_rebuilds_then_waits_for_full_coverage(ready_connection, monkeypatch):
     compile_id = _compiled(ready_connection, monkeypatch)
     client = FakeClient(None)
-    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
-    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
-    steps = [
-        [_active("e1", 4)],
-        [_active("e1", 2), _active("e1-new", 2)],
-        [_active("e1-new", 4)],
-    ]
-
-    class Reader:
-        def __init__(self, database_url):
-            pass
-
-        def space_embedding_generations(self, space_id):
-            return {"space_id": space_id, "generations": steps.pop(0) if len(steps) > 1 else steps[0]}
-
-    monkeypatch.setattr(embed, "LineageReader", Reader)
     client.configs = {
         "configs": [
             {**entry, **({"model": "e1-new"} if entry["feature"] == "embedding" else {})}
             for entry in CONFIGS["configs"]
         ]
     }
+    monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
+    monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
+    _stub_generations(
+        monkeypatch,
+        embed,
+        [[_active("e1", 4)], [_active("e1-new", 4)]],
+        batches=[0, 2, 4],
+    )
 
     execute(
         embed.run,
@@ -1729,16 +1798,9 @@ def test_embed_leaves_concurrency_to_remote_default(ready_connection, monkeypatc
     }
     monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
     monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
-    steps = [[_active("e1", 4)], [_active("e1-new", 4)]]
-
-    class Reader:
-        def __init__(self, database_url):
-            pass
-
-        def space_embedding_generations(self, space_id):
-            return {"space_id": space_id, "generations": steps.pop(0) if len(steps) > 1 else steps[0]}
-
-    monkeypatch.setattr(embed, "LineageReader", Reader)
+    _stub_generations(
+        monkeypatch, embed, [[_active("e1", 4)], [_active("e1-new", 4)]], batches=[0, 4]
+    )
 
     execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
 
@@ -1772,9 +1834,9 @@ def test_embed_fails_when_rebuild_stalls(ready_connection, monkeypatch):
     monkeypatch.setattr(embed, "AkashaClient", lambda config: client)
     monkeypatch.setattr(embed.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(embed, "MAX_IDLE_POLLS", 3)
-    _stub_generations(monkeypatch, embed, [_active("e1", 4)])
+    _stub_generations(monkeypatch, embed, [_active("e1", 4)], batches=[0, 2])
 
-    with pytest.raises(RuntimeError, match="重建停滞"):
+    with pytest.raises(RuntimeError, match="进度停在 2 / 4"):
         execute(embed.run, context(ready_connection, {"compile_id": compile_id}))
 
 

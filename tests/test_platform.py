@@ -218,7 +218,7 @@ def _stage_params(stage: str) -> dict:
     ],
 )
 def test_embed_is_exclusive_with_compile_and_query(settings, db, running, incoming):
-    """重建期间空间里是新旧混合的活跃代，编译和查询都读不到稳定结果。"""
+    """重建期间同一批 chunk 上新旧向量混在一起，编译和查询都读不到稳定结果。"""
     _active_task(db, running, _stage_params(running))
     runner = TaskRunner(settings)
 
@@ -1350,7 +1350,7 @@ def test_compile_cleanup_cancels_remote_run_and_keeps_space(client, db_path, mon
     assert "空间没有删除" in body["note"]
 
 
-def _embedding_client(monkeypatch, generations, model="e2"):
+def _embedding_client(monkeypatch, generations, model="e2", rebuilds=()):
     class FakeAkasha(_AkashaStub):
         def get_model_configs(self):
             return {
@@ -1371,6 +1371,16 @@ def _embedding_client(monkeypatch, generations, model="e2"):
 
         def space_embedding_generations(self, space_id):
             return {"space_id": space_id, "generations": generations}
+
+        def space_rebuild_usage(self, space_id, *, since=None):
+            return {
+                "space_id": space_id,
+                "models": list(rebuilds),
+                "batches": sum(entry["batches"] for entry in rebuilds),
+                "chunks": sum(entry["chunks"] for entry in rebuilds),
+                "failed": sum(entry["failed"] for entry in rebuilds),
+                "last_batch_at": None,
+            }
 
     monkeypatch.setattr("akasha_platform.api.runs.AkashaClient", FakeAkasha)
     monkeypatch.setattr("akasha_platform.api.runs.LineageReader", Reader)
@@ -1407,6 +1417,13 @@ def test_compile_embedding_reports_coverage_and_usage(client, db_path, monkeypat
                 "first_created_at": None, "last_created_at": None,
             },
         ],
+        rebuilds=[
+            {
+                "model": "e2", "batches": 1, "chunks": 3, "failed": 0,
+                "total_tokens": 900, "duration_ms_sum": 1200,
+                "first_batch_at": None, "last_batch_at": None,
+            }
+        ],
     )
     with closing(connect(db_path)) as connection:
         compile_id = make_compile_run(connection)
@@ -1418,6 +1435,7 @@ def test_compile_embedding_reports_coverage_and_usage(client, db_path, monkeypat
     assert body["target"] == {"model": "e2", "dimensions": 1024}
     assert body["coverage"] == {"total": 3, "matched": 3, "ready": True, "models": ["e2"]}
     assert [entry["active"] for entry in body["generations"]] == [True, False]
+    assert body["rebuilds"][0]["duration_ms_sum"] == 1200
 
 
 def test_compile_embedding_needs_postgres(client, db_path, monkeypatch):
@@ -1438,6 +1456,70 @@ def test_compile_embedding_requires_a_space(client, db_path, monkeypatch):
         connection.commit()
 
     assert client.get(f"/api/compiles/{compile_id}/embedding").status_code == 409
+
+
+def test_query_preview_returns_response_without_creating_query_run(client, db_path, monkeypatch):
+    class FakeAkasha(_AkashaStub):
+        def current_user(self):
+            return {"workspace": {"id": "workspace-1"}}
+
+        def query(self, question, space_ids):
+            from akasha_benchmark.akasha_client import Response
+
+            assert question == "什么是测试？"
+            assert space_ids == ["space-1"]
+            return Response(
+                status=200,
+                body={
+                    "answerMode": "knowledge",
+                    "answer": "这是测试答案。",
+                    "snippets": [{"title": "测试文档", "text": "测试证据"}],
+                    "citations": [{"sourcePageId": "page-1"}],
+                },
+                latency_ms=12,
+            )
+
+    monkeypatch.setattr(runs_api, "AkashaClient", FakeAkasha)
+    with closing(connect(db_path)) as connection:
+        compile_id = make_compile_run(connection, run_id="preview")
+        compile_store.update_compile_run(
+            connection,
+            compile_id,
+            space_id="space-1",
+            workspace_id="workspace-1",
+            status="succeeded",
+            quality_json=dumps({"passed": True}),
+        )
+        connection.commit()
+
+    before = client.get("/api/compiles").json()["compiles"]
+    body = client.post(
+        f"/api/compiles/{compile_id}/query-preview",
+        json={"question": "什么是测试？"},
+    )
+
+    assert body.status_code == 200
+    result = body.json()
+    assert result["run_id"] == "preview"
+    assert result["answer"] == "这是测试答案。"
+    assert result["latency_ms"] == 12
+    after = client.get("/api/compiles").json()["compiles"]
+    assert len(after[0]["queries"]) == len(before[0]["queries"])
+
+
+def test_query_preview_rejects_unready_compile(client, db_path, monkeypatch):
+    monkeypatch.setattr(runs_api, "AkashaClient", _AkashaStub)
+    with closing(connect(db_path)) as connection:
+        compile_id = make_compile_run(connection, run_id="not-ready")
+        connection.commit()
+
+    response = client.post(
+        f"/api/compiles/{compile_id}/query-preview",
+        json={"question": "测试"},
+    )
+
+    assert response.status_code == 409
+    assert "编译状态" in response.json()["detail"]
 
 
 def test_cleanup_refused_while_a_task_writes_the_record(client, db_path):

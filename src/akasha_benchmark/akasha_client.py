@@ -349,7 +349,7 @@ class AkashaClient:
     def rebuild_space_embeddings(
         self, space_ids: list[str], *, embedding_concurrency: int | None = None
     ) -> dict[str, Any]:
-        """用当前远端 embedding 配置重算整个空间：旧 chunk 标 stale，插入新一代。"""
+        """用当前远端 embedding 配置重算整个空间：原地改写活跃 chunk 的向量。"""
         payload: dict[str, Any] = {"action": "rebuild_embeddings", "spaceIds": space_ids}
         if embedding_concurrency is not None:
             payload["embeddingConcurrency"] = embedding_concurrency

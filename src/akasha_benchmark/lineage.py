@@ -43,6 +43,26 @@ ORDER BY active DESC, last_created_at DESC
 """
 
 
+SPACE_REBUILD_BATCHES = """
+SELECT embedding_model,
+       COUNT(*)::bigint AS batches,
+       SUM(chunk_count)::bigint AS chunks,
+       SUM(failed_count)::bigint AS failed,
+       SUM(total_tokens)::bigint AS total_tokens,
+       SUM(duration_ms)::bigint AS duration_ms_sum,
+       MIN(created_at) AS first_batch_at,
+       MAX(created_at) AS last_batch_at
+FROM knowledge_embedding_rebuild_batches
+WHERE space_id = %(space)s
+  AND (%(since)s::timestamptz IS NULL OR created_at >= %(since)s::timestamptz)
+GROUP BY embedding_model
+ORDER BY last_batch_at DESC
+"""
+
+
+SERVER_NOW = "SELECT now()"
+
+
 SOURCE_CHUNKS = """
 SELECT ksc.id, ksc.source_page_id, ksc.text
 FROM knowledge_source_chunks ksc
@@ -56,19 +76,6 @@ FROM knowledge_query_audit
 WHERE query_hash = ANY(%(hashes)s)
   AND (%(since)s::timestamptz IS NULL OR created_at >= %(since)s::timestamptz)
 ORDER BY query_hash, created_at DESC
-"""
-
-
-EDGES_OF_ARTIFACTS = """
-SELECT e.id, e.relation, e.stale_at,
-       e.from_knowledge_page_id, f.title AS from_title, f.canonical_key AS from_key,
-       e.to_knowledge_page_id,   t.title AS to_title,   t.canonical_key AS to_key
-FROM knowledge_graph_edges e
-JOIN knowledge_pages f ON f.id = e.from_knowledge_page_id
-JOIN knowledge_pages t ON t.id = e.to_knowledge_page_id
-WHERE e.from_knowledge_page_id = ANY(%(ids)s)
-   OR e.to_knowledge_page_id = ANY(%(ids)s)
-ORDER BY e.relation
 """
 
 
@@ -112,7 +119,7 @@ def _iso(value: Any) -> str | None:
 
 
 def active_coverage(generations: list[dict[str, Any]], model: str) -> dict[str, Any]:
-    """活跃代里匹配目标模型的占比。活跃集是 1:1 替换，总数恒定，占比即重建进度。"""
+    """活跃 chunk 里匹配目标模型的占比。重建原地改写同一批行，总数恒定。"""
     active = [entry for entry in generations if entry["active"]]
     total = sum(entry["chunks"] for entry in active)
     matched = sum(entry["chunks"] for entry in active if entry["model"] == model)
@@ -194,8 +201,70 @@ class LineageReader:
                 f"PostgreSQL query audit unavailable: {type(exc).__name__}"
             ) from exc
 
+    def server_now(self) -> str:
+        """取 PG 自己的时钟，用它当重建起点，免得本机与库有时差。"""
+        try:
+            with self._connect() as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    cursor.execute(SERVER_NOW)
+                    return _iso(cursor.fetchone()[0]) or ""
+        except LineageUnavailable:
+            raise
+        except Exception as exc:
+            raise LineageUnavailable(
+                f"PostgreSQL clock unavailable: {type(exc).__name__}"
+            ) from exc
+
+    def space_rebuild_usage(
+        self, space_id: str, *, since: str | None = None
+    ) -> dict[str, Any]:
+        """重建批次的真实用量：duration_ms 是整批并发 embed 的墙钟，可直接比并发。
+
+        chunk 行上的 embedding_total_tokens/_duration_ms 只有编译路径写，重建不写，
+        所以重建用量只能从这张批次表读。
+        """
+        space_id = self._check_id(space_id, "space id")
+        try:
+            with self._connect() as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        SPACE_REBUILD_BATCHES, {"space": space_id, "since": since}
+                    )
+                    rows = _rows(cursor)
+        except LineageUnavailable:
+            raise
+        except Exception as exc:
+            raise LineageUnavailable(
+                f"PostgreSQL rebuild batches unavailable: {type(exc).__name__}"
+            ) from exc
+
+        models = [
+            {
+                "model": row["embedding_model"],
+                "batches": int(row["batches"] or 0),
+                "chunks": int(row["chunks"] or 0),
+                "failed": int(row["failed"] or 0),
+                "total_tokens": _optional_int(row["total_tokens"]),
+                "duration_ms_sum": _optional_int(row["duration_ms_sum"]),
+                "first_batch_at": _iso(row["first_batch_at"]),
+                "last_batch_at": _iso(row["last_batch_at"]),
+            }
+            for row in rows
+        ]
+        timestamps = [entry["last_batch_at"] for entry in models if entry["last_batch_at"]]
+        return {
+            "space_id": space_id,
+            "models": models,
+            "batches": sum(entry["batches"] for entry in models),
+            "chunks": sum(entry["chunks"] for entry in models),
+            "failed": sum(entry["failed"] for entry in models),
+            "last_batch_at": max(timestamps, default=None),
+        }
+
     def space_embedding_generations(self, space_id: str) -> dict[str, Any]:
-        """按 space 聚合各代 chunk 的嵌入模型与用量；活跃代即当前可检索的那一代。"""
+        """按 space 聚合 chunk 的嵌入模型分布；用量两列只反映编译时，重建不写。"""
         space_id = self._check_id(space_id, "space id")
         try:
             with self._connect() as connection:
@@ -251,15 +320,12 @@ class LineageReader:
                 ids = [a["id"] for a in artifacts]
 
                 chunks: list[dict[str, Any]] = []
-                edges: list[dict[str, Any]] = []
                 if ids:
                     cursor.execute(CHUNKS_OF_ARTIFACTS, {"ids": ids})
                     chunks = _rows(cursor)
                     if chunk_chars is not None:
                         for chunk in chunks:
                             chunk["text"] = (chunk["text"] or "")[:chunk_chars]
-                    cursor.execute(EDGES_OF_ARTIFACTS, {"ids": ids})
-                    edges = _rows(cursor)
 
                 cursor.execute(SOURCE_CHUNKS, {"page": page_id})
                 source_chunks = _rows(cursor)
@@ -272,11 +338,9 @@ class LineageReader:
             "artifacts": artifacts,
             "chunks": chunks,
             "source_chunks": source_chunks,
-            "edges": edges,
             "counts": {
                 "artifacts": len(artifacts),
                 "chunks": len(chunks),
                 "source_chunks": len(source_chunks),
-                "edges": len(edges),
             },
         }

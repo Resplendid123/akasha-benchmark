@@ -15,7 +15,7 @@ from .compile_control import CompileRemoteService
 from .settings import Settings
 
 
-# embed 重建期间空间里是新旧混合的活跃代，编译和查询都读不到稳定结果
+# embed 重建期间同一批 chunk 上新旧向量混在一起，编译和查询都读不到稳定结果
 EXCLUSIVE = frozenset({"download", "normalize", "embed"})
 
 STAGE_CONCURRENCY: dict[str, int] = {"compile": 16, "query": 16}
