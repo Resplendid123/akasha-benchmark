@@ -44,7 +44,7 @@ compile_run ──▶ query_run ──▶ eval_run ──▶ attribution_run
       └── embed（重建向量，不产生运行记录）
 ```
 
-1. `download` 将数据集文件下载或整理到 `dataset/`。
+1. `download` 将数据集文件下载或整理到 `dataset/`。本地数据集改为在数据集页导入 Akasha 空间导出 zip（md 页面作为语料），再由 `generate` 用样本生成模型逐篇产出带证据的问答对。
 2. `normalize` 通过适配器生成统一的 `sample` 和 `corpus_doc`，只写 SQLite。
 3. `compile` 抽取样本和语料，创建独立 Akasha 空间，导入并编译文档，同时保存抽样参数、空间信息和远端模型快照。
 4. `embed` 用当前远端 embedding 配置重算整个空间的向量。
@@ -52,7 +52,7 @@ compile_run ──▶ query_run ──▶ eval_run ──▶ attribution_run
 6. `evaluate` 将 `sourcePageId` 映射回语料文档，计算可用指标和可选 Judge，并保存逐样本结果与汇总。
 7. `attribute` 基于指标与血缘证据给出逐样本规则根因；配置模型时，还可为整轮评测生成一份分析报告。
 
-编译子集策略由数据集适配器声明：有 gold 映射的数据集按 QA 选择语料，`musique` 额外按跳数分层，`narrativeqa` 按完整文档取样，`itfaq` 使用全量语料。指标同样声明所需标注，数据集不满足依赖时直接省略该指标。
+编译子集策略由数据集适配器声明：有 gold 映射的数据集按 QA 选择语料，`musique` 额外按跳数分层，`narrativeqa` 按完整文档取样。指标同样声明所需标注，数据集不满足依赖时直接省略该指标。
 
 ## 数据模型
 

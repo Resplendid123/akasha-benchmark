@@ -86,9 +86,11 @@ export interface ModelConfigsView {
   compiles: { id: number; run_id: string; drift: Record<string, boolean> }[]
 }
 
+export type ProviderRole = 'judge' | 'attribution' | 'generation'
+
 export interface Provider {
   id: number
-  role: 'judge' | 'attribution'
+  role: ProviderRole
   label: string
   base_url: string
   model: string
@@ -253,7 +255,6 @@ export interface QueryStats {
   server_total_ms_mean: number | null
 }
 
-/** 用量三列只有编译路径写，重建不写；重建用量看 EmbeddingRebuild。 */
 export interface EmbeddingGeneration {
   model: string | null
   dimensions: number | null
@@ -274,7 +275,6 @@ export interface EmbeddingCoverage {
   models: string[]
 }
 
-/** 重建批次的聚合用量。duration_ms_sum 是真墙钟，可直接比并发。 */
 export interface EmbeddingRebuild {
   model: string | null
   batches: number
@@ -344,7 +344,6 @@ export interface CompileRun {
   finished_at: string | null
   stats: Record<string, CompileStats>
   compiled_pages: number | null
-  compiled_pages_error: string | null
   quality: {
     passed: boolean
     gates: Record<string, number | null>

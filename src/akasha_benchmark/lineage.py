@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
-
 
 ARTIFACTS_OF_SOURCE = """
 SELECT DISTINCT kp.id, kp.title, kp.page_type
@@ -101,6 +101,10 @@ class BadPageId(ValueError):
     pass
 
 
+def query_hash(question: str) -> str:
+    return "sha256:" + hashlib.sha256(question.encode("utf-8")).hexdigest()
+
+
 def _rows(cursor) -> list[dict[str, Any]]:
     columns = [c.name for c in cursor.description]
     return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
@@ -119,7 +123,6 @@ def _iso(value: Any) -> str | None:
 
 
 def active_coverage(generations: list[dict[str, Any]], model: str) -> dict[str, Any]:
-    """活跃 chunk 里匹配目标模型的占比。重建原地改写同一批行，总数恒定。"""
     active = [entry for entry in generations if entry["active"]]
     total = sum(entry["chunks"] for entry in active)
     matched = sum(entry["chunks"] for entry in active if entry["model"] == model)
@@ -150,8 +153,21 @@ class LineageReader:
 
         return psycopg.connect(self.database_url, autocommit=False)
 
-    def compiled_source_page_ids(self, page_ids: list[str]) -> set[str]:
+    def _fetch(self, what: str, read: Callable[[Any], Any], sql: str, *params: Any) -> Any:
+        try:
+            with self._connect() as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, *params)
+                    return read(cursor)
+        except LineageUnavailable:
+            raise
+        except Exception as exc:
+            raise LineageUnavailable(
+                f"PostgreSQL {what} unavailable: {type(exc).__name__}"
+            ) from exc
 
+    def compiled_source_page_ids(self, page_ids: list[str]) -> set[str]:
         valid: list[UUID] = []
         for page_id in dict.fromkeys(page_ids):
             try:
@@ -160,86 +176,39 @@ class LineageReader:
                 continue
         if not valid:
             return set()
-
-        try:
-            with self._connect() as connection:
-                connection.read_only = True
-                with connection.cursor() as cursor:
-                    cursor.execute(COMPILED_SOURCE_PAGES, {"pages": valid})
-                    return {str(row[0]) for row in cursor.fetchall()}
-        except LineageUnavailable:
-            raise
-        except Exception as exc:
-
-            raise LineageUnavailable(
-                f"PostgreSQL compilation count unavailable: {type(exc).__name__}"
-            ) from exc
+        return self._fetch(
+            "compilation count",
+            lambda cursor: {str(row[0]) for row in cursor.fetchall()},
+            COMPILED_SOURCE_PAGES,
+            {"pages": valid},
+        )
 
     def query_audits(
         self, questions: list[str], *, since: str | None = None
     ) -> dict[str, dict[str, Any]]:
-
-        hashes = [
-            "sha256:" + hashlib.sha256(question.encode("utf-8")).hexdigest()
-            for question in dict.fromkeys(questions)
-        ]
+        hashes = [query_hash(question) for question in dict.fromkeys(questions)]
         if not hashes:
             return {}
-        try:
-            with self._connect() as connection:
-                connection.read_only = True
-                with connection.cursor() as cursor:
-                    cursor.execute(QUERY_AUDITS, {"hashes": hashes, "since": since})
-                    return {
-                        str(row[0]): row[1] if isinstance(row[1], dict) else {}
-                        for row in cursor.fetchall()
-                    }
-        except LineageUnavailable:
-            raise
-        except Exception as exc:
-            raise LineageUnavailable(
-                f"PostgreSQL query audit unavailable: {type(exc).__name__}"
-            ) from exc
+        return self._fetch(
+            "query audit",
+            lambda cursor: {
+                str(row[0]): row[1] if isinstance(row[1], dict) else {}
+                for row in cursor.fetchall()
+            },
+            QUERY_AUDITS,
+            {"hashes": hashes, "since": since},
+        )
 
     def server_now(self) -> str:
-        """取 PG 自己的时钟，用它当重建起点，免得本机与库有时差。"""
-        try:
-            with self._connect() as connection:
-                connection.read_only = True
-                with connection.cursor() as cursor:
-                    cursor.execute(SERVER_NOW)
-                    return _iso(cursor.fetchone()[0]) or ""
-        except LineageUnavailable:
-            raise
-        except Exception as exc:
-            raise LineageUnavailable(
-                f"PostgreSQL clock unavailable: {type(exc).__name__}"
-            ) from exc
+        return self._fetch("clock", lambda cursor: _iso(cursor.fetchone()[0]) or "", SERVER_NOW)
 
     def space_rebuild_usage(
         self, space_id: str, *, since: str | None = None
     ) -> dict[str, Any]:
-        """重建批次的真实用量：duration_ms 是整批并发 embed 的墙钟，可直接比并发。
-
-        chunk 行上的 embedding_total_tokens/_duration_ms 只有编译路径写，重建不写，
-        所以重建用量只能从这张批次表读。
-        """
         space_id = self._check_id(space_id, "space id")
-        try:
-            with self._connect() as connection:
-                connection.read_only = True
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        SPACE_REBUILD_BATCHES, {"space": space_id, "since": since}
-                    )
-                    rows = _rows(cursor)
-        except LineageUnavailable:
-            raise
-        except Exception as exc:
-            raise LineageUnavailable(
-                f"PostgreSQL rebuild batches unavailable: {type(exc).__name__}"
-            ) from exc
-
+        rows = self._fetch(
+            "rebuild batches", _rows, SPACE_REBUILD_BATCHES, {"space": space_id, "since": since}
+        )
         models = [
             {
                 "model": row["embedding_model"],
@@ -264,21 +233,10 @@ class LineageReader:
         }
 
     def space_embedding_generations(self, space_id: str) -> dict[str, Any]:
-        """按 space 聚合 chunk 的嵌入模型分布；用量两列只反映编译时，重建不写。"""
         space_id = self._check_id(space_id, "space id")
-        try:
-            with self._connect() as connection:
-                connection.read_only = True
-                with connection.cursor() as cursor:
-                    cursor.execute(SPACE_EMBEDDING_GENERATIONS, {"space": space_id})
-                    rows = _rows(cursor)
-        except LineageUnavailable:
-            raise
-        except Exception as exc:
-            raise LineageUnavailable(
-                f"PostgreSQL embedding generations unavailable: {type(exc).__name__}"
-            ) from exc
-
+        rows = self._fetch(
+            "embedding generations", _rows, SPACE_EMBEDDING_GENERATIONS, {"space": space_id}
+        )
         generations = [
             {
                 "model": row["embedding_model"],
@@ -298,20 +256,14 @@ class LineageReader:
 
     @staticmethod
     def _check_id(value: str, label: str = "page id") -> str:
-
         try:
             UUID(value)
         except (ValueError, AttributeError, TypeError) as exc:
             raise BadPageId(f"{value!r} is not a valid {label} (expected a UUID)") from exc
         return value
 
-    @classmethod
-    def _check_page_id(cls, page_id: str) -> str:
-        return cls._check_id(page_id)
-
     def lineage(self, page_id: str, *, chunk_chars: int | None = 2000) -> dict[str, Any]:
-
-        page_id = self._check_page_id(page_id)
+        page_id = self._check_id(page_id)
         with self._connect() as connection:
             connection.read_only = True
             with connection.cursor() as cursor:
@@ -323,15 +275,13 @@ class LineageReader:
                 if ids:
                     cursor.execute(CHUNKS_OF_ARTIFACTS, {"ids": ids})
                     chunks = _rows(cursor)
-                    if chunk_chars is not None:
-                        for chunk in chunks:
-                            chunk["text"] = (chunk["text"] or "")[:chunk_chars]
 
                 cursor.execute(SOURCE_CHUNKS, {"page": page_id})
                 source_chunks = _rows(cursor)
-                if chunk_chars is not None:
-                    for chunk in source_chunks:
-                        chunk["text"] = (chunk["text"] or "")[:chunk_chars]
+
+        if chunk_chars is not None:
+            for chunk in (*chunks, *source_chunks):
+                chunk["text"] = (chunk["text"] or "")[:chunk_chars]
 
         return {
             "source_page_id": page_id,

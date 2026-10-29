@@ -17,6 +17,7 @@ import type {
   Paged,
   Provider,
   ProviderProbe,
+  ProviderRole,
   QueryPreview,
   RawSamples,
   ResponseList,
@@ -52,7 +53,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const body = (await response.json()) as { detail?: string }
       if (body.detail) detail = body.detail
     } catch {
-
     }
     throw new ApiError(response.status, detail)
   }
@@ -85,9 +85,9 @@ export const api = {
     put<{ updated: string[]; connection: Connection }>('/api/connection', payload),
   testConnection: () => post<ConnectionTest>('/api/connection/test'),
   modelConfigs: () => request<ModelConfigsView>('/api/model-configs'),
-  providers: (role?: 'judge' | 'attribution') =>
+  providers: (role?: ProviderRole) =>
     request<Provider[]>(`/api/providers${query({ role })}`),
-  saveProvider: (role: 'judge' | 'attribution', payload: Record<string, unknown>) =>
+  saveProvider: (role: ProviderRole, payload: Record<string, unknown>) =>
     put<{ id: number; api_key_set: boolean }>(`/api/providers/${role}`, payload),
   deleteProvider: (id: number) => del<{ deleted: number }>(`/api/providers/${id}`),
   probeProvider: (id: number) => post<ProviderProbe>(`/api/providers/${id}/probe`),
@@ -106,6 +106,11 @@ export const api = {
     ),
 
   datasets: () => request<{ datasets: DatasetEntry[]; dataset_dir: string }>('/api/datasets'),
+  importSpace: (name: string, file: File, overwrite = false) =>
+    request<{ dataset: string; docs: number }>(
+      `/api/datasets/import${query({ name, overwrite })}`,
+      { method: 'POST', body: file, headers: { 'Content-Type': 'application/zip' } },
+    ),
   deleteDataset: (name: string) =>
     del<{ deleted: number }>(`/api/datasets/${encodeURIComponent(name)}`),
   rawSamples: (

@@ -27,7 +27,6 @@ type LoadedItem = {
   option: EvalOption
   detail: EvalDetail
   attribution: AttributionDetail | null
-  /** PG 不可用时为 null，报告跳过嵌入成本一节。 */
   embedding: CompileEmbedding | null
 }
 
@@ -66,7 +65,6 @@ const DATASET_LABELS: Record<string, string> = {
   musique: 'MuSiQue',
   '2wikimultihopqa': '2WikiMultiHopQA',
   narrativeqa: 'NarrativeQA',
-  itfaq: 'ITFAQ',
 }
 
 const METRIC_SECTIONS = [
@@ -155,7 +153,6 @@ function datasetLabel(name: string): string {
   return DATASET_LABELS[name.toLowerCase()] ?? name
 }
 
-/** 按查询时的 embedding 模型取用量。重建过就用批次表的墙钟，否则用编译时的累计调用耗时。 */
 function embeddingGeneration(item: LoadedItem) {
   const model = item.option.query.embedding_model
   const matching = (item.embedding?.generations ?? []).filter((entry) => entry.model === model)
@@ -233,7 +230,6 @@ function queryStats(item: LoadedItem, dataset: string) {
 
 type Segment = { label: string; startMs: number; durationMs: number; fill: string }
 
-/** 按管线顺序把均值摊成首尾相接的区段；生成段对齐到合计末尾。 */
 function timelineSegments(stats: QueryStats): { segments: Segment[]; totalMs: number } | null {
   const total = stats.server_total_ms_mean
   if (total === null || total === undefined || total <= 0) return null
@@ -276,7 +272,6 @@ function timelineBlock(item: LoadedItem, dataset: string, index: number): string
     cells.fill(segment.fill, from, to)
   }
 
-  // ttft_ms 自生成请求起算，标记锚在生成段内；各阶段均值取自不同子集，夹住防止越界。
   const generation = segments.find((segment) => segment.label === '生成')
   const ttft = generation === undefined ? null : stats.ttft_ms_mean ?? null
   const marks = Array.from({ length: TIMELINE_WIDTH }, () => ' ')
@@ -311,6 +306,26 @@ function metricCell(value: number | null, baseline: number | null, rawDelta = fa
   return rawDelta
     ? `${formatted} (${delta >= 0 ? '+' : ''}${delta.toFixed(2)})`
     : `${formatted} (${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(2)}pp)`
+}
+
+type Column = { dataset: string; item: LoadedItem }
+
+const COUNT_METRICS = new Set(['uncited_count', 'uncited_gold_count', 'graph_neighbor_gold_snippets'])
+
+function hasMetric(columns: Column[], scope: string, name: string): boolean {
+  return columns.some(({ dataset, item }) => metricValue(item, dataset, scope, name) !== null)
+}
+
+function deltaCells(columns: Column[], scope: string, name: string): string[] {
+  const baselines = new Map<string, number | null>()
+  return columns.map(({ dataset, item }) => {
+    const value = metricValue(item, dataset, scope, name)
+    if (!baselines.has(dataset)) {
+      baselines.set(dataset, value)
+      return metricCell(value, null)
+    }
+    return metricCell(value, baselines.get(dataset) ?? null, COUNT_METRICS.has(name))
+  })
 }
 
 function tableHeader(headers: string[], numeric = true): string[] {
@@ -401,7 +416,7 @@ function MarkdownPreview({ source }: { source: string }) {
 
 function buildMarkdown(items: LoadedItem[]): string {
   const datasets = Array.from(new Set(items.flatMap((item) => item.detail.datasets.map((entry) => entry.dataset))))
-  const columns = datasets.flatMap((dataset) => items
+  const columns: Column[] = datasets.flatMap((dataset) => items
     .filter((item) => datasetSummary(item, dataset))
     .map((item) => ({ dataset, item })))
   const lines: string[] = ['## 一、测试概况', '']
@@ -449,14 +464,12 @@ function buildMarkdown(items: LoadedItem[]): string {
   lines.push(...tableHeader(routeHeaders))
   const routeValues = (item: LoadedItem, dataset: string) => {
     const summary = datasetSummary(item, dataset)
-    const modes = summary?.answer_modes ?? {}
-    const knowledgeShare = modes.knowledge ?? null
-    const generalShare = modes.general ?? null
+    const knowledgeShare = summary?.answer_modes.knowledge
+    if (knowledgeShare === undefined) return '—'
     const sampleCount = summary?.responses_evaluated ?? 0
-    const knowledge = knowledgeShare === null ? null : Math.round(knowledgeShare * sampleCount)
-    const general = generalShare === null ? null : Math.round(generalShare * sampleCount)
-    if (knowledgeShare === null) return '—'
-    return `${(knowledgeShare * 100).toFixed(1)}%（${knowledge ?? 0}/${general ?? 0}）`
+    const knowledge = Math.round(knowledgeShare * sampleCount)
+    const general = Math.round((summary?.answer_modes.general ?? 0) * sampleCount)
+    return `${(knowledgeShare * 100).toFixed(1)}%（${knowledge}/${general}）`
   }
   for (const [itemIndex, item] of items.entries()) {
     lines.push(`| ${escapeCell(`${circledNumber(itemIndex + 1)} ${modelLabel(item.option)}`)} | ${datasets.map((dataset) => routeValues(item, dataset)).join(' | ')} |`)
@@ -464,19 +477,12 @@ function buildMarkdown(items: LoadedItem[]): string {
 
   lines.push('', '', '## 三、指标对比')
   for (const section of METRIC_SECTIONS) {
-    const availableMetrics = section.metrics.filter(([name]) => columns.some(({ dataset, item }) => metricValue(item, dataset, 'overall', name) !== null))
+    const availableMetrics = section.metrics.filter(([name]) => hasMetric(columns, 'overall', name))
     if (availableMetrics.length === 0) continue
     lines.push(section.title)
     lines.push(...tableHeader(['指标', ...columns.map(({ dataset, item }) => `${datasetLabel(dataset)} ${modelNote(item, items.indexOf(item))}`)]))
     for (const [name, label] of availableMetrics) {
-      const baselineByDataset = new Map<string, number | null>()
-      const cells = columns.map(({ dataset, item }) => {
-        const value = metricValue(item, dataset, 'overall', name)
-        const baseline = baselineByDataset.get(dataset)
-        if (!baselineByDataset.has(dataset)) baselineByDataset.set(dataset, value)
-        return metricCell(value, baseline ?? null, name === 'uncited_count' || name === 'uncited_gold_count' || name === 'graph_neighbor_gold_snippets')
-      })
-      lines.push(`| ${label} | ${cells.join(' | ')} |`)
+      lines.push(`| ${label} | ${deltaCells(columns, 'overall', name).join(' | ')} |`)
     }
     lines.push('')
   }
@@ -494,32 +500,17 @@ function buildMarkdown(items: LoadedItem[]): string {
         `${datasetLabel(dataset)}（${circledNumber(items.indexOf(item) + 1)} ${embeddingLabel(item.option)}）`),
     ]))
     for (const [name, label] of EMBEDDING_METRICS) {
-      if (!embeddingColumns.some(({ dataset, item }) => metricValue(item, dataset, 'overall', name) !== null)) continue
-      const baselineByDataset = new Map<string, number | null>()
-      const cells = embeddingColumns.map(({ dataset, item }) => {
-        const value = metricValue(item, dataset, 'overall', name)
-        const baseline = baselineByDataset.get(dataset)
-        if (!baselineByDataset.has(dataset)) baselineByDataset.set(dataset, value)
-        return metricCell(value, baseline ?? null)
-      })
-      lines.push(`| ${label} | ${cells.join(' | ')} |`)
+      if (!hasMetric(embeddingColumns, 'overall', name)) continue
+      lines.push(`| ${label} | ${deltaCells(embeddingColumns, 'overall', name).join(' | ')} |`)
     }
     lines.push('')
   }
 
   lines.push(`### 3.${embeddingModels.size > 1 ? 8 : 7} Knowledge-Only 指标对比`, '')
-  const knowledgeColumns = columns
-  lines.push(...tableHeader(['指标', ...knowledgeColumns.map(({ dataset, item }) => `${datasetLabel(dataset)} ${modelNote(item, items.indexOf(item))}`)]))
+  lines.push(...tableHeader(['指标', ...columns.map(({ dataset, item }) => `${datasetLabel(dataset)} ${modelNote(item, items.indexOf(item))}`)]))
   for (const [name, label] of KNOWLEDGE_METRICS) {
-    if (!knowledgeColumns.some(({ dataset, item }) => metricValue(item, dataset, 'knowledge_only', name) !== null)) continue
-    const baselineByDataset = new Map<string, number | null>()
-    const cells = knowledgeColumns.map(({ dataset, item }) => {
-      const value = metricValue(item, dataset, 'knowledge_only', name)
-      const baseline = baselineByDataset.get(dataset)
-      if (!baselineByDataset.has(dataset)) baselineByDataset.set(dataset, value)
-      return metricCell(value, baseline ?? null)
-    })
-    lines.push(`| ${label} | ${cells.join(' | ')} |`)
+    if (!hasMetric(columns, 'knowledge_only', name)) continue
+    lines.push(`| ${label} | ${deltaCells(columns, 'knowledge_only', name).join(' | ')} |`)
   }
 
   const causes = Array.from(new Set(items.flatMap(({ attribution }) => attribution?.results.map((result) => result.root_cause) ?? []))).sort()
@@ -546,13 +537,14 @@ export function Comparison() {
     [compiles.data],
   )
   const optionMap = useMemo(() => new Map(options.map((option) => [option.eval.id, option])), [options])
+  const updateItems = (next: ComparisonItem[]) => {
+    setItems(next)
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+  }
   useEffect(() => {
     if (!compiles.data) return
     const valid = items.filter((item) => optionMap.has(item.evalId))
-    if (valid.length !== items.length) {
-      setItems(valid)
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(valid))
-    }
+    if (valid.length !== items.length) updateItems(valid)
   }, [compiles.data, items, optionMap])
   const selectedKey = items.map((item) => `${item.evalId}:${item.attributionId ?? ''}`).join(',')
   const loaded = useAsync<LoadedItem[]>(
@@ -567,11 +559,6 @@ export function Comparison() {
     })),
     [selectedKey, options.length],
   )
-
-  const updateItems = (next: ComparisonItem[]) => {
-    setItems(next)
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
-  }
 
   if (compiles.loading) return <Loading what="对比数据" />
   if (compiles.error) return <Failed error={compiles.error} />

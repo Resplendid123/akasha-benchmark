@@ -12,7 +12,6 @@ from ..task import TaskContext
 
 POLL_INTERVAL_SECONDS = 15.0
 MAX_IDLE_POLLS = 20
-# 远端 AdminKnowledgeSpaceActionDto 限制 1-50，留空则用它的默认并发 2
 MAX_EMBEDDING_CONCURRENCY = 50
 
 
@@ -33,7 +32,6 @@ def _coverage(reader: LineageReader, space_id: str, model: str) -> dict[str, Any
 
 
 def _usage_note(usage: dict[str, Any]) -> str:
-    """批次表的 duration_ms 是整批并发 embed 的墙钟，批次间串行，相加即总墙钟。"""
     chunks = usage["chunks"]
     tokens = sum(entry.get("total_tokens") or 0 for entry in usage["models"])
     duration = sum(entry.get("duration_ms_sum") or 0 for entry in usage["models"])
@@ -95,7 +93,6 @@ def run(ctx: TaskContext) -> None:
             return
         ctx.log(f"当前活跃 chunk 的模型：{', '.join(coverage['models']) or '（无）'}")
 
-        # 续跑复用冻结的起点，否则已记录的批次不计入进度，会误判停滞
         since = str(ctx.params.get("rebuild_since") or "") or reader.server_now()
         ctx.checkpoint()
         result = client.rebuild_space_embeddings(
@@ -133,15 +130,11 @@ def _wait_for_batches(
     since: str,
     total: int,
 ) -> dict[str, Any]:
-    """按本次请求之后的重建批次算进度。模型没变时覆盖率恒为满，批次是唯一信号。
-
-    失败批次会被 BullMQ 重试并再插一行，done 可能略超 total，故用 >= 收尾。
-    """
     usage = reader.space_rebuild_usage(space_id, since=since)
     done = usage["chunks"]
     idle = 0
     while done < total:
-        ctx.progress(min(done, total), total, "重建嵌入")
+        ctx.progress(done, total, "重建嵌入")
         time.sleep(POLL_INTERVAL_SECONDS)
         ctx.checkpoint()
         usage = reader.space_rebuild_usage(space_id, since=since)

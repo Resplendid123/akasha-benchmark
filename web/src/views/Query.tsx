@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { CompileRun, QueryRun } from '../types'
+import type { CompileRun, Task } from '../types'
 import {
   AnswerModeFilter,
   CleanupButton,
@@ -22,6 +22,7 @@ import {
   useAsync,
   usePagedRecordNavigation,
   usePoll,
+  useTaskWatch,
 } from '../ui'
 
 export function Query({
@@ -41,6 +42,7 @@ export function Query({
   const [openQuery, setOpenQuery] = useState<number | null>(activeQuery)
   const cleanup = useAction<unknown>()
   const retry = useAction<unknown>()
+  const tasks = useTaskWatch(compiles.reload)
 
   const runs = compiles.data?.compiles ?? []
   useEffect(() => {
@@ -74,7 +76,10 @@ export function Query({
           <Field label="选择编译">
             <select
               value={compile?.id ?? ''}
-              onChange={(e) => onSelectCompile(Number(e.target.value))}
+              onChange={(e) => {
+                onSelectCompile(Number(e.target.value))
+                setOpenQuery(null)
+              }}
             >
               {ready.map((run) => (
                 <option key={run.id} value={run.id}>
@@ -85,7 +90,7 @@ export function Query({
             </select>
           </Field>
           {compile && (
-            <NewQuery key={compile.id} compile={compile} onStarted={compiles.reload} />
+            <NewQuery key={compile.id} compile={compile} onStarted={tasks.watch} />
           )}
         </ConfigPanel>
       )}
@@ -161,7 +166,7 @@ export function Query({
                             onClick={() =>
                               retry.run(async () => {
                                 const task = await api.retryFailedQuery(run.id)
-                                compiles.reload()
+                                tasks.watch(task)
                                 return task
                               })
                             }
@@ -197,12 +202,11 @@ export function Query({
   )
 }
 
-function useEmbedding(compile: CompileRun, onStarted: () => void) {
+function useEmbedding(compile: CompileRun, onStarted: (task: Task) => void) {
   const embedding = useAsync(() => api.compileEmbedding(compile.id), [compile.id])
   const rebuild = useAction<unknown>()
   const [concurrency, setConcurrency] = useState<number | ''>('')
-
-  usePoll(rebuild.busy, embedding.reload)
+  const rebuilding = useTaskWatch(embedding.reload, 3000)
 
   const data = embedding.data
   const field = (
@@ -220,20 +224,20 @@ function useEmbedding(compile: CompileRun, onStarted: () => void) {
   const button = (
     <button
       className="action"
-      disabled={rebuild.busy || (concurrency !== '' && (concurrency < 1 || concurrency > 50))}
+      disabled={rebuild.busy || rebuilding.watching || (concurrency !== '' && (concurrency < 1 || concurrency > 50))}
       onClick={() =>
         rebuild.run(async () => {
           const task = await api.startTask('embed', {
             compile_id: compile.id,
             ...(concurrency === '' ? {} : { embedding_concurrency: concurrency }),
           })
-          embedding.reload()
-          onStarted()
+          rebuilding.watch(task)
+          onStarted(task)
           return task
         })
       }
     >
-      {rebuild.busy ? '启动中…' : '重建嵌入'}
+      {rebuild.busy ? '启动中…' : rebuilding.watching ? '重建中…' : '重建嵌入'}
     </button>
   )
 
@@ -269,7 +273,7 @@ function NewQuery({
   onStarted,
 }: {
   compile: CompileRun
-  onStarted: () => void
+  onStarted: (task: Task) => void
 }) {
   const [selected, setSelected] = useState<string[]>(compile.datasets)
   const [name, setName] = useState('')
@@ -349,7 +353,7 @@ function NewQuery({
                 ...(limit === '' ? {} : { sample_limit: limit }),
                 ...(followUp ? { follow_up: true } : {}),
               })
-              onStarted()
+              onStarted(task)
               return task
             })
           }
@@ -494,5 +498,3 @@ function FullResponse({ queryId, sampleId }: { queryId: number; sampleId: string
     </pre>
   )
 }
-
-export type { QueryRun }

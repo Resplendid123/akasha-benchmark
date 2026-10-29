@@ -19,9 +19,9 @@ from akasha_benchmark.store import (
     query_store,
 )
 
-from ..run_tree import build_compile_tree
 from ..compile_control import CompileRemoteService
-from ._common import db, reject_if_busy, writable
+from ..run_tree import build_compile_tree
+from ._common import db, reject_if_busy, runner_of, writable
 
 router = APIRouter(prefix="/api")
 compile_remote = CompileRemoteService()
@@ -32,7 +32,6 @@ MAX_PAGE = 200
 
 @router.get("/compiles")
 def list_compiles(request: Request) -> dict[str, Any]:
-
     with db(request) as connection:
         return {"compiles": build_compile_tree(connection)}
 
@@ -71,7 +70,6 @@ def compile_docs(
 
 @router.get("/compiles/{compile_id}/embedding")
 def compile_embedding(request: Request, compile_id: int) -> dict[str, Any]:
-    """远端当前 embedding 配置、空间里 chunk 的模型覆盖率，以及各模型的重建用量。"""
     with db(request) as connection:
         row = compile_store.get_compile_run(connection, compile_id)
         if row is None:
@@ -120,7 +118,6 @@ def query_preview(
     compile_id: int,
     payload: dict[str, Any] = Body(...),
 ) -> dict[str, Any]:
-    """对指定编译做一次不落库的单条查询。"""
     question = str(payload.get("question") or "").strip()
     if not question:
         raise HTTPException(422, "请输入问题")
@@ -181,7 +178,6 @@ def query_preview(
 
 @router.delete("/compiles/{compile_id}")
 def delete_compile(request: Request, compile_id: int) -> dict[str, Any]:
-
     with writable(request) as connection:
         row = compile_store.get_compile_run(connection, compile_id)
         if row is None:
@@ -241,7 +237,6 @@ def query_responses(
 
 @router.get("/queries/{query_id}/responses/{sample_id}")
 def query_response(request: Request, query_id: int, sample_id: str) -> dict[str, Any]:
-
     with db(request) as connection:
         row = query_store.response_of(connection, query_id, sample_id)
         if row is None:
@@ -251,17 +246,11 @@ def query_response(request: Request, query_id: int, sample_id: str) -> dict[str,
 
 @router.post("/queries/{query_id}/retry-failed")
 def retry_failed_query(request: Request, query_id: int) -> dict[str, Any]:
-    from ..tasks import TaskRejected
-
-    try:
-        return request.app.state.runner.retry_failed_query(query_id)
-    except TaskRejected as exc:
-        raise HTTPException(409, str(exc)) from exc
+    return runner_of(request).retry_failed_query(query_id)
 
 
 @router.delete("/queries/{query_id}")
 def delete_query(request: Request, query_id: int) -> dict[str, Any]:
-
     with writable(request) as connection:
         if query_store.get_query_run(connection, query_id) is None:
             raise HTTPException(404, f"查询 #{query_id} 不存在")

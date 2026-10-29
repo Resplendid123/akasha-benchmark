@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api'
-import type { CompileRun, DatasetEntry, QueryPreview } from '../types'
+import type { CompileDoc, CompileRun, DatasetEntry, QueryPreview, Task } from '../types'
 import {
   CleanupButton,
   ConfigPanel,
@@ -19,6 +19,7 @@ import {
   useAsync,
   usePagedRecordNavigation,
   usePoll,
+  useTaskWatch,
 } from '../ui'
 
 function todaySeed(): number {
@@ -40,6 +41,7 @@ export function Compile({
   const compiles = useAsync(() => api.compiles(), [])
   const datasets = useAsync(() => api.datasets(), [])
   const cleanup = useAction<unknown>()
+  const tasks = useTaskWatch(compiles.reload)
 
   usePoll(
     (compiles.data?.compiles ?? []).some((c) => c.status === 'running'),
@@ -60,7 +62,7 @@ export function Compile({
 
       {cleanup.error && <Failed error={cleanup.error} />}
 
-      <NewCompile datasets={normalized} onStarted={compiles.reload} />
+      <NewCompile datasets={normalized} onStarted={tasks.watch} />
 
       <h3>编译记录</h3>
       {compiles.data.compiles.length === 0 && <p className="muted">还没有编译记录。</p>}
@@ -98,7 +100,7 @@ export function Compile({
                   <td>{run.quality ? <Pass ok={run.quality.passed} /> : <span className="tag">未执行</span>}</td>
                   <td className="num">{docs}</td>
                   <td className="num">{imported}</td>
-                  <td className="num" title={run.compiled_pages_error ?? '由 PostgreSQL 编译产物统计'}>
+                  <td className="num" title="由远端编译 Run 的逐页进度统计">
                     {num(run.compiled_pages)}
                   </td>
                   <td>
@@ -152,7 +154,7 @@ function NewCompile({
   onStarted,
 }: {
   datasets: DatasetEntry[]
-  onStarted: () => void
+  onStarted: (task: Task) => void
 }) {
   const [selected, setSelected] = useState<string[]>([])
   const [runId, setRunId] = useState('')
@@ -209,7 +211,7 @@ function NewCompile({
             />
           </Field>
         )}
-        <Field label="随机种子" hint="">
+        <Field label="随机种子">
           <input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value))} />
         </Field>
         <Field label="语料范围">
@@ -272,7 +274,7 @@ function NewCompile({
                 ...(runId.trim() ? { run_id: runId.trim() } : {}),
                 ...(scheduleAt ? { schedule_at: scheduleAt } : {}),
               })
-              onStarted()
+              onStarted(task)
               return task
             })
           }
@@ -305,7 +307,7 @@ function CompileDetail({ run }: { run: CompileRun }) {
       }),
     [run.id, dataset, goldOnly, q, limit, offset],
   )
-  const selectDoc = (doc: NonNullable<typeof docs.data>['docs'][number]) =>
+  const selectDoc = (doc: CompileDoc) =>
     setOpenDoc({
       key: `${doc.dataset}/${doc.doc_id}`,
       pageId: doc.page_id,
@@ -446,7 +448,7 @@ function CompileDetail({ run }: { run: CompileRun }) {
               </tr>
             </thead>
             <tbody>
-              {docs.data.docs.slice(0, limit).map((doc) => (
+              {docs.data.docs.map((doc) => (
                 <tr key={`${doc.dataset}/${doc.doc_id}`}>
                   <td className="mono small">{doc.doc_id}</td>
                   <td className="small muted">{doc.dataset}</td>
