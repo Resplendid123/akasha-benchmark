@@ -44,7 +44,7 @@ compile_run ──▶ query_run ──▶ eval_run ──▶ attribution_run
       └── embed（重建向量，不产生运行记录）
 ```
 
-1. `download` 将数据集文件下载或整理到 `dataset/`。本地数据集改为在数据集页导入 Akasha 空间导出 zip（md 页面作为语料），再由 `generate` 用样本生成模型逐篇产出带证据的问答对。
+1. `download` 将数据集文件下载或整理到 `dataset/`。本地数据集改为在数据集页导入 Akasha 空间导出 zip，或直接从当前 Akasha 连接中选择空间导出（md 页面作为语料，编译时复用该空间，不新建空间也不上传语料），再由 `generate` 用样本生成模型逐篇产出带证据的问答对。
 2. `normalize` 通过适配器生成统一的 `sample` 和 `corpus_doc`，只写 SQLite。
 3. `compile` 抽取样本和语料，创建独立 Akasha 空间，导入并编译文档，同时保存抽样参数、空间信息和远端模型快照。
 4. `embed` 用当前远端 embedding 配置重算整个空间的向量。
@@ -78,4 +78,4 @@ compile_run 1 ── * query_run 1 ── * eval_run 1 ── * attribution_run
 - `embed` 统一按 `knowledge_embedding_rebuild_batches` 判完成：取请求前的 PG 时钟作起点，累加之后批次的 chunk 数到覆盖总数为止，再回查覆盖率确认目标模型已铺满。重建原地改写同一批 chunk，模型相同时覆盖率恒为满，批次是唯一进度信号。失败批次会被重试并重复记录，故进度用 `>=` 收尾。
 - 编译完整性由 `missingChunk`、`missingEmbedding`、`missingSource` 和 `stalePageCount` 判定。明确存在成功页面但整体失败的编译可降级用于查询，并标记结果不完整。
 - PostgreSQL 用于读取编译血缘、chunk 的嵌入模型分布和重建批次用量。不可用时，归因跳过依赖血缘的 `compiled_away` 判据，其他规则照常执行；但 `embed` 阶段强依赖它——远端重建不产生 run 记录，HTTP 侧没有进度可查。
-- 嵌入用量分两个来源：chunk 行上的 `embedding_total_tokens`/`_duration_ms` 只有编译路径写，是单次调用墙钟相加，不反映并发；重建用量在 `knowledge_embedding_rebuild_batches`，`duration_ms` 是整批并发 embed 的真墙钟，批次间串行，相加即总墙钟。对比报告标注用量来源，重建过的优先用批次表。
+- 嵌入用量分两个来源：chunk 行上的 `embedding_total_tokens`/`_duration_ms` 由编译路径写入，重建用量记录在 `knowledge_embedding_rebuild_batches`。对比报告标注用量来源，重建过的优先用批次表。
