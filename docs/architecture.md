@@ -12,7 +12,7 @@ FastAPI (:8848) ── TaskRunner ── 阶段任务
         │                         │
         └──────── SQLite ◀────────┤
                                   ├── Akasha HTTP：编译、查询、模型配置
-                                  ├── 模型 HTTP：Judge、整轮归因报告
+                                  ├── 模型 HTTP：Judge、模型归因、样本生成
                                   └── PostgreSQL：编译血缘
 ```
 
@@ -50,7 +50,7 @@ compile_run ──▶ query_run ──▶ eval_run ──▶ attribution_run
 4. `embed` 用当前远端 embedding 配置重算整个空间的向量。
 5. `query` 在指定编译空间逐样本调用 Akasha，保存 HTTP 状态、耗时和完整响应。
 6. `evaluate` 将 `sourcePageId` 映射回语料文档，计算可用指标和可选 Judge，并保存逐样本结果与汇总。
-7. `attribute` 基于指标与血缘证据给出逐样本规则根因；配置模型时，还可为整轮评测生成一份分析报告。
+7. `attribute` 基于指标与血缘证据给出逐样本规则根因；配置归因模型时，逐样本用模型选出唯一主要根因并写入证据链。
 
 编译子集策略由数据集适配器声明：有 gold 映射的数据集按 QA 选择语料，`musique` 额外按跳数分层，`narrativeqa` 按完整文档取样。指标同样声明所需标注，数据集不满足依赖时直接省略该指标。
 
@@ -64,7 +64,9 @@ compile_run 1 ── * query_run 1 ── * eval_run 1 ── * attribution_run
 
 因此任务页展示的是分叉树，而不是固定的一条四阶段链。各运行表拥有自己的样本、响应、指标或归因明细；外键使用 `ON DELETE CASCADE` 清理下游本地数据。`task` 独立保存阶段、冻结参数、进度和绑定的运行产物，`audit_log` 只追加。
 
-配置分为两类：`akasha_connection` 保存 Akasha 与可选 PostgreSQL 连接，`model_provider` 保存 Judge、归因及可应用到 Akasha 的模型端点。数据库以 `store/schema.sql` 为最终结构，不包含迁移层。
+配置分为两类：`akasha_connection` 保存 Akasha 与可选 PostgreSQL 连接，`model_provider` 保存评估、归因、样本生成及可应用到 Akasha 的模型端点。数据库以 `store/schema.sql` 为最终结构，不包含迁移层。
+
+模型端点按用途区分协议：评估指标（faithfulness/context_relevancy/answer_correctness）与归因根因判定走 JEV `systemone` 协议，样本生成和 answer_relevancy 问题生成仍走 OpenAI 兼容的 chat completions。
 
 ## 任务语义与约束
 
